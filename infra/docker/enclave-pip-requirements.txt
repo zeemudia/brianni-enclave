@@ -1,0 +1,62 @@
+# Pinned Python dependency set for the Calypso enclave runtime.
+#
+# Used by infra/docker/vendor-deps.sh with `pip download -r <this> --no-deps`
+# so every vendored wheel is byte-identical across hosts and over time.
+#
+# Top-level requirements: cbor2 (NSM attestation helper, enclave/src/nsm_helper.py)
+# + the media/document extraction tooling (PyMuPDF, Pillow, pillow-heif, vosk;
+# enclave/src/tools/media_tools_service.py). Everything else below is a real
+# transitive dep of those (vosk → requests/urllib3/certifi/charset-normalizer/
+# idna + websockets + tqdm + srt + cffi; pillow-heif → cffi → pycparser).
+#
+# The Presidio/spaCy on-enclave PII-masking stack was REMOVED end to end
+# (de-identification is on-device only — see CLAUDE.md privacy invariants). This
+# file was pruned to the exact transitive closure of the surviving top-level
+# packages: 42 presidio/spaCy-only wheels (blis, thinc, cymem, preshed,
+# murmurhash, catalogue, confection, wasabi, srsly, weasel, cloudpathlib,
+# smart-open, typer, shellingham, click, rich, markdown-it-py, mdurl, pygments,
+# jinja2, markupsafe, phonenumbers, tldextract, requests-file, pydantic*, anyio,
+# httpx, httpcore, h11, numpy, regex, cryptography, setuptools, packaging,
+# filelock, wrapt, tqdm-extras, typing-inspection, annotated-*, …) were dropped.
+# The closure was recomputed for the cp311 / manylinux x86_64 target and proven
+# complete with an offline `pip install --no-index` + smoke imports.
+#
+# Survivors were bumped to current versions for security currency (cbor2,
+# Pillow, PyMuPDF, pillow-heif parse untrusted input / sign attestations).
+# vosk is deliberately HELD at 0.3.44: newer vosk wheels exceed the manylinux
+# 2_28 allowlist ceiling below, so an unpinned resolve silently DOWNGRADES it —
+# bump it only with a matching allowlist widen + revalidation.
+#
+# To refresh (e.g. security patch, dep bump):
+#   1. Delete this file's body, leave the header.
+#   2. Add only the top-level packages with new == versions.
+#   3. Run `pip download -r enclave-pip-requirements.txt --python-version 3.11 \
+#        --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 \
+#        --platform manylinux_2_28_x86_64 --implementation cp --abi cp311 \
+#        --only-binary=:all: --no-deps --dest /tmp/pip-refresh` (exclude srt).
+#   4. Regenerate this file from the resolved wheel filenames; prove the closure
+#      with an offline `pip install --no-index --find-links` of the full set.
+#   5. Re-run vendor-deps.sh + the Task 13 two-host reproducibility proof.
+#
+# --no-deps is enforced by vendor-deps.sh, so missing a transitive here fails
+# the offline docker build at pip-install time. Keep the list complete.
+
+cbor2==6.1.2
+certifi==2026.5.20
+cffi==2.0.0
+charset-normalizer==3.4.7
+idna==3.18
+Pillow==12.2.0
+pillow-heif==1.4.0
+pycparser==3.0
+PyMuPDF==1.27.2.3
+requests==2.34.2
+# srt is sdist-only on PyPI but is a hard runtime dep of vosk (vosk/__init__.py
+# does `import srt` at module load; vosk METADATA: Requires-Dist: srt). With the
+# enclave's --no-deps install it MUST be pinned here, and vendor-deps.sh builds
+# its pure-Python wheel from the pinned sdist (see the `pip wheel srt` step).
+srt==3.5.3
+tqdm==4.68.2
+urllib3==2.7.0
+vosk==0.3.44
+websockets==16.0

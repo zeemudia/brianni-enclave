@@ -1,0 +1,31 @@
+{
+  "name": "@calypso/crypto-core",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./aead": "./src/aead.ts",
+    "./hkdf": "./src/hkdf.ts",
+    "./memory-namespace": "./src/memory-namespace.ts",
+    "./mnemonic": "./src/mnemonic.ts",
+    "./biometric-key": "./src/biometric-key.ts",
+    "./seed-wrapper": "./src/seed-wrapper.ts",
+    "./verification-blob": "./src/verification-blob.ts",
+    "./sorted-json": "./src/sorted-json.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@calypso/chat-types": "workspace:*",
+    "@noble/hashes": "^2.2.0",
+    "@scure/bip39": "^2.0.1"
+  },
+  "devDependencies": {
+    "@calypso/crypto-test-vectors": "workspace:*",
+    "happy-dom": "20.10.2",
+    "vitest": "^4.1.4"
+  }
+}

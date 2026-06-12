@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+
+# Build output
+dist/
+build/
+*.eif
+*.tsbuildinfo
+__pycache__/
+
+# Native addon build artefacts
+packages/vsock-native/build/
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets (safety net — the extractor forbids these, but belt + braces)
+.env
+.env.*
+!.env.example
+*.pem
+!enclave/src/providers/registry-verify-key.pem
+!packages/nitro-verify/src/**/*.pem
+.secrets
+*credentials*
+
+# Local log output
+*.log

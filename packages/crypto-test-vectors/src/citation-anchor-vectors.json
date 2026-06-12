@@ -1,0 +1,48 @@
+[
+  {
+    "name": "ascii-span",
+    "conversationKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "content": "The verified source says yes.",
+    "startIndex": 4,
+    "endIndex": 19,
+    "salt": "brianni:citation-anchor-hmac:salt:v1",
+    "info": "brianni:citation-anchor-hmac:v1",
+    "len": 32,
+    "substring": "verified source",
+    "utf8MessageHex": "766572696669656420736f75726365",
+    "anchorKeyHex": "8de0f6e86002a1ee0fc431a0daefef1622de78387d2d949d82aa589193060870",
+    "hmacSha256Hex": "b21d711b3ec2a34155cf7b2f4cc05b7de058f3dbc3c123a747b3f2d3033647d6",
+    "anchorTextHash": "sh1xGz7Co0FVz3svTMBbfeBY89vDwSOnR7Py0wM2R9Y"
+  },
+  {
+    "name": "astral-plane-valid-span",
+    "conversationKeyHex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "content": "Launch 🚀 confirmed",
+    "startIndex": 7,
+    "endIndex": 9,
+    "salt": "brianni:citation-anchor-hmac:salt:v1",
+    "info": "brianni:citation-anchor-hmac:v1",
+    "len": 32,
+    "substring": "🚀",
+    "utf8MessageHex": "f09f9a80",
+    "anchorKeyHex": "3021e9e22ef514d0f699281419379c7b48e71915aae08b5ca1813e2da293ce74",
+    "hmacSha256Hex": "72eec8b450bcd99d66f68fa927cfca4ec9a8e6f90ad295d740d7a1f88c537677",
+    "anchorTextHash": "cu7ItFC82Z1m9o-pJ8_KTsmo5vkK0pXXQNeh-IxTdnc"
+  },
+  {
+    "name": "surrogate-splitting-boundary-rejected",
+    "content": "A 🚀 launch",
+    "startIndex": 2,
+    "endIndex": 3,
+    "rejectedBeforeHmac": true,
+    "reason": "surrogate_boundary"
+  },
+  {
+    "name": "lone-surrogate-in-range-rejected",
+    "content": "bad \\ud83d range",
+    "startIndex": 4,
+    "endIndex": 10,
+    "rejectedBeforeHmac": true,
+    "reason": "malformed_utf16"
+  }
+]

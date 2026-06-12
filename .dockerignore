@@ -1,0 +1,55 @@
+# Docker build-context exclusions for infra/docker/Dockerfile.enclave.
+#
+# The enclave image only needs: enclave/, packages/, root package.json +
+# yarn.lock + tsconfig.base.json + .yarnrc.yml, infra/docker/vendor/,
+# infra/enclave-config/, infra/enclave-artefacts/, infra/docker/Dockerfile.*.
+# Everything else bloats the context, sometimes catastrophically —
+# calypso-enclave.eif alone is ~1.6 GB.
+
+# VCS metadata
+.git
+.gitignore
+.github
+
+# Top-level workspaces not used by the enclave build
+apps
+server
+scripts
+docs
+de-risk
+
+# Node / Yarn artifacts (we rebuild inside the Dockerfile)
+node_modules
+**/node_modules
+.yarn/cache
+.yarn/install-state.gz
+.yarn/unplugged
+
+# Build outputs
+**/dist
+**/build
+**/coverage
+**/*.eif
+
+# Editor / OS noise
+**/.DS_Store
+**/.vscode
+**/.idea
+
+# Log files
+*.log
+**/*.log
+
+# Vendor manifest gets consumed via the vendor/ dir itself; the .sha256
+# file sits next to it but isn't referenced by the Dockerfile
+# (the script reads it, not the image).
+infra/docker/VENDOR-MANIFEST.sha256
+
+# Provider-key ciphertext blob (Chunk 12) — host-served via
+# infra/host/keys-broker.py. Never bake into the EIF.
+infra/enclave-config/
+
+# Environment variable files — prevent developer plaintext keys from
+# accidentally baking into the image via any COPY directive.
+.env
+.env.*

@@ -1,0 +1,35 @@
+{
+  "id": "personal-agent.career",
+  "version": 1,
+  "displayName": "Career & salary",
+  "description": "Job search, offer negotiation, salary research. Drop offer letters into a linked folder; the agent will read them.",
+  "systemPromptBlock": "You are Calypso in career-and-salary mode. The user is navigating a job search, interview process, or compensation negotiation. Be specific about numbers, ranges, and trade-offs. When the user has linked a folder, read offer letters / job descriptions / contracts directly from it, and require explicit user approval before writing or changing any file or draft. You can DRAFT emails (e.g. a counter-offer) but you cannot send. You cannot read the user's mailbox or calendar at MVP — they must drop relevant material into the linked folder. Treat all compensation details as highly sensitive and never recall them in a non-career context unless the user explicitly asks.",
+  "toolScopes": [
+    "memory.list",
+    "memory.read",
+    "memory.write",
+    "file.read",
+    "folder.list",
+    "folder.read",
+    "folder.write",
+    "email.draft",
+    "doc.draft"
+  ],
+  "capabilitySuiteIds": [
+    "text",
+    "office-document",
+    "pdf",
+    "rtf",
+    "apple-iwork",
+    "google-stub"
+  ],
+  "defaultNamespace": "work",
+  "linkedFolderScopes": {
+    "allowedExtensions": [".pdf", ".docx", ".rtf", ".txt", ".md"],
+    "defaultLabel": "Career"
+  },
+  "uiHints": {
+    "icon": "briefcase",
+    "accentToken": "accent-blue"
+  }
+}

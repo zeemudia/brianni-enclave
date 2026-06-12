@@ -1,0 +1,18 @@
+feat(server): wire SSE stream through TEE proxy
+
+This PR routes chat completion responses through the TEE enclave via the
+vsock bridge. The server receives an encrypted session envelope from the
+client, forwards the ciphertext to the enclave over vsock, and relays the
+decrypted SSE stream back out without ever seeing plaintext.
+
+Changes:
+- server/src/routes/chat.ts: open a vsock tunnel per request, forward bytes
+- server/src/lib/tee-client.ts: new module wrapping fd lifecycle, with
+  UV_THREADPOOL_SIZE=64 bumped in pm2 config
+- enclave/src/handlers/chat.ts: stream provider response into AES-GCM
+
+Tests: integration test opens 50 concurrent streams; all complete within
+the 30-second timeout. PCR0 pinned at fb2990b1a86a6e in the client.
+
+Follow-up: TEE must zero the session key after the final chunk. Filed as
+bug #204. No rollback needed; prior behaviour was a TODO stub.

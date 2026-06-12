@@ -1,0 +1,11 @@
+{
+  "//": "Production build config for the measured enclave image. Mirrors tsconfig.json but EXCLUDES test files so compiled tests never land in dist/ (and therefore in the Nitro EIF). Keeping test code out of the image avoids PCR0 churn on every test change and shrinks the measured attack surface (Codex LOW F21). tsconfig.json (no exclude) is still used by `typecheck` so tests stay type-checked.",
+  "extends": "./tsconfig.json",
+  "include": ["src"],
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/**/__tests__/**",
+    "src/__tests__/**"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "name": "calypso",
+  "private": true,
+  "workspaces": [
+    "packages/chat-types",
+    "packages/crypto-core",
+    "packages/crypto-test-vectors",
+    "packages/masking-core",
+    "packages/nitro-verify",
+    "packages/vsock-native",
+    "enclave"
+  ],
+  "packageManager": "yarn@4.6.0+sha512.5383cc12567a95f1d668fbe762dfe0075c595b4bfff433be478dbbe24e05251a8e8c3eb992a986667c1d53b6c3a9c85b8398c35a960587fbd9fa3a0915406728",
+  "devDependencies": {
+    "@commitlint/cli": "^20",
+    "@commitlint/config-conventional": "^20",
+    "@dotenvx/dotenvx": "^1.62.0",
+    "@types/node": "^25.6.0",
+    "@vitest/coverage-v8": "^4.1.4",
+    "husky": "^9",
+    "minimatch": "^10.2.5",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.4"
+  },
+  "scripts": {
+    "build": "yarn build:enclave",
+    "build:enclave": "yarn workspace @calypso/enclave build",
+    "type-check": "yarn type-check:packages && yarn type-check:enclave",
+    "type-check:enclave": "yarn workspace @calypso/enclave typecheck",
+    "type-check:chat-types": "yarn workspace @calypso/chat-types typecheck",
+    "type-check:packages": "yarn workspace @calypso/chat-types typecheck && yarn tsc -p packages/crypto-core/tsconfig.json --noEmit && yarn tsc -p packages/crypto-test-vectors/tsconfig.json --noEmit && yarn tsc -p packages/masking-core/tsconfig.json --noEmit && yarn tsc -p packages/nitro-verify/tsconfig.json --noEmit",
+    "test": "yarn test:packages && yarn test:enclave",
+    "test:enclave": "yarn workspace @calypso/enclave test",
+    "test:crypto-core": "yarn workspace @calypso/crypto-core test",
+    "test:crypto-test-vectors": "yarn workspace @calypso/crypto-test-vectors test",
+    "test:masking-core": "yarn workspace @calypso/masking-core test",
+    "test:nitro-verify": "yarn workspace @calypso/nitro-verify test",
+    "test:packages": "yarn test:crypto-core && yarn test:crypto-test-vectors && yarn test:masking-core && yarn test:nitro-verify"
+  }
+}

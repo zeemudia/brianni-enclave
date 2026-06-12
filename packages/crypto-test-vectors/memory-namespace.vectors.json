@@ -1,0 +1,26 @@
+{
+  "info": "Locked parity vectors for deriveNamespaceKey. DO NOT hand-edit; regenerate from generate-memory-namespace-vectors.mjs.",
+  "chatRootHex": "6c61727279d0fae7e8c4f01b6c87f29ce42cd2c00f6113d8d31bf06b0e2dc92e",
+  "vectors": [
+    {
+      "namespace": "default",
+      "expectedKeyHex": "fda2d9ed50b7ef3cffc2fd79e82c42159078e06c01802479e94470ba0d4959ed"
+    },
+    {
+      "namespace": "work",
+      "expectedKeyHex": "bd479b2498af03b8f613409b36cb1560568a7d1e3129bf740d062659f4d8322a"
+    },
+    {
+      "namespace": "money",
+      "expectedKeyHex": "fe696575ee2998a36e533fb6f8d7442bad2c10d9872f98b0944744d3f902d6e8"
+    },
+    {
+      "namespace": "health",
+      "expectedKeyHex": "6bbc48f14d8bc068c38a082a679e8ed9f85664bf88745887a8904d7d51a2dc0f"
+    },
+    {
+      "namespace": "relationships",
+      "expectedKeyHex": "641fa28facbe0bd0d9f382ded82a3fa15cbb1dedfde9ef168d03a7c61d27688d"
+    }
+  ]
+}

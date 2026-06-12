@@ -1,0 +1,28 @@
+{
+  "name": "@calypso/vsock-native",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AF_VSOCK native bindings for Nitro Enclave communication. Linux only.",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "install": "node-gyp-build || true",
+    "build": "node-gyp rebuild",
+    "prebuild": "prebuildify --napi --strip"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "dependencies": {
+    "node-addon-api": "^8.0.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "node-gyp": "12.4.0",
+    "prebuildify": "^6.0.0"
+  }
+}

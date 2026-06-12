@@ -1,0 +1,43 @@
+{
+  "name": "@calypso/enclave",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./dream": "./src/dream/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/fix-esm-extensions.mjs dist",
+    "dev": "tsx watch src/index.ts",
+    "lint": "eslint . --fix",
+    "lint:check": "eslint .",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@calypso/chat-types": "workspace:*",
+    "@calypso/crypto-core": "workspace:*",
+    "@calypso/masking-core": "workspace:*",
+    "@google/generative-ai": "^0.24.0",
+    "@noble/hashes": "^2.2.0",
+    "cbor-x": "^1.6.0",
+    "openai": "^5.0.0",
+    "pdfjs-dist": "5.7.284",
+    "zod": "^4.3.6"
+  },
+  "optionalDependencies": {
+    "@calypso/vsock-native": "workspace:*"
+  },
+  "devDependencies": {
+    "@peculiar/webcrypto": "^1.5.0",
+    "@peculiar/x509": "^2.0.0",
+    "@types/node": "^25.6.0",
+    "@typescript-eslint/eslint-plugin": "^8",
+    "@typescript-eslint/parser": "^8",
+    "eslint": "^9",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.1.0"
+  }
+}

@@ -1,0 +1,158 @@
+{
+  "rootHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "messages": [
+    {
+      "conversationId": "conv-a",
+      "messageId": "m1",
+      "text": "quantum computing basics and Grover algorithm"
+    },
+    {
+      "conversationId": "conv-b",
+      "messageId": "m1",
+      "text": "Banana bread recipe with walnuts"
+    },
+    {
+      "conversationId": "conv-c",
+      "messageId": "m1",
+      "text": "TEE attestation pipeline AWS Nitro enclaves"
+    },
+    {
+      "conversationId": "conv-d",
+      "messageId": "m1",
+      "text": "Marathon training plan forty kilometres"
+    },
+    {
+      "conversationId": "conv-e",
+      "messageId": "m1",
+      "text": "Stylometric normalisation privacy chat"
+    }
+  ],
+  "terms": [
+    {
+      "term": "quantum",
+      "tagHex": "253e3a7ef2fedb849226824187f1771e5797671ab50e4872e651269d6ea0cb12"
+    },
+    {
+      "term": "computing",
+      "tagHex": "5abade8059146214faae4b95a9c4f6a38fabc84b967b5f8ab9e6df1006c6b813"
+    },
+    {
+      "term": "basics",
+      "tagHex": "7e4a6aa4c643261de21786d4bc525ac3be142f70edcdea631fc5c8d9ede803bd"
+    },
+    {
+      "term": "and",
+      "tagHex": "7292784a5a99e0950a66aab61527e17a11bc2d30b63a6e76cba4d50fbddb9fa4"
+    },
+    {
+      "term": "grover",
+      "tagHex": "0e15dadedd61a5fac74159716515a2359cd450481430dab984ec8e892499d0d2"
+    },
+    {
+      "term": "algorithm",
+      "tagHex": "756675d4953b1caed825b2bde86f9484703f274626c0e43faa07c1cc289b0ff4"
+    },
+    {
+      "term": "banana",
+      "tagHex": "0b7fd9373e30bab2f93723fde8728a092bdb611fa1441a3585fd79961b4bd02e"
+    },
+    {
+      "term": "bread",
+      "tagHex": "b30758dd288c89f7accc1ab9e2d826b2ad77b4abc6c3e167525fd79795696c72"
+    },
+    {
+      "term": "recipe",
+      "tagHex": "0fd946f303fd5e6440e3063991fe9c50faed77a5dabdcb2ea1454b80aa3b4357"
+    },
+    {
+      "term": "with",
+      "tagHex": "3af8bfac0ebf1d4e79c8d7c59869d5f14c774d77fece942d296181668d08470d"
+    },
+    {
+      "term": "walnuts",
+      "tagHex": "3ac83fccbdd49c21c9e4c070e125a58409837bbeb6100ff1a8a16dfbe866cfba"
+    },
+    {
+      "term": "tee",
+      "tagHex": "a826e9411738477a3309b709fe4450cc3c12f5bd06a89613a0bd8ff285858440"
+    },
+    {
+      "term": "attestation",
+      "tagHex": "52c89e195deb4fce1539711fd466971f0c6af9d602614896981a1bfc48203616"
+    },
+    {
+      "term": "pipeline",
+      "tagHex": "856550825c42805bb349981c52cbde37ca8991bd311ab2984e8a41ef45fb48d5"
+    },
+    {
+      "term": "aws",
+      "tagHex": "7a6a62423a5e6a9dc4d3da9923e3dcb429e0a8846e09ccfa213e56c5509c6b24"
+    },
+    {
+      "term": "nitro",
+      "tagHex": "c075744eec75dd79c5f202419820da9aa093a362d1a8dfbe0115902ad311e0b2"
+    },
+    {
+      "term": "enclaves",
+      "tagHex": "0ca9ebfc51ee93dfe0436ed329c565ed4f8a2b4cf72a927ab8d81ec835282876"
+    },
+    {
+      "term": "marathon",
+      "tagHex": "28ac0c5d7e90386e9787543e333fac789a8d6c3781b29be107d01b4dfe19da6f"
+    },
+    {
+      "term": "training",
+      "tagHex": "b35276573c116a18131f62eec7ba0abfc4e4e82f3c48dd5513af9edc811efaa7"
+    },
+    {
+      "term": "plan",
+      "tagHex": "e92b6be9b033e4e495ce54e2715aa15f89537222e81be05a79cc62ed27c80cc9"
+    },
+    {
+      "term": "forty",
+      "tagHex": "dace92915b7626f4830c3929dbf7954a2ac198846904c24d8662f1f751403f3b"
+    },
+    {
+      "term": "kilometres",
+      "tagHex": "2f154029f26786faad246b5172d7412e080c116a3d0761dbfc85c494cb1e913f"
+    },
+    {
+      "term": "stylometric",
+      "tagHex": "b241dc5f3d2ead5b5e613b4582ccb645d3f2792187b7f35a16892379a601a0ce"
+    },
+    {
+      "term": "normalisation",
+      "tagHex": "288c908634642a46278a2b2bc5dd2176eca5f92c92a48b8407b6a79bd7148956"
+    },
+    {
+      "term": "privacy",
+      "tagHex": "a0484c80e5ceef7116ea88c6f6a22bc5cc5162901423bf17c04c681869160f5d"
+    },
+    {
+      "term": "chat",
+      "tagHex": "42f1e0abcb399663805c48932ec1d8f651fb9752143624b77a30d26bf8101d7b"
+    }
+  ],
+  "queries": [
+    {
+      "q": "grover",
+      "hit": "conv-a"
+    },
+    {
+      "q": "walnuts",
+      "hit": "conv-b"
+    },
+    {
+      "q": "nitro",
+      "hit": "conv-c"
+    },
+    {
+      "q": "marathon",
+      "hit": "conv-d"
+    },
+    {
+      "q": "stylometric",
+      "hit": "conv-e"
+    }
+  ]
+}

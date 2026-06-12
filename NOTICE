@@ -1,0 +1,12 @@
+brianni-enclave
+Copyright 2026 Brianni
+
+This product includes software developed at Brianni (https://brianni.ai).
+
+Third-party components bundled in this repository:
+
+- kmstool_enclave_cli + libnsm.so (under infra/enclave-artefacts/):
+  Prebuilt from aws-nitro-enclaves-sdk-c
+  (https://github.com/aws/aws-nitro-enclaves-sdk-c).
+  Copyright Amazon.com, Inc. or its affiliates. Licensed under Apache-2.0.
+  See infra/enclave-artefacts/README.md and SHA256SUMS for provenance.

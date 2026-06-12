@@ -1,0 +1,33 @@
+Here is the config you asked for. Copy it into `server/src/config.ts`
+and then run `yarn type-check` to make sure nothing drifted.
+
+```typescript
+import { z } from 'zod';
+
+export const ConfigSchema = z.object({
+  databaseUrl: z.string().url(),
+  redisUrl: z.string().url(),
+  vsockPort: z.number().int().positive(),
+  kmsKeyArn: z.string().startsWith('arn:aws:kms:'),
+  pcr0Hex: z.string().length(96),
+});
+
+export type Config = z.infer<typeof ConfigSchema>;
+
+export function loadConfig(env: NodeJS.ProcessEnv): Config {
+  return ConfigSchema.parse({
+    databaseUrl: env.DATABASE_URL,
+    redisUrl: env.REDIS_URL,
+    vsockPort: Number(env.VSOCK_PORT ?? 5005),
+    kmsKeyArn: env.KMS_KEY_ARN,
+    pcr0Hex: env.PCR0_HEX,
+  });
+}
+```
+
+The schema rejects any config where the KMS ARN does not start with
+`arn:aws:kms:`, which protects us from accidentally pointing at an S3
+bucket. Remember that the PCR0 hex is 48 bytes, so 96 hex characters.
+
+If `yarn type-check` fails, run `yarn install` first. The workspace
+resolves `zod` from the root node_modules.

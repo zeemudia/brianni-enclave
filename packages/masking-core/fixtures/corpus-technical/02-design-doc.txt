@@ -1,0 +1,21 @@
+The attestation protocol runs before any session key is exchanged. The
+client requests a signed attestation document from the enclave over the
+public HTTPS endpoint. The document contains the PCR0 measurement, a
+nonce supplied by the client, and a public key generated inside the
+enclave for this session only.
+
+The client verifies the signature against the AWS Nitro trust root, then
+verifies that the PCR0 matches a pinned value shipped in the app bundle.
+If either check fails, the client aborts with a hard error. There is no
+fallback path. Users never see a session that was established without a
+verified attestation.
+
+Once the attestation is accepted, the client performs an ECDH handshake
+with the public key from the attestation document. The resulting shared
+secret is used to derive a session key via HKDF-SHA256 with a
+domain-separation label of "calypso-session-v1". The session key is used
+for AES-256-GCM on every subsequent request and response.
+
+Session keys are ephemeral. They are zeroed in the enclave's memory when
+the final chunk of the response has been written. There is no disk-backed
+cache. There is no reuse across sessions.

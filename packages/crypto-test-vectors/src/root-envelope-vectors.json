@@ -1,0 +1,59 @@
+[
+  {
+    "name": "fixture-1",
+    "passphrase": "correct horse battery staple",
+    "wrapSaltHex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "chatRootHex": "0101010101010101010101010101010101010101010101010101010101010101",
+    "mnemonic": "absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter advice comic",
+    "wrapVersion": "legacy-wrap-v1",
+    "verificationConstant": "BRIANNI_CHAT_ROOT_VERIFIED_v1",
+    "wrappedRootKey": {
+      "ciphertextB64": "B+s9YKq/G2ajX58e8ZVEIXNszzm0ZqO1szOFmJ4EUg0=",
+      "ivB64": "1INaKyMIu3cfdN4e",
+      "tagB64": "nicp6XZOGqgnsKsNAsO2PQ=="
+    },
+    "verificationBlob": {
+      "ciphertextB64": "ZHqMVjASWOmd/U9l9lAN+S7I8rH7UJRx4KTReLk=",
+      "ivB64": "1b6Ic6Yxl0ZyjoFw",
+      "tagB64": "AJkNfdtQz1nzTJae/wtG+g=="
+    }
+  },
+  {
+    "name": "fixture-2",
+    "passphrase": "let-me-in-42-please-test",
+    "wrapSaltHex": "a1b2c3d4e5f6ffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "chatRootHex": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    "mnemonic": "team hospital room run swim jewel kingdom result used voice hurry text turn term satoshi stick same leave problem lava worth fine wing utility",
+    "wrapVersion": "legacy-wrap-v1",
+    "verificationConstant": "BRIANNI_CHAT_ROOT_VERIFIED_v1",
+    "wrappedRootKey": {
+      "ciphertextB64": "c1v0EUk5M1RQ0AnLL/swWEnKdnPcsyyz9YOXwQXyG7Y=",
+      "ivB64": "2fGr0XCuGNtMsZUM",
+      "tagB64": "CS1aO786/6W2/HGTuIInlA=="
+    },
+    "verificationBlob": {
+      "ciphertextB64": "KmzMaCfPjD4c2xYGXDDHdnkpGGzfrB9KJ2FuE30=",
+      "ivB64": "JObAnHLyNcNRIpMS",
+      "tagB64": "SauFdtqYfpQpnMGWA0ZSEA=="
+    }
+  },
+  {
+    "name": "fixture-3",
+    "passphrase": "hunter2-hunter2-hunter2-hunter2-hunter2",
+    "wrapSaltHex": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+    "chatRootHex": "fafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
+    "mnemonic": "wife style salt vote quick latin typical gap wife style salt vote quick latin typical gap wife style salt vote quick latin typical fortune",
+    "wrapVersion": "legacy-wrap-v1",
+    "verificationConstant": "BRIANNI_CHAT_ROOT_VERIFIED_v1",
+    "wrappedRootKey": {
+      "ciphertextB64": "+iTDPZ67xy6cNF5QGahTkShPxPcPwtwrGODqE7JtDxg=",
+      "ivB64": "xS7GUPf7AhNA2hMK",
+      "tagB64": "mXr1sRJBEydWLOofpED/dQ=="
+    },
+    "verificationBlob": {
+      "ciphertextB64": "Pgyr6mlhAl77bByhy8pgkVbXfvIDE8E9knRA8Mg=",
+      "ivB64": "YOFqBmdweVL7IOl5",
+      "tagB64": "OLB/9giEzDmDHwh4e0uNQg=="
+    }
+  }
+]

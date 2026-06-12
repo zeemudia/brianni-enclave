@@ -1,0 +1,323 @@
+# infra/docker/Dockerfile.enclave
+# Reproducible build for Calypso TEE enclave
+# Build: docker build -f infra/docker/Dockerfile.enclave -t calypso-enclave .
+#
+# PRODUCTION BLOCKERS (must resolve before first enclave release):
+# 1. [DONE] Base images pinned by digest below.
+# 2. [DONE] Offline dependency vendoring via infra/docker/vendor-deps.sh +
+#    `./enclave/build.sh --offline` (docker build --network=none against the
+#    VENDOR_DIR). Cross-host PCR0 reproducibility proof lives at
+#    docs/.archive/phase2-2026-04/14-Phase2-Reproducibility-Evidence.md once Task 13 runs.
+# 3. Extract PCR values via nitro-cli on a Nitro-capable EC2 host
+#    Docker image hashes are NOT PCR values — they are a different hash over different data
+#
+# The ARG VENDOR_DIR below defaults to infra/docker/vendor so an online
+# build still works for dev iteration. Offline / reproducible builds
+# pass --build-arg VENDOR_DIR=infra/docker/vendor plus --network=none.
+# All three `FROM` lines below pin base images by digest for PCR reproducibility.
+# To refresh the digests:
+#   docker pull node:22-slim   && docker inspect --format='{{index .RepoDigests 0}}' node:22-slim
+#   docker pull python:3.12-slim && docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim
+FROM node:22-slim@sha256:f3a68cf41a855d227d1b0ab832bed9749469ef38cf4f58182fb8c893bc462383 AS builder
+
+# Deterministic timestamps
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
+
+# Reproducibility: disable Python bytecode caching. Without this, node-gyp's
+# embedded python compiles .pyc files whose embedded compile-time header
+# (timestamp of when the .py file was last touched, per PEP 552) diverges
+# across hosts. That alone accounts for ~99% of the PCR0 non-determinism
+# we observed in the first two-host Task 13 run.
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Path (relative to the build context) where vendor-deps.sh staged the
+# offline dependencies. `./enclave/build.sh --offline` passes this via
+# --build-arg so the image can be rebuilt with --network=none.
+ARG VENDOR_DIR=infra/docker/vendor
+
+WORKDIR /app
+
+# Copy workspace package.json files. Yarn resolves the full workspace
+# graph at install time, so every workspace declared under `packages/*`
+# in the root package.json must have its manifest present even if the
+# enclave itself only depends on a subset.
+COPY enclave/package.json ./enclave/
+COPY packages/chat-types/package.json ./packages/chat-types/
+COPY packages/crypto-core/package.json ./packages/crypto-core/
+COPY packages/crypto-test-vectors/package.json ./packages/crypto-test-vectors/
+COPY packages/masking-core/package.json ./packages/masking-core/
+COPY packages/nitro-verify/package.json ./packages/nitro-verify/
+COPY packages/vsock-native/package.json ./packages/vsock-native/
+COPY package.json yarn.lock tsconfig.base.json .yarnrc.yml ./
+
+# Build tools so the vsock-native node addon compiles during install.
+# Without these, node-gyp-build silently skips (|| true in its install
+# script) and the enclave crashes at runtime with "native addon not
+# available" when it tries to connect to KMS over vsock.
+#
+# Offline build: install from vendored .debs at /tmp/vendor-apt (copied
+# in below). Online build: fall back to apt-get update + install.
+COPY ${VENDOR_DIR}/apt-builder /tmp/vendor-apt
+RUN if ls /tmp/vendor-apt/*.deb >/dev/null 2>&1; then \
+        echo "Installing builder deps from vendored .debs"; \
+        dpkg --install --force-depends /tmp/vendor-apt/*.deb || true; \
+        dpkg --configure -a; \
+    else \
+        apt-get update && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3 make g++ libc6-dev && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi && rm -rf /tmp/vendor-apt
+
+# Install the enclave + vsock-native workspaces (both get devDeps such as
+# typescript and node-gyp), skipping mobile/web/server trees entirely.
+# Focusing on vsock-native too ensures node-gyp is present so the explicit
+# rebuild step below succeeds — focusing only on @calypso/enclave skips its
+# transitive workspace's devDeps and leaves node-gyp unavailable.
+#
+# If the vendor directory exists (--offline build), point Yarn at it and
+# refuse network fetches. Otherwise fall back to the default cache — this
+# keeps online iteration working for day-to-day edits.
+COPY ${VENDOR_DIR}/ /tmp/vendor/
+# If a corepack cache was vendored, point COREPACK_HOME at it so
+# `corepack enable` doesn't reach for repo.yarnpkg.com under --network=none.
+ENV COREPACK_HOME=/tmp/vendor/corepack
+RUN corepack enable && \
+    if [ -d /tmp/vendor/npm ] && [ "$(ls -A /tmp/vendor/npm 2>/dev/null || true)" != "" ]; then \
+        echo "Using vendored yarn cache at /tmp/vendor/npm"; \
+        # Yarn 4 (Berry) offline: YARN_CACHE_FOLDER alone isn't enough — Yarn
+        # still reaches the registry for resolution metadata. YARN_ENABLE_NETWORK=0
+        # refuses any network call, forcing a fail-fast if the cache is incomplete.
+        # YARN_ENABLE_IMMUTABLE_INSTALLS=1 plus YARN_ENABLE_IMMUTABLE_CACHE=1 keep
+        # the lockfile + cache byte-identical across hosts so PCR0 stays stable.
+        YARN_ENABLE_GLOBAL_CACHE=false \
+        YARN_CACHE_FOLDER=/tmp/vendor/npm \
+        YARN_ENABLE_NETWORK=0 \
+        YARN_ENABLE_IMMUTABLE_INSTALLS=1 \
+        YARN_ENABLE_IMMUTABLE_CACHE=1 \
+        yarn workspaces focus @calypso/enclave @calypso/vsock-native; \
+    else \
+        yarn workspaces focus @calypso/enclave @calypso/vsock-native; \
+    fi
+
+# Copy source (vsock-native's .cc source must be present before node-gyp runs)
+COPY enclave/ ./enclave/
+COPY packages/ ./packages/
+
+# Build the native AF_VSOCK addon. node-gyp-build's install hook cannot run
+# this during `yarn workspaces focus` because the source isn't copied yet;
+# do it here now that both source and node-gyp are available. Output lands at
+# packages/vsock-native/build/Release/vsock_native.node which node-gyp-build
+# auto-discovers at runtime.
+#
+# Offline: extract the vendored node headers tarball and point node-gyp at
+# it via npm_config_nodedir. Without this, node-gyp tries to fetch from
+# nodejs.org and --network=none trips it. Online builds still work because
+# the else branch falls back to node-gyp's default download.
+RUN if ls /tmp/vendor/node-headers/node-v*-headers.tar.gz >/dev/null 2>&1; then \
+        NODE_VER=$(ls /tmp/vendor/node-headers/node-v*-headers.tar.gz | sed -E 's/.*node-v([0-9.]+)-headers.tar.gz/\1/'); \
+        echo "Using vendored node-${NODE_VER} headers"; \
+        tar xzf /tmp/vendor/node-headers/node-v${NODE_VER}-headers.tar.gz -C /tmp; \
+        npm_config_nodedir=/tmp/node-v${NODE_VER} yarn workspace @calypso/vsock-native run build; \
+    else \
+        yarn workspace @calypso/vsock-native run build; \
+    fi
+
+# Build TypeScript
+RUN cd enclave && yarn build
+
+# The repo keeps workspace package exports pointed at TypeScript source for
+# local bundler-mode tooling. The enclave image runs plain Node, so prepare
+# runtime JS entrypoints inside the Docker build copy before the final stage
+# copies packages.
+RUN node enclave/scripts/prepare-runtime-workspaces.mjs
+
+# Reproducibility cleanup in the builder stage: strip non-deterministic
+# build artifacts before the final COPY hands this tree to the runtime
+# stage. Without this, PCR0 rotates on every build because of .pyc cache
+# content (PEP 552 hashes) and node-gyp's Makefile with embedded absolute
+# paths.
+RUN find /app -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true; \
+    find /app -name '*.pyc' -delete 2>/dev/null || true; \
+    # Keep only the built .node binary from vsock-native/build/; the
+    # intermediate Makefile, config.gypi, .o files, etc. are not needed
+    # at runtime and embed host-specific paths.
+    if [ -d /app/packages/vsock-native/build ]; then \
+        find /app/packages/vsock-native/build -mindepth 1 -maxdepth 1 \
+             ! -name 'Release' -exec rm -rf {} + 2>/dev/null || true; \
+    fi
+
+# Final image — starts from the SAME node:22-slim base as the builder,
+# then installs Python directly so the NSM attestation helper and the
+# media/document extraction tooling are linked against one consistent
+# glibc. (The in-enclave Presidio/spaCy PII masking sidecar was removed —
+# de-identification is now on-device only; see CLAUDE.md privacy
+# invariants. enclave-pip-requirements.txt is already pruned to the
+# surviving closure; the orphaned presidio/spaCy wheels physically drop
+# from vendor/ on the next vendor-deps.sh pass that rebuilds the EIF.)
+FROM node:22-slim@sha256:f3a68cf41a855d227d1b0ab832bed9749469ef38cf4f58182fb8c893bc462383
+
+ARG VENDOR_DIR=infra/docker/vendor
+
+# Install Python deps for the NSM attestation helper (cbor2) and the
+# media/document extraction tooling (PyMuPDF, Pillow, pillow-heif, vosk).
+# --break-system-packages is required on bookworm's pip; the enclave image
+# is not a shared host.
+#
+# When the vendor directory is populated, pip installs strictly from the
+# wheel cache (--no-index) so the final stage can be produced with
+# --network=none.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+# Reproducibility: same reason as the builder stage — block Python from
+# writing .pyc bytecode caches (PEP 552 timestamp hashes) during pip
+# install. --no-compile is the pip-side switch; PYTHONDONTWRITEBYTECODE
+# covers everything else that imports Python at build time.
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV VOSK_MODEL_PATH=/opt/calypso/vosk-model-small-en-us-0.15
+ENV CALYPSO_VOSK_MODEL=/opt/calypso/vosk-model-small-en-us-0.15
+COPY ${VENDOR_DIR}/ /tmp/vendor/
+COPY infra/docker/enclave-pip-requirements.txt /tmp/enclave-pip-requirements.txt
+RUN if ls /tmp/vendor/apt-runtime/*.deb >/dev/null 2>&1; then \
+        echo "Installing runtime apt deps from vendored .debs"; \
+        dpkg --install --force-depends /tmp/vendor/apt-runtime/*.deb || true; \
+        dpkg --configure -a; \
+    else \
+        apt-get update && \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            python3 python3-pip ca-certificates ffmpeg libheif1 tesseract-ocr tesseract-ocr-eng && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi && \
+    if [ -d /tmp/vendor/pip ] && [ "$(ls -A /tmp/vendor/pip 2>/dev/null || true)" != "" ]; then \
+        echo "Using vendored pip wheels at /tmp/vendor/pip"; \
+        pip3 install --no-cache-dir --no-compile --no-index --find-links /tmp/vendor/pip \
+            --no-deps -r /tmp/enclave-pip-requirements.txt; \
+    else \
+        pip3 install --no-cache-dir --no-deps -r /tmp/enclave-pip-requirements.txt; \
+    fi && \
+    if ls /tmp/vendor/vosk/vosk-model-small-en-us-*.zip >/dev/null 2>&1; then \
+        echo "Installing Vosk transcription model from vendored zip"; \
+        mkdir -p /opt/calypso && \
+        python3 -c "import glob, zipfile; path = glob.glob('/tmp/vendor/vosk/vosk-model-small-en-us-*.zip')[0]; zipfile.ZipFile(path).extractall('/opt/calypso')"; \
+    else \
+        echo "Downloading Vosk transcription model"; \
+        mkdir -p /opt/calypso && \
+        python3 -c "import hashlib, urllib.request, zipfile; expected='30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498'; url='https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip'; path='/tmp/vosk-model-small-en-us-0.15.zip'; urllib.request.urlretrieve(url, path); actual=hashlib.sha256(open(path,'rb').read()).hexdigest(); assert actual == expected, actual; zipfile.ZipFile(path).extractall('/opt/calypso')"; \
+    fi && \
+    test -d "$VOSK_MODEL_PATH" && \
+    # Do not purge python3-pip when deps came from vendored .debs —
+    # apt-get autoremove would try to reach the index to compute the
+    # removal plan, which fails under --network=none. The image is
+    # throwaway per enclave run; a few MB of pip is acceptable.
+    if [ ! -d /tmp/vendor/apt-runtime ] || ! ls /tmp/vendor/apt-runtime/*.deb >/dev/null 2>&1; then \
+        apt-get purge -y python3-pip && apt-get autoremove -y; \
+    fi && \
+    rm -rf /tmp/vendor /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app/enclave/dist ./dist
+# Yarn 4 with the node-modules linker hoists most deps to /app/node_modules
+# (the root workspace), so the enclave's own folder may be empty or missing.
+# Copy the hoisted root set; runtime resolution still finds the enclave's
+# direct deps + transitive workspace deps.
+COPY --from=builder /app/node_modules ./node_modules
+# Yarn's node-modules linker creates SYMLINKS in /app/node_modules/@calypso/*
+# that point at /app/packages/<name>/. Copy the workspace packages too so
+# those symlinks resolve to actual source trees.
+COPY --from=builder /app/packages ./packages
+# Media/document extraction and transform sidecar.
+COPY --from=builder /app/enclave/src/tools/media_tools_service.py ./dist/tools/media_tools_service.py
+# Verify key for provider registry signature (public key — safe to bundle).
+COPY --from=builder /app/enclave/src/providers/registry-verify-key.pem ./dist/providers/registry-verify-key.pem
+
+# NSM attestation helper (Python script called by nsm.ts for /dev/nsm ioctl)
+COPY --from=builder /app/enclave/src/nsm_helper.py ./dist/nsm_helper.py
+
+# kmstool_enclave_cli + libnsm.so from aws-nitro-enclaves-sdk-c.
+# kmstool speaks TLS + SigV4 to KMS over vsock and attaches the NSM
+# attestation document itself, so the host's vsock-proxy only needs to be a
+# raw TCP forwarder (vsock:8000 → kms.<region>.amazonaws.com:443).
+# See infra/enclave-artefacts/README.md for provenance.
+COPY infra/enclave-artefacts/kmstool_enclave_cli /usr/local/bin/kmstool_enclave_cli
+COPY infra/enclave-artefacts/libnsm.so /usr/local/lib/libnsm.so
+RUN chmod +x /usr/local/bin/kmstool_enclave_cli && \
+    echo /usr/local/lib > /etc/ld.so.conf.d/aws-nitro.conf && \
+    ldconfig
+
+# Provider-key ciphertext and provider registry are BOTH host-served
+# at boot time rather than baked into the EIF. See:
+#   infra/host/keys-broker.py    (vsock:8102, serves /etc/calypso/encrypted-keys.json)
+#   infra/host/registry-broker.py (vsock:8101, serves /etc/calypso/providers.json)
+# Enclave-side clients:
+#   enclave/src/keys-client.ts    (fetches + validates encrypted-keys blob)
+#   enclave/src/registry-client.ts (fetches + Ed25519-verifies providers.json)
+# Why host-served rather than baked: any change to either file would
+# otherwise rotate PCR0, forcing a KMS policy rotation AND a mobile/
+# web client release. Host-serving decouples the two lifecycles so
+# provider-key rotation and registry updates are laptop/host-only
+# operations. Trust model: encrypted-keys is protected by the KMS
+# attestation policy (PCR0-bound); providers.json is Ed25519-signed
+# against a baked verify key (registry-verify-key.pem, already bundled
+# in the builder stage). DO NOT re-introduce a COPY of either file —
+# the P8 static gate (enclave/__tests__/p8-registry-stability.test.ts)
+# will catch it and fail CI.
+
+# Reproducibility: final-stage cleanup. Must be the LAST RUN so every file
+# COPY'd above gets its mtime normalised — otherwise COPYs after the sweep
+# retain Docker's wall-clock mtimes and rotate PCR0 between hosts.
+# - .pyc / __pycache__: a vendored package's install hook can import a module
+#   and emit bytecode; belt-and-braces removal on top of PYTHONDONTWRITEBYTECODE.
+# - /var/cache/ldconfig/aux-cache: ldconfig writes a content-addressed cache
+#   whose file-order dependency differs between builds.
+# - /var/log/dpkg.log: dpkg appends install timestamps. Truncate so the
+#   entry is present but empty (consistent across hosts).
+# - /var/cache/fontconfig/*.cache-*: fontconfig writes binary caches whose
+#   internal byte layout is non-deterministic across builds (introduced by the
+#   media stack — libfontconfig1/fontconfig-config arrive via libheif1 + Pillow).
+#   The enclave renders no fonts, so the cache is dead weight; remove it so it
+#   can't rotate PCR0. (Root-caused via two-build rootfs content diff: these
+#   caches + alternatives.log were the ONLY divergent files.)
+# - /var/log/alternatives.log: update-alternatives records each operation in a
+#   non-deterministic order across the media-package installs. Truncate like
+#   dpkg.log (present-but-empty, consistent across hosts).
+# - find -exec touch -d '@0': reset every mtime on the image FS so the EIF
+#   tarball is byte-stable regardless of when docker built it.
+RUN find / -xdev -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true; \
+    find / -xdev -name '*.pyc' -delete 2>/dev/null || true; \
+    rm -rf /var/cache/fontconfig; \
+    rm -f /var/cache/ldconfig/aux-cache /var/log/dpkg.log /var/log/alternatives.log; \
+    : > /var/log/dpkg.log; \
+    : > /var/log/alternatives.log; \
+    find / -xdev -exec touch -h -d '@0' {} + 2>/dev/null || true
+
+# Clear inherited ENTRYPOINT from node:22-slim (docker-entrypoint.sh).
+# Use an absolute path for node — linuxkit's init doesn't do a PATH search
+# the way docker run does, so "node" alone resolves to ENOENT inside the
+# enclave even when /usr/local/bin is in the image's PATH env var.
+ENTRYPOINT []
+# Bump libuv's worker pool. @calypso/vsock-native wraps AF_VSOCK fds in a
+# stream.Duplex that does I/O via fs.read/fs.write, each of which burns a
+# pool slot while in flight. The default of 4 serialises modest parallelism
+# (accept + N concurrent client I/O + the media-tooling subprocess IPC),
+# and live-fire integration tests with ~10 parallel attestations wedge.
+ENV UV_THREADPOOL_SIZE=64
+# Pin expected KMS key ARN for blob-wrapping enforcement (see
+# enclave/src/kms-client.ts KMS_KEY_ARN_MISMATCH path). Baked into the EIF
+# because nitro-cli run-enclave does not support runtime env injection —
+# setting this only in the host/server environment has no effect inside the
+# enclave process.
+#
+# Measuring this into PCR0 is a feature, not a liability: the EIF is
+# cryptographically bound to a specific KMS key; tampering requires a
+# rebuild (which rotates PCR0 and invalidates the existing KMS policy
+# binding). Rotating to a different KMS key is a coordinated change:
+# update this line, rebuild EIF (new PCR0), then rotate the client/server pins
+# and KMS PCR0 allowlist together. Rare, operator-driven.
+#
+# This ARN is public metadata, not provider-key material. It is intentionally
+# measured into PCR0 so the encrypted provider-key blob cannot be replayed
+# against a different KMS key without a new enclave release.
+ENV EXPECTED_KMS_KEY_ARN=arn:aws:kms:eu-west-2:623849685386:key/aaa30049-eb10-458c-9a0c-3c0183ac0593
+# Both node AND the entry script need absolute paths — linuxkit's init does
+# not honor Docker's WORKDIR, so relative paths resolve from / not /app.
+CMD ["/usr/local/bin/node", "/app/dist/index.js"]

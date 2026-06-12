@@ -1,0 +1,32 @@
+{
+  "name": "@calypso/crypto-test-vectors",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./conversation-vectors": "./src/conversation-vectors.ts",
+    "./citation-anchor-vectors": "./src/citation-anchor-vectors.ts",
+    "./envelope-vectors": "./src/envelope-vectors.ts",
+    "./memory-namespace.vectors.json": "./memory-namespace.vectors.json",
+    "./root-envelope-vectors": "./src/root-envelope-vectors.ts",
+    "./search-hmac-parity-vectors": "./src/search-hmac-parity-vectors.ts",
+    "./search-hmac-vectors": "./src/search-hmac-vectors.ts",
+    "./search-key-vectors": "./src/search-key-vectors.ts",
+    "./stylometric-vectors": "./src/stylometric-vectors.ts",
+    "./biometric-key-vectors": "./src/biometric-key-vectors.ts",
+    "./seed-wrapper-vectors": "./src/seed-wrapper-vectors.ts",
+    "./verification-blob-vectors": "./src/verification-blob-vectors.ts"
+  },
+  "dependencies": {
+    "@calypso/crypto-core": "workspace:*",
+    "@calypso/masking-core": "workspace:*"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.4"
+  }
+}

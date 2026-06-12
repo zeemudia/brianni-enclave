@@ -1,0 +1,16 @@
+Hello team. I am writing to ask about the new feature. I have read the
+documentation twice but still I have some questions that I hope you can
+help with. When I try to login on the mobile app I see a message that
+says the attestation has failed. I am not sure what this means.
+
+I use the latest version from the store. My device is Samsung Galaxy S23
+running Android 14. I tried to restart the device and also I tried to
+clear the cache but nothing changed. The login worked last week without
+problem. Today it does not work.
+
+Please let me know what information you need from me to help investigate
+this. I can send a log file if you tell me how to export it. I want to
+use the app again as soon as possible because I have work meetings where
+I need the chat features.
+
+Thank you for the help. I look forward to your reply. Best regards.

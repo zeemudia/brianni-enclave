@@ -1,0 +1,26 @@
+You can solve this by using `useEffect` with a cleanup function. The key
+is that the effect runs after every render where the dependency changed,
+and the cleanup runs before the next effect.
+
+Try this:
+
+```javascript
+useEffect(() => {
+  const timer = setInterval(() => {
+    console.log("tick");
+  }, 1000);
+  return () => clearInterval(timer);
+}, []);
+```
+
+The empty dependency array means the effect only runs once on mount, and
+the cleanup runs on unmount. If you want the interval to reset whenever a
+prop changes, put that prop in the dependency array.
+
+For more details see the React docs at
+https://react.dev/reference/react/useEffect and the relevant blog post
+at https://overreacted.io/a-complete-guide-to-useeffect/.
+
+One common mistake is forgetting the return statement inside the effect.
+Without it the interval keeps running after unmount and can trigger a
+"setState on unmounted component" warning in strict mode.
