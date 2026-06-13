@@ -10,6 +10,7 @@ import {
 } from '@calypso/chat-types';
 
 import {
+  DEFAULT_WRITE_SUBTASK_TIMEOUT_MS,
   runOrchestrator,
   type RunOrchestratorDeps,
 } from '../orchestrator/executor';
@@ -882,6 +883,133 @@ describe('runOrchestrator', () => {
         detail: 'ORCHESTRATOR_WORKER_TIMEOUT_AFTER_CONFIRMED_WRITE',
       }),
     );
+  });
+
+  it('gives a folder.write subtask the longer write-subtask worker timeout (generation + human-review window), not the 60s default', async () => {
+    // Live 2026-06-13 regression: a folder.write subtask must generate the
+    // whole artifact AND wait on the "Ask before saving" confirmation modal.
+    // Under the flat 60s worker timeout, a long generation or a deliberate
+    // human review trips ORCHESTRATOR_WORKER_TIMEOUT and abandons a write that
+    // would have landed clean. Write subtasks must use the longer
+    // write-subtask window instead. Here the worker stays quiet well past the
+    // (small) standard worker timeout, then emits its write — it must survive.
+    const folderPack = mkPack(['folder.write']);
+    const tool = JSON.stringify({
+      invocationId: 'inv_slow_write',
+      toolName: 'folder.write',
+      args: {
+        folderId: 'fld_1',
+        displayName: 'Documents',
+        path: 'slow-report.md',
+        contentBytesB64: Buffer.from('report body').toString('base64'),
+      },
+    });
+    let workerCalls = 0;
+    const slowWriteWorker: ChatProcessor = {
+      async *streamChat(): AsyncGenerator<ChatChunk> {
+        workerCalls += 1;
+        if (workerCalls === 1) {
+          // Quiet past the standard worker timeout (30ms) — emulates a long
+          // artifact / slow first token — then emit the write tool call.
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          yield {
+            id: 'tool',
+            choices: [
+              { delta: { content: `<tool>${tool}</tool>` }, finish_reason: 'stop' },
+            ],
+          };
+        } else {
+          // Continuation turn after the tool result: finish cleanly.
+          yield {
+            id: 'final',
+            choices: [{ delta: { content: 'Saved the report.' }, finish_reason: 'stop' }],
+          };
+        }
+      },
+    };
+    const gateway = {
+      prepareInvocation: vi.fn((frame: ToolInvocationFrame) => ({
+        ok: true,
+        wireFrame: frame,
+      })),
+      dispatch: vi.fn(async () => ({
+        invocationId: 'inv_slow_write',
+        outcome: 'ok' as const,
+        resultJson: { writtenPath: 'slow-report.md' },
+        ledgerEntry: {
+          invokedAt: new Date().toISOString(),
+          toolName: 'folder.write',
+          scope: 'folder/Documents',
+          approvedPath: 'slow-report.md',
+          outcome: 'ok' as const,
+          reason: null,
+          skillPackId: folderPack.id,
+          turnId: 'turn_1',
+        },
+      })),
+    } as unknown as ToolGateway;
+
+    const events = await collectEvents(
+      runOrchestrator(
+        baseDeps({
+          pack: folderPack,
+          gateway,
+          plannerProvider: plannerProcessor(`{
+            "planId": "plan_write",
+            "title": "Write proof",
+            "summary": "Write the terminal proof artifact.",
+            "subtasks": [
+              {
+                "id": "st_write",
+                "title": "Write proof file",
+                "objective": "Write the final proof artifact.",
+                "kind": "writing",
+                "requiredCapabilities": ["writing", "general_reasoning"],
+                "allowedTools": ["folder.write"],
+                "dependsOn": [],
+                "producesArtifact": true,
+                "risk": "low"
+              }
+            ]
+          }`),
+          workerProviderFactory: () => slowWriteWorker,
+          enabledGatewayTools: folderPack.toolScopes,
+          // Standard worker timeout is far below the 120ms generation delay,
+          // so on the OLD flat-budget behaviour the write subtask would time
+          // out before ever dispatching. The write-subtask timeout is larger.
+          workerTimeoutMs: 30,
+          writeSubtaskTimeoutMs: 2_000,
+        }),
+      ),
+    );
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: 'ledger',
+        entry: expect.objectContaining({ toolName: 'folder.write', outcome: 'ok' }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: 'orchestrator-progress',
+        subtaskId: 'st_write',
+        status: 'done',
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: 'orchestrator-progress',
+        subtaskId: 'st_write',
+        status: 'error',
+      }),
+    );
+  });
+
+  it('DEFAULT_WRITE_SUBTASK_TIMEOUT_MS matches the binary-write ack window and exceeds the 60s default', () => {
+    // A confirmation-gated text write must get the same human-review +
+    // durable-write window a media/binary write already gets.
+    expect(DEFAULT_WRITE_SUBTASK_TIMEOUT_MS).toBe(5 * 60_000);
+    expect(DEFAULT_WRITE_SUBTASK_TIMEOUT_MS).toBeGreaterThan(60_000);
   });
 
   it('waits for a pending always-ask folder.write result after worker timeout and surfaces the ledger once', async () => {

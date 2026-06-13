@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { EnclaveRouter } from "../index";
+import { EnclaveRouter, clientInvocationTimeoutMs } from "../index";
 import { encodeFrame, MSG } from "../vsock";
 import { webcrypto } from "node:crypto";
 import type {
@@ -224,5 +224,39 @@ describe("EnclaveRouter — invocation timeout (codex R4 finding #5)", () => {
       /Math\.min\(\s*this\.invocationTimeoutMs,\s*remainingMs\s*\)/,
     );
     expect(indexSource).toMatch(/if\s*\(remainingMs\s*<=\s*0\)/);
+  });
+});
+
+describe("clientInvocationTimeoutMs — confirmation-gated write window", () => {
+  const timeouts = {
+    invocationTimeoutMs: 60_000,
+    confirmationGatedWriteTimeoutMs: 5 * 60_000,
+  };
+
+  it("folder.write gets the long human-review / durable-write window", () => {
+    // In "Ask before saving" mode folder.write blocks on the user's
+    // confirmation modal, which emits NO interim chunks to refresh the idle
+    // timer — so it must not be cut off at the 60s machine-round-trip default.
+    expect(clientInvocationTimeoutMs("folder.write", timeouts)).toBe(5 * 60_000);
+  });
+
+  it("every other client tool keeps the short machine-round-trip timeout", () => {
+    for (const toolName of [
+      "memory.list",
+      "memory.write",
+      "file.read",
+      "folder.read",
+      "web.fetch",
+      "image.generate",
+    ]) {
+      expect(clientInvocationTimeoutMs(toolName, timeouts)).toBe(60_000);
+    }
+  });
+
+  it("the resolver wires folder.write to the binary-write ack window", () => {
+    expect(indexSource).toContain("clientInvocationTimeoutMs(");
+    expect(indexSource).toMatch(
+      /confirmationGatedWriteTimeoutMs:\s*DEFAULT_BINARY_WRITE_ACK_TIMEOUT_MS/,
+    );
   });
 });

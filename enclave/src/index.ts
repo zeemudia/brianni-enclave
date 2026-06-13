@@ -129,6 +129,29 @@ const ORCHESTRATOR_PROVIDER_CALL_BUDGET_BY_PLAN = {
   MAX: 17,
 } as const;
 
+/**
+ * How long the per-invocation resolver waits for a client TOOL_RESULT before
+ * giving up. `folder.write` is the exception: in "Ask before saving" mode it
+ * blocks on the user's confirmation modal, which emits NO interim chunks to
+ * refresh the idle timer — so a deliberate human review (reading a generated
+ * report/letter before approving) must not be cut off at the short
+ * machine-round-trip default. Give it the same human-review + durable-write
+ * window a binary/media write already gets (the confirmation-gated window).
+ * Every other tool keeps the short timeout so a dead client can't hang a turn.
+ * Pure + exported so the policy is unit-tested without standing up a session.
+ */
+export function clientInvocationTimeoutMs(
+  toolName: string,
+  timeouts: {
+    invocationTimeoutMs: number;
+    confirmationGatedWriteTimeoutMs: number;
+  },
+): number {
+  return toolName === "folder.write"
+    ? timeouts.confirmationGatedWriteTimeoutMs
+    : timeouts.invocationTimeoutMs;
+}
+
 type InvocationResolver = (result: ToolResultFrame) => void;
 
 type ChatModelSelection = {
@@ -1691,10 +1714,15 @@ export class EnclaveRouter {
           const buildResolverPromise = (
             key: string,
             invocationId: string,
+            initialTimeoutMs: number = this.invocationTimeoutMs,
           ): Promise<ToolResultFrame> => {
             return new Promise<ToolResultFrame>((resolve) => {
+              // A confirmation-gated write (folder.write) legitimately waits on
+              // a human for longer than the chunk-round-trip default, so the
+              // absolute cap must clear its initial window too.
               const absoluteInvocationDeadline =
-                Date.now() + this.invocationTimeoutMs * 10;
+                Date.now() +
+                Math.max(this.invocationTimeoutMs * 10, initialTimeoutMs);
               let settled = false;
               let timer: ReturnType<typeof setTimeout>;
 
@@ -1714,7 +1742,7 @@ export class EnclaveRouter {
                 timer = setTimeout(resolveWithTimeout, delayMs);
               };
 
-              armTimeout(this.invocationTimeoutMs);
+              armTimeout(initialTimeoutMs);
               // Refresher: clear + rearm the timer. Called by the
               // chunked TOOL_RESULT handler each time a chunk lands so
               // a slow-but-progressing client doesn't trip the
@@ -1843,7 +1871,15 @@ export class EnclaveRouter {
                 this.preRegisteredResolverPromises.delete(key);
                 return preRegistered;
               }
-              return buildResolverPromise(key, frame.invocationId);
+              return buildResolverPromise(
+                key,
+                frame.invocationId,
+                clientInvocationTimeoutMs(frame.toolName, {
+                  invocationTimeoutMs: this.invocationTimeoutMs,
+                  confirmationGatedWriteTimeoutMs:
+                    DEFAULT_BINARY_WRITE_ACK_TIMEOUT_MS,
+                }),
+              );
             },
             // Layer 3: surface the EXACT compiled outbound query to the client
             // for mid-turn approval. Called from tier-research.run, which runs
@@ -2226,7 +2262,15 @@ export class EnclaveRouter {
                 if (!this.preRegisteredResolverPromises.has(key)) {
                   this.preRegisteredResolverPromises.set(
                     key,
-                    buildResolverPromise(key, item.frame.invocationId),
+                    buildResolverPromise(
+                      key,
+                      item.frame.invocationId,
+                      clientInvocationTimeoutMs(item.frame.toolName, {
+                        invocationTimeoutMs: this.invocationTimeoutMs,
+                        confirmationGatedWriteTimeoutMs:
+                          DEFAULT_BINARY_WRITE_ACK_TIMEOUT_MS,
+                      }),
+                    ),
                   );
                 }
                 const encrypted = await encryptChunk(

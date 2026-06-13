@@ -45,6 +45,19 @@ export const MAX_WORKING_MEMORY_CHARS = 8_000;
 const MAX_ORCHESTRATOR_TEXT_CHARS = 8_000;
 const MAX_SUPPRESSED_PRE_WRITE_TEXT_CHARS = 1_000;
 const DEFAULT_WRITE_DISPATCH_GRACE_MS = 60_000;
+/**
+ * Worker timeout for a `folder.write` subtask. Unlike a read/reasoning worker
+ * (which streams within seconds or it's genuinely stuck), a write worker must
+ * (1) generate the entire artifact as the write tool-call argument AND then
+ * (2) sit blocked on the client's "Ask before saving" confirmation modal until
+ * a human approves — which sends no interim events to keep the worker "alive".
+ * The flat 60s default abandons such writes as ORCHESTRATOR_WORKER_TIMEOUT even
+ * when the file lands clean (live 2026-06-13 finding). Give write subtasks the
+ * same human-review + durable-write window a binary/media write already gets
+ * (mirrors index.ts DEFAULT_BINARY_WRITE_ACK_TIMEOUT_MS = 5 min), and the
+ * matching client-invocation resolver timeout for the dispatch itself.
+ */
+export const DEFAULT_WRITE_SUBTASK_TIMEOUT_MS = 5 * 60_000;
 const ARTIFACT_PRODUCING_TOOLS = {
   'memory.list': false,
   'memory.read': false,
@@ -98,6 +111,13 @@ export interface RunOrchestratorDeps {
   providerCallBudget?: number;
   plannerTimeoutMs?: number;
   workerTimeoutMs?: number;
+  /**
+   * Worker timeout for folder.write subtasks (generation + human confirmation).
+   * Defaults to {@link DEFAULT_WRITE_SUBTASK_TIMEOUT_MS}. Falls back to
+   * workerTimeoutMs when set but writeSubtaskTimeoutMs is not, so existing tests
+   * that inject only workerTimeoutMs keep driving write-subtask timing.
+   */
+  writeSubtaskTimeoutMs?: number;
   writeDispatchGraceMs?: number;
   summaryTimeoutMs?: number;
   nowMs?: () => number;
@@ -629,6 +649,14 @@ export async function* runOrchestrator(
 
     const requiresReadResultTool = subtaskRequiresReadResultTool(subtask);
     const requiresFolderWriteTool = subtaskRequiresFolderWriteTool(subtask);
+    // A folder.write subtask must generate the artifact AND wait on the human
+    // confirmation modal, so it gets the longer write-subtask window; every
+    // other subtask keeps the short worker timeout (a quiet worker is stuck).
+    const subtaskWorkerTimeoutMs = requiresFolderWriteTool
+      ? deps.writeSubtaskTimeoutMs ??
+        deps.workerTimeoutMs ??
+        DEFAULT_WRITE_SUBTASK_TIMEOUT_MS
+      : deps.workerTimeoutMs ?? 60_000;
     const workerPrompt = [
       `Subtask: ${subtask.title}`,
       `Objective: ${subtask.objective}`,
@@ -721,7 +749,7 @@ export async function* runOrchestrator(
                   model: modelId,
                 },
               ),
-            deps.workerTimeoutMs ?? 60_000,
+            subtaskWorkerTimeoutMs,
             deps.abortSignal,
             {
               shouldDeferTimeout: () => pendingFolderWriteDispatch,
