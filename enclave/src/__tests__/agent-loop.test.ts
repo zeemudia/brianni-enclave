@@ -133,6 +133,103 @@ describe("runAgentLoop", () => {
     ).toContain("Found one detail.");
   });
 
+  it("appends the assistant's own turn (with its tool fence) to the transcript before the result reinjection", async () => {
+    // Live finding 2026-06-12: the loop reinjected tool RESULTS as user
+    // messages but never appended the assistant's own tool-call turn, so on
+    // iteration N+1 the model saw orphaned "untrusted data" confirmations for
+    // calls it (in its visible context) never made. For side-effecting tools
+    // the model then re-issued the call every iteration — memory.write wrote
+    // 10 duplicate records per task and memory.list looped until the tool
+    // budget killed the task.
+    const pack = mkPack(["memory.list", "memory.read"]);
+    const tool = JSON.stringify({
+      toolName: "memory.list",
+      args: { namespace: "default" },
+    });
+    const capturedMessages: ChatMessage[][] = [];
+    const provider: ChatProcessor = {
+      async *streamChat(messages): AsyncGenerator<ChatChunk> {
+        capturedMessages.push(JSON.parse(JSON.stringify(messages)));
+        const content =
+          capturedMessages.length === 1
+            ? `Checking your saved details. <tool>${tool}</tool>`
+            : "All done.";
+        yield {
+          id: `c${capturedMessages.length}`,
+          choices: [{ delta: { content }, finish_reason: "stop" }],
+        };
+      },
+    };
+    const bridge = mkBridge((frame) => ({
+      invocationId: frame.invocationId,
+      outcome: "ok",
+      resultJson: { records: [] },
+    }));
+    const deps: AgentLoopDeps = {
+      gateway: new ToolGateway({ clientBridge: bridge }),
+      provider,
+      pack,
+      agentTurnId: "turn1",
+    };
+    await collectEvents(
+      runAgentLoop(deps, { messages: [{ role: "user", content: "hi" }] }),
+    );
+
+    expect(capturedMessages).toHaveLength(2);
+    const second = capturedMessages[1];
+    // The model's second call must see, in order: ... its OWN assistant turn
+    // containing the tool fence it emitted, then the tool result as the next
+    // (user-role) message — never an orphaned result.
+    const assistantIdx = second.findIndex(
+      (m) =>
+        m.role === "assistant" &&
+        m.content.includes("Checking your saved details.") &&
+        m.content.includes("<tool>") &&
+        m.content.includes("memory.list"),
+    );
+    expect(assistantIdx, "assistant turn with its tool fence").toBeGreaterThan(
+      -1,
+    );
+    const resultMsg = second[assistantIdx + 1];
+    expect(resultMsg?.role).toBe("user");
+    expect(resultMsg?.content).toContain("Tool result — memory.list");
+    expect(resultMsg?.content).toContain("outcome: ok");
+  });
+
+  it("appends the assistant turn before a parse-error reinjection so the model sees its malformed fence", async () => {
+    const pack = mkPack(["memory.list"]);
+    const capturedMessages: ChatMessage[][] = [];
+    const provider: ChatProcessor = {
+      async *streamChat(messages): AsyncGenerator<ChatChunk> {
+        capturedMessages.push(JSON.parse(JSON.stringify(messages)));
+        const content =
+          capturedMessages.length === 1
+            ? "Trying a call. <tool>{not json"
+            : "Recovered.";
+        yield {
+          id: `c${capturedMessages.length}`,
+          choices: [{ delta: { content }, finish_reason: "stop" }],
+        };
+      },
+    };
+    const deps: AgentLoopDeps = {
+      gateway: new ToolGateway({ clientBridge: { invokeClient: vi.fn() } }),
+      provider,
+      pack,
+      agentTurnId: "turn1",
+    };
+    await collectEvents(
+      runAgentLoop(deps, { messages: [{ role: "user", content: "hi" }] }),
+    );
+    expect(capturedMessages).toHaveLength(2);
+    const second = capturedMessages[1];
+    const assistantIdx = second.findIndex(
+      (m) => m.role === "assistant" && m.content.includes("Trying a call."),
+    );
+    expect(assistantIdx).toBeGreaterThan(-1);
+    expect(second[assistantIdx + 1]?.role).toBe("user");
+  });
+
   it("suppresses an exact duplicate folder.write after the first write succeeds", async () => {
     const pack = mkPack(["folder.write"]);
     const folderWriteTool = JSON.stringify({
@@ -212,6 +309,77 @@ describe("runAgentLoop", () => {
     const duplicateReinjection = capturedMessages[2][capturedMessages[2].length - 1];
     expect(duplicateReinjection.content).toContain("DUPLICATE_WRITE_SUPPRESSED");
     expect(duplicateReinjection.content).toContain("cascade-survival-proof.md");
+    expect(events.at(-1)).toMatchObject({ kind: "done" });
+  });
+
+  it("suppresses a same-path folder.write even when the regenerated content differs", async () => {
+    // Live finding 2026-06-12 (T1 duplicate-write race): after a worker
+    // timeout-retry the model regenerated the file content with small
+    // textual differences, so the exact-args dedup key missed and the same
+    // path was written twice ("may-summary.md" + the client's copy-on-write
+    // "may-summary 2.md"). Within one turn, a second write to the SAME
+    // folder+path is always the duplicate race — key on destination, not
+    // content.
+    const pack = mkPack(["folder.write"]);
+    const writeTo = (content: string) =>
+      JSON.stringify({
+        toolName: "folder.write",
+        args: {
+          folderId: "fld_1",
+          displayName: "Documents",
+          path: "may-summary.md",
+          contentBytesB64: Buffer.from(content).toString("base64"),
+        },
+      });
+    const capturedMessages: ChatMessage[][] = [];
+    const provider: ChatProcessor = {
+      async *streamChat(messages): AsyncGenerator<ChatChunk> {
+        capturedMessages.push(JSON.parse(JSON.stringify(messages)));
+        const content =
+          capturedMessages.length === 1
+            ? `<tool>${writeTo("# Summary v1")}</tool>`
+            : capturedMessages.length === 2
+              ? `<tool>${writeTo("# Summary v2 (regenerated)")}</tool>`
+              : "Saved.";
+        yield {
+          id: `c${capturedMessages.length}`,
+          choices: [{ delta: { content }, finish_reason: "stop" }],
+        };
+      },
+    };
+    const gateway = {
+      prepareInvocation: vi.fn((frame: ToolInvocationFrame) => ({
+        ok: true,
+        wireFrame: frame,
+      })),
+      dispatch: vi.fn(async (frame: ToolInvocationFrame) => ({
+        invocationId: frame.invocationId,
+        outcome: "ok" as const,
+        resultJson: { writtenPath: "may-summary.md" },
+        ledgerEntry: {
+          invokedAt: new Date().toISOString(),
+          toolName: frame.toolName,
+          scope: "folder/Documents",
+          approvedPath: "may-summary.md",
+          outcome: "ok" as const,
+          reason: null,
+          skillPackId: pack.id,
+          turnId: "turn1",
+        },
+      })),
+    } as unknown as ToolGateway;
+
+    const events = await collectEvents(
+      runAgentLoop(
+        { gateway, provider, pack, agentTurnId: "turn1" },
+        { messages: [{ role: "user", content: "write summary" }] },
+      ),
+    );
+
+    expect(gateway.dispatch).toHaveBeenCalledTimes(1);
+    expect(events.filter((e) => e.kind === "tool-invocation")).toHaveLength(1);
+    const last = capturedMessages[2]?.at(-1);
+    expect(last?.content).toContain("DUPLICATE_WRITE_SUPPRESSED");
     expect(events.at(-1)).toMatchObject({ kind: "done" });
   });
 

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   AgentTaskPlanSchema,
+  type ChatChunk,
   type ChatProcessor,
   type ToolName,
 } from '@calypso/chat-types';
@@ -242,6 +243,83 @@ describe('createTaskPlan', () => {
     ]);
     expect(plan.planId).not.toBe('plan_openai_application');
     expect(plan.planId).toMatch(/^plan_/);
+  });
+
+  it('strips folder/file tools from planning when no folder is linked (2026-06-12 finding 2)', async () => {
+    // Live: with "No folder linked" the planner still scheduled
+    // "Write prioritised checklist" / "Save notes to file" folder.write
+    // subtasks, which died with ORCHESTRATOR_REQUIRED_WRITE_NOT_CALLED.
+    // linkedFolderCount was a prompt hint the model ignored — enforce it.
+    const capturedPrompts: string[] = [];
+    const planUsingFolderWrite = `
+<plan id="planner_nofolder">
+{
+  "planId": "plan_checklist",
+  "title": "Write checklist",
+  "summary": "Write and save a checklist.",
+  "subtasks": [
+    {
+      "id": "st_checklist",
+      "title": "Write checklist",
+      "objective": "Write the checklist file.",
+      "kind": "writing",
+      "requiredCapabilities": ["writing"],
+      "allowedTools": ["folder.write"],
+      "dependsOn": [],
+      "producesArtifact": true,
+      "risk": "low"
+    }
+  ]
+}
+</plan>`;
+    const provider: ChatProcessor = {
+      async *streamChat(messages): AsyncGenerator<ChatChunk> {
+        capturedPrompts.push(messages[0]?.content ?? '');
+        yield {
+          id: 'p1',
+          choices: [
+            { delta: { content: planUsingFolderWrite }, finish_reason: 'stop' },
+          ],
+        };
+      },
+    };
+
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_nofolder',
+      userText: 'sort out my life admin',
+      toolScopes: [
+        'memory.list',
+        'memory.read',
+        'memory.write',
+        'folder.list',
+        'folder.read',
+        'folder.write',
+        'file.read',
+      ],
+      linkedFolderCount: 0,
+    });
+
+    // The prompt must not advertise folder-dependent tools and must explain
+    // why, so the model plans chat-deliverable subtasks instead.
+    const availableLine = capturedPrompts[0]
+      .split('\n')
+      .find((l) => l.startsWith('Available tools:'));
+    expect(availableLine).toBeDefined();
+    expect(availableLine).not.toContain('folder.');
+    expect(availableLine).not.toContain('file.read');
+    expect(capturedPrompts[0]).toContain('no folder is linked');
+
+    // Whatever plan comes back (corrected or fallback), no subtask may be
+    // granted a folder-dependent tool.
+    for (const subtask of plan.subtasks) {
+      for (const tool of subtask.allowedTools) {
+        expect(tool, `subtask ${subtask.id}`).not.toMatch(
+          /^folder\.|^file\.read$/,
+        );
+      }
+    }
   });
 
   it('does NOT collapse a multi-intent fetch+folder+write request (A17) onto the single-subtask shape', async () => {

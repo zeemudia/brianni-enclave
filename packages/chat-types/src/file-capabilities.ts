@@ -55,6 +55,11 @@ export const FILE_CAPABILITY_FAMILIES = [
       ".json",
       ".yaml",
       ".yml",
+      // CSV/TSV are plain text and the single most common bank/finance
+      // export format; their absence made every "analyse my statement"
+      // task fail with an opaque BRIDGE_ERROR (live finding 2026-06-12).
+      ".csv",
+      ".tsv",
     ],
     listRead: "supported",
     understand: "plain-text",

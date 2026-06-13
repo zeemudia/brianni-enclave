@@ -31,6 +31,15 @@ describe("file capability registry", () => {
     expect(md?.write).toBe("native-text");
   });
 
+  it("treats csv/tsv as plain text (bank-export regression, 2026-06-12)", () => {
+    for (const ext of [".csv", ".tsv"]) {
+      const cap = getCapabilityForExtension(ext);
+      expect(cap?.id, ext).toBe("text");
+      expect(cap?.listRead, ext).toBe("supported");
+      expect(cap?.understand, ext).toBe("plain-text");
+    }
+  });
+
   it("marks proprietary and cloud stubs honestly", () => {
     expect(getCapabilityForExtension(".pages")?.understand).toBe(
       "preview-or-export",

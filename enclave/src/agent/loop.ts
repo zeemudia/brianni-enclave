@@ -262,6 +262,14 @@ export async function* runAgentLoop(
       const parser = new ToolCallStreamParser();
       let pendingTool: ToolInvocationFrame | null = null;
       let pendingParseError: string | null = null;
+      // The model's raw output for THIS provider call, including any tool
+      // fence verbatim. Appended to the transcript as the assistant's own
+      // turn before a result is reinjected — without it the model sees
+      // orphaned "untrusted data" tool results for calls it (in its visible
+      // context) never made, and re-issues side-effecting calls every
+      // iteration (the 2026-06-12 memory.write/memory.list budget-death
+      // loops: 10 duplicate records per task).
+      let assistantRaw = '';
 
       const stream = deps.provider.streamChat(messages, {
         model: input.model ?? '',
@@ -282,6 +290,7 @@ export async function* runAgentLoop(
         const chunk = next.value;
         const delta = chunk.choices[0]?.delta.content;
         if (typeof delta !== 'string' || delta.length === 0) continue;
+        assistantRaw += delta;
         for (const ev of parser.push(delta)) {
           if (ev.kind === 'text') {
             const text = transformChunk(ev.value);
@@ -320,6 +329,14 @@ export async function* runAgentLoop(
             pendingParseError = ev.reason;
           }
         }
+      }
+
+      // Preserve the assistant's own turn in the transcript before ANY
+      // reinjection path runs (tool result, parse error, gateway rejection,
+      // duplicate suppression). The model must always see its prior call as
+      // its own — never just the result.
+      if ((pendingTool || pendingParseError) && assistantRaw.length > 0) {
+        messages.push({ role: 'assistant', content: assistantRaw });
       }
 
       if (pendingParseError) {
@@ -475,6 +492,16 @@ export async function* runAgentLoop(
 }
 
 function duplicateSideEffectKey(frame: ToolInvocationFrame): string {
+  // folder.write dedups on DESTINATION, not full args: after a timeout-retry
+  // the model regenerates the content with textual drift, so an exact-args
+  // key misses and the same path gets written twice (live 2026-06-12 — the
+  // client's copy-on-write then produced "name 2.md" duplicates). Within a
+  // single turn, a second write to the same folder+path is the duplicate
+  // race, not a legitimate revision.
+  if (frame.toolName === 'folder.write') {
+    const args = isRecord(frame.args) ? frame.args : {};
+    return `folder.write:${String(args.folderId ?? '')}:${String(args.path ?? '')}`;
+  }
   return `${frame.toolName}:${stableJson(frame.args)}`;
 }
 

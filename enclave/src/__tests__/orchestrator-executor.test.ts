@@ -228,7 +228,20 @@ function baseDeps(overrides: Partial<RunOrchestratorDeps> = {}): RunOrchestrator
     enabledGatewayTools: pack.toolScopes,
     enabledEndpointFamilies: ['chat'],
     messages: [{ role: 'user' as const, content: 'Write an application letter.' }],
-    requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const },
+    // A granted folder by default: most fixtures exercise folder.write plans,
+    // and since the 2026-06-12 fix the planner refuses folder-dependent tools
+    // for folderless workspaces. No-folder behaviour is tested explicitly in
+    // orchestrator-planner.test.ts.
+    requestContext: {
+      linkedFolders: [
+        {
+          folderId: 'fld_test',
+          displayName: 'Documents',
+          status: 'granted' as const,
+        },
+      ],
+      writePermissionMode: 'always_ask' as const,
+    },
     ...overrides,
   };
 }
@@ -1266,7 +1279,13 @@ describe('runOrchestrator', () => {
     );
   });
 
-  it('does not mark a folder.write artifact subtask done when the worker streams prose but never writes', async () => {
+  it('errors a never-written folder.write subtask but DELIVERS the suppressed text as fallback', async () => {
+    // 2026-06-12 live finding 3/3b: workers generated the full deliverable
+    // (2,427 and 3,392 chars seen) as suppressed pre-write text, never called
+    // folder.write, and the artifact was silently discarded — the user got a
+    // green banner and nothing else. Suppression remains correct on the
+    // success path (the file is the deliverable); on the failure path the
+    // prepared content must reach the user as subtask text.
     const folderPack = mkPack(['folder.write']);
     const events = await collectEvents(
       runOrchestrator(
@@ -1311,12 +1330,15 @@ describe('runOrchestrator', () => {
         status: 'done',
       }),
     );
-    expect(events).not.toContainEqual(
-      expect.objectContaining({
-        kind: 'orchestrator-text',
-        subtaskId: 'st_write',
-      }),
-    );
+    const fallbackText = events
+      .filter(
+        (e): e is Extract<typeof e, { kind: 'orchestrator-text' }> =>
+          e.kind === 'orchestrator-text' && e.subtaskId === 'st_write',
+      )
+      .map((e) => e.text)
+      .join('');
+    expect(fallbackText).toContain('I wrote the file.');
+    expect(fallbackText).toContain('could not be saved');
   });
 
   it('does not require folder.write when another artifact tool is available for the subtask', async () => {

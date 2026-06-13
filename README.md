@@ -11,9 +11,9 @@ If a rebuild on the documented toolchain stops matching the pinned PCR0, treat i
 ## Current pinned measurement
 
 ```
-PCR0: f89a5d12c4761018c8dce806e3d9d959f40621fea988d93ed4dc83a1e626c56145e3acee0147472c76113e8f78215705
+PCR0: f64d680afaefd4c1473e9c3314ff99d040dcb5f41b22894699af05907d5663d1941b46ba98aa9e205f6c70c86aa81eaf
 PCR1: 4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493
-PCR2: 1f2ef78d797da587cb8a73335fc06506963192406fd1550048d36c3cf962b01872e2dc5aeffa391c853836e1cff995e6
+PCR2: fff8a3900c38f12fa33a4feb3c5ff0ec5dc344608c8a9ebcfb47569f15106aeffeed2a9ad85ab12c084f2bd9d34de5d5
 ```
 
 - **Verified through the clean-host release path.** On 2026-06-12, this EIF was built from a clean git ref on a temporary Nitro builder, booted in Nitro release mode on a separate Nitro host, and verified through local vsock health plus public attestation health. Every entry is appended to [`VERIFICATIONS.md`](./VERIFICATIONS.md) — contribute your own rebuild there.
@@ -89,7 +89,7 @@ not produce PCR0; that still requires a Nitro-capable EC2 host.
 # 1. Clone this repo onto a Nitro host.
 git clone https://github.com/zeemudia/brianni-enclave.git
 cd brianni-enclave
-git checkout v1.0.0-pcr0-f89a5d12
+git checkout v1.0.0-pcr0-f64d680a
 
 # Verify the signed release tag. The expected Brianni release key fingerprint is:
 # SHA256:vgDASzXg3D8A2xNUFxDkzbCX8ZbauHknSoSilN+AwIA
@@ -98,7 +98,7 @@ iosazee1@gmail.com,zee@zeemudia.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI
 EOF
 git config --local gpg.format ssh
 git config --local gpg.ssh.allowedSignersFile /tmp/brianni-enclave.allowed_signers
-git verify-tag v1.0.0-pcr0-f89a5d12
+git verify-tag v1.0.0-pcr0-f64d680a
 
 # 2. One-time bootstrap on Amazon Linux 2023:
 sudo dnf install -y docker aws-nitro-enclaves-cli \

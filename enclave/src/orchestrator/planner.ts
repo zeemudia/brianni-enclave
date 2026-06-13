@@ -91,9 +91,39 @@ type FallbackSpec = {
   risk?: AgentSubtask['risk'];
 };
 
+/**
+ * Tools that are inert without a granted linked folder. When
+ * `linkedFolderCount === 0` they are removed from the planner's available
+ * set ENTIRELY (prompt, plan validation, fallback specs) — the count used to
+ * be only a prompt hint, and the planner scheduled folder.write subtasks for
+ * folderless workspaces that then died with
+ * ORCHESTRATOR_REQUIRED_WRITE_NOT_CALLED (live finding 2026-06-12).
+ */
+const FOLDER_DEPENDENT_TOOLS: ReadonlySet<string> = new Set([
+  'folder.list',
+  'folder.read',
+  'folder.write',
+  'file.read',
+]);
+
+function scopesForFolderAvailability(
+  toolScopes: ToolName[],
+  linkedFolderCount: number,
+): ToolName[] {
+  if (linkedFolderCount > 0) return toolScopes;
+  return toolScopes.filter((tool) => !FOLDER_DEPENDENT_TOOLS.has(tool));
+}
+
 export async function createTaskPlan(
-  input: CreateTaskPlanInput,
+  rawInput: CreateTaskPlanInput,
 ): Promise<AgentTaskPlan> {
+  const input: CreateTaskPlanInput = {
+    ...rawInput,
+    toolScopes: scopesForFolderAvailability(
+      rawInput.toolScopes,
+      rawInput.linkedFolderCount,
+    ),
+  };
   if (input.abortSignal?.aborted) throw new Error('ORCHESTRATOR_CANCELLED');
 
   const plannerTag = input.plannerTag ?? randomUUID();
@@ -161,8 +191,15 @@ export async function createTaskPlan(
 export function createFallbackTaskPlan(input: {
   userText: string;
   toolScopes: ToolName[];
+  /** When provided and 0, folder-dependent tools are excluded (see above). */
+  linkedFolderCount?: number;
 }): AgentTaskPlan {
-  return fallbackPlan(input.userText, input.toolScopes);
+  return fallbackPlan(
+    input.userText,
+    input.linkedFolderCount === undefined
+      ? input.toolScopes
+      : scopesForFolderAvailability(input.toolScopes, input.linkedFolderCount),
+  );
 }
 
 function buildPlannerPrompt(
@@ -209,7 +246,9 @@ function buildPlannerPrompt(
     example,
     '',
     `Available tools: ${input.toolScopes.join(', ') || 'none'}`,
-    `Linked folder count: ${input.linkedFolderCount}`,
+    input.linkedFolderCount > 0
+      ? `Linked folder count: ${input.linkedFolderCount}`
+      : 'Linked folder count: 0 — no folder is linked. Folder and file tools are unavailable; plan subtasks that deliver content directly in the reply.',
     '',
     `User task: ${input.userText}`,
   ].join('\n');

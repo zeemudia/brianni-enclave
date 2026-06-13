@@ -285,7 +285,15 @@ export function assembleSystemPrompt(
     '',
     regulatedInfoRule,
     '',
-    "Tool availability contract: the Available tools list below is authoritative for this turn and may be narrower than the skill's general description. Only those tools are callable. Use exact tool names only; do not invent aliases or unlisted tool names.",
+    [
+      "Tool availability contract: the Available tools list below is authoritative for this turn and may be narrower than the skill's general description. Only those tools are callable. Use exact tool names only; do not invent aliases or unlisted tool names.",
+      // Name the live trap only when web access exists; when it does not,
+      // say so without naming out-of-scope tools (a guard test asserts
+      // unscoped tool names never appear in the prompt).
+      pack.toolScopes.includes('web.fetch')
+        ? 'There is no web.search tool — web.fetch is the only web tool.'
+        : 'No web access is available this turn: complete the task without the web and say plainly what you could not look up.',
+    ].join(' '),
     '',
     'Available tools:',
     scoped,

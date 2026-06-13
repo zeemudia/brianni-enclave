@@ -234,7 +234,12 @@ describe('orchestrator egress memory isolation', () => {
         },
       ],
       requestContext: {
-        linkedFolders: [],
+        // These fixtures read the linked Documents folder; since the
+        // 2026-06-12 fix the planner refuses folder tools for folderless
+        // workspaces, so the folder must exist for the plan to validate.
+        linkedFolders: [
+          { folderId: 'fld_docs', displayName: 'Documents', status: 'granted' as const },
+        ],
         writePermissionMode: 'always_ask' as const,
       },
       workerTimeoutMs: 5_000,
@@ -420,7 +425,12 @@ describe('orchestrator egress memory isolation', () => {
         },
       ],
       requestContext: {
-        linkedFolders: [],
+        // These fixtures read the linked Documents folder; since the
+        // 2026-06-12 fix the planner refuses folder tools for folderless
+        // workspaces, so the folder must exist for the plan to validate.
+        linkedFolders: [
+          { folderId: 'fld_docs', displayName: 'Documents', status: 'granted' as const },
+        ],
         writePermissionMode: 'always_ask' as const,
       },
       workerTimeoutMs: 5_000,

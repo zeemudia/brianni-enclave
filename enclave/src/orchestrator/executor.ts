@@ -349,6 +349,7 @@ export async function* runOrchestrator(
       plan = createFallbackTaskPlan({
         userText,
         toolScopes: deps.pack.toolScopes,
+        linkedFolderCount: deps.requestContext?.linkedFolders?.length ?? 0,
       });
       yield {
         kind: 'orchestrator-progress',
@@ -953,6 +954,27 @@ export async function* runOrchestrator(
           progressDetail = 'ORCHESTRATOR_WORKER_TIMEOUT_AFTER_WRITE_DISPATCH';
         }
       }
+      // A worker that died (e.g. timed out) before ever dispatching its
+      // required write may still have generated the deliverable as suppressed
+      // pre-write text — deliver it rather than discard it. Never fires when
+      // the write was dispatched (the file may have landed; text would
+      // duplicate it).
+      if (
+        requiresFolderWriteTool &&
+        !invokedFolderWriteTool &&
+        suppressedPreWriteText.trim().length > 0
+      ) {
+        const fallback = `The file could not be saved to your folder, so here is the prepared content:\n\n${suppressedPreWriteText}`;
+        for (const text of splitTextForOrchestrator(fallback)) {
+          yield {
+            kind: 'orchestrator-text',
+            planId: plan.planId,
+            subtaskId: subtask.id,
+            role: subtask.producesArtifact ? 'final_artifact' : 'working',
+            text,
+          };
+        }
+      }
       yield {
         kind: 'orchestrator-progress',
         planId: plan.planId,
@@ -1043,6 +1065,24 @@ export async function* runOrchestrator(
           label: subtask.title,
           detail: `ORCHESTRATOR_PRE_WRITE_TEXT_SUPPRESSED:${suppressedPreWriteChars}`,
         };
+      }
+      // The write never happened, so the suppressed pre-write text IS the
+      // deliverable — hand it to the user as subtask text instead of
+      // discarding it (2026-06-12 live finding: full letters/checklists were
+      // generated, suppressed, and lost while the banner claimed success).
+      // Suppression stays in force on the success path, where the written
+      // file is the deliverable.
+      if (suppressedPreWriteText.trim().length > 0) {
+        const fallback = `The file could not be saved to your folder, so here is the prepared content:\n\n${suppressedPreWriteText}`;
+        for (const text of splitTextForOrchestrator(fallback)) {
+          yield {
+            kind: 'orchestrator-text',
+            planId: plan.planId,
+            subtaskId: subtask.id,
+            role: subtask.producesArtifact ? 'final_artifact' : 'working',
+            text,
+          };
+        }
       }
       const requiredWriteFailureNote = suppressedPreWriteText.trim()
         ? `a required folder.write tool was not called; suppressed pre-write text: ${fallbackMemorySummary(suppressedPreWriteText)}`
