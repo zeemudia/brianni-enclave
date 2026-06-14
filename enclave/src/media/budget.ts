@@ -22,6 +22,10 @@ export interface VideoBudgetClient {
     quotaUnits: number;
     providerId: string;
     modelId: string;
+    // Drives the server-side per-kind quota cap (video reserves must NOT be
+    // charged against the image budget). 'video_render' is set by the render
+    // path; the generate path passes 'video_generate'.
+    routeKind: 'video_generate' | 'video_render';
   }): Promise<{ ok: true; holdId: string } | { ok: false; reason: string }>;
 }
 
@@ -44,11 +48,15 @@ export async function reserveVideoBudget(input: {
   mediaJobId: string;
   estimate: VideoQuotaEstimate;
   client: VideoBudgetClient;
+  // Defaults to 'video_generate'; the render path passes 'video_render'. Either
+  // way the server applies the video cap, never the image cap.
+  routeKind?: 'video_generate' | 'video_render';
 }): Promise<{ ok: true; holdId: string } | { ok: false; reason: string }> {
   return input.client.reserve({
     mediaJobId: input.mediaJobId,
     quotaUnits: input.estimate.quotaUnits,
     providerId: input.estimate.providerId,
     modelId: input.estimate.modelId,
+    routeKind: input.routeKind ?? 'video_generate',
   });
 }

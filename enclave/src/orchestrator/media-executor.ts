@@ -1,20 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  AgentLinkedFolderContext,
   AgentSubtask,
+  BinaryWorkItemToolName,
   MediaArtifactKind,
+  MediaBudgetRouteKind,
   MediaProvenanceRecord,
   ProviderVisibleInputConsent,
   ModelRouteDecision,
+  ToolResultFrame,
   VideoCompositionSpec,
 } from "@calypso/chat-types";
 import {
   createMediaJobIds,
+  createProvenanceRecord,
   estimateVideoQuotaUnits,
   evaluateRenderCustody,
   prepareProviderVisibleInput,
   reserveVideoBudget,
   validateVideoCompositionAgainstProvenance,
   verifyProviderVisibleInputConsent,
+  verifyProvenanceRecord,
   type ConsentVerifier,
   type MediaHandleStore,
   type ProvenanceSigner,
@@ -26,7 +32,29 @@ import {
 } from "../media/render-attestation";
 import type { RenderBackend } from "../media/render-backend";
 import type { VideoProviderAdapter } from "../media/video-provider";
+import type {
+  ImageInputMimeType,
+  ImageOutputMimeType,
+  ImageProviderAdapter,
+} from "../media/image-provider";
+import type { BinaryWorkItemManager } from "../tools/binary-work-items";
+import type { AgentLoopEvent } from "../agent/loop";
 import type { OrchestratorExecutorEvent } from "./events";
+
+// The image delivery path yields a `binary-write-request` AgentLoopEvent (so the
+// index.ts wire pump emits the write_request + chunk frames to the client) and
+// then awaits the client write ACK — exactly how a worker's image.transform
+// binary output is delivered. The media generator therefore yields this AgentLoopEvent
+// variant alongside its OrchestratorExecutorEvents.
+type BinaryWriteRequestEvent = Extract<
+  AgentLoopEvent,
+  { kind: "binary-write-request" }
+>;
+type ClientOnlyBinaryWrite = BinaryWriteRequestEvent["payload"];
+
+export type RunMediaSubtaskEvent =
+  | OrchestratorExecutorEvent
+  | BinaryWriteRequestEvent;
 
 export interface RunMediaSubtaskDeps {
   agentTurnId: string;
@@ -34,6 +62,23 @@ export interface RunMediaSubtaskDeps {
   subtask: AgentSubtask;
   route: ModelRouteDecision;
   videoAdapters: Record<string, VideoProviderAdapter>;
+  // Synchronous image generation/edit adapters, keyed by providerId. Mirrors
+  // videoAdapters; an image subtask routes to imageAdapters[route.providerId].
+  imageAdapters?: Record<string, ImageProviderAdapter>;
+  // ── Image-generate binary delivery (mirrors how image.transform delivers) ──
+  // A generated image is a file: it is delivered through the SAME binary
+  // write-ACK path a media worker uses — write to the linked folder behind the
+  // client's "Ask before saving" confirmation. `binaryWorkItems` mints the
+  // write request + chunks; `awaitBinaryWriteAck` registers the per-invocation
+  // resolver and blocks until the client ACKs (matches AgentLoopDeps's field).
+  // `linkedFolders` is the destination context (the first `granted` folder is
+  // the target). `sessionId` keys the binary work item so the ACK round-trips.
+  binaryWorkItems?: BinaryWorkItemManager;
+  awaitBinaryWriteAck?: (
+    payload: ClientOnlyBinaryWrite,
+  ) => Promise<ToolResultFrame>;
+  linkedFolders?: readonly AgentLinkedFolderContext[];
+  sessionId?: string;
   abortSignal?: AbortSignal;
   now?: Date;
   createJobNonce?: (mediaJobId: string) => string;
@@ -57,6 +102,12 @@ export interface RunMediaSubtaskDeps {
       quotaUnits: number;
       providerId: string;
       modelId: string;
+      // Per-operation media kind so the server applies the correct per-kind
+      // quota cap (image_generate → image caps; video_* → video caps). The
+      // image branch passes image_generate; the video branch passes a video
+      // kind via reserveVideoBudget. Omitting it would charge video jobs
+      // against the image budget.
+      routeKind: MediaBudgetRouteKind;
     }): Promise<{ ok: true; holdId: string } | { ok: false; reason: string }>;
     reconcile(input: {
       holdId: string;
@@ -162,9 +213,24 @@ export const PENDING_START_UNRECOVERABLE_SENTINEL = "unknown:pending_start_unrec
 // without trying to poll an adapter that does not exist.
 export const PROVIDER_STARTED_UNREACHABLE_SENTINEL_PREFIX = "unreachable:provider_started:";
 
+// Fixed quota estimate per generated image (no per-request billing metadata
+// like video operations expose). The adapter returns the actual units for the
+// reconcile; this is the up-front hold.
+const IMAGE_GENERATE_QUOTA_UNITS = 4;
+// Output artifacts (generated images) live in the same short-lived custody
+// window as other generated media.
+const GENERATED_MEDIA_TTL_SECONDS = 3600;
+
 export async function* runMediaSubtask(
   deps: RunMediaSubtaskDeps,
-): AsyncGenerator<OrchestratorExecutorEvent> {
+): AsyncGenerator<RunMediaSubtaskEvent> {
+  // Image generation/edit is synchronous (single provider call, no job/poll/
+  // checkpoint machinery) so it takes a dedicated branch BEFORE the
+  // video-only guard below.
+  if (deps.subtask.kind === "image") {
+    yield* runGenerateImageSubtask(deps);
+    return;
+  }
   if (deps.subtask.kind !== "video") {
     yield {
       kind: "orchestrator-progress",
@@ -429,6 +495,7 @@ export async function* runMediaSubtask(
     mediaJobId: ids.mediaJobId,
     estimate,
     client: deps.budgetClient,
+    routeKind: "video_generate",
   });
   if (!hold.ok) {
     yield {
@@ -774,6 +841,8 @@ export async function* runMediaSubtask(
       mimeType: result.mimeType,
       title: deps.subtask.title,
     });
+    // encryptArtifact only feeds the metadata trail event (sha/ref); the binary
+    // write-ACK below is the real delivery (ciphertextRef is empty).
     yield {
       kind: "orchestrator-artifact",
       planId: deps.planId,
@@ -785,20 +854,144 @@ export async function* runMediaSubtask(
       sha256: artifact.sha256,
       ciphertextRef: artifact.ciphertextRef,
     };
-    await deps.budgetClient.reconcile({
-      holdId: hold.holdId,
-      status: "debited",
-      actualQuotaUnits: result.actualQuotaUnits,
-      billingReceiptId: result.billingReceiptId,
+
+    // Delivery rides the SAME encrypted binary write-ACK path image generation
+    // uses. With a GRANTED folder the bytes are saved to it behind the client's
+    // "ask before saving" confirmation; with NO granted folder we deliver a
+    // PREVIEW-ONLY write — the client reassembles + sha-verifies + renders the
+    // in-app preview, performing no folder write. The bytes stream over the
+    // already-attested encrypted session channel in frame-safe chunks; the
+    // client writes them straight to disk (no full-video buffer in JS heap).
+    const videoSizeCap = videoMaxOutputBytes();
+    if (result.videoBytes.byteLength > videoSizeCap) {
+      await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+      try {
+        await deps.checkpointClient.markTerminal({
+          mediaJobId: ids.mediaJobId,
+          terminalState: "released",
+        });
+      } catch {
+        /* best-effort terminal hygiene; the checkpoint row simply expires */
+      }
+      yield {
+        kind: "orchestrator-media-job-progress",
+        planId: deps.planId,
+        subtaskId: deps.subtask.id,
+        mediaJobId: ids.mediaJobId,
+        status: "error",
+        label: deps.subtask.title,
+        detail: `VIDEO_OUTPUT_TOO_LARGE:${result.videoBytes.byteLength}`,
+      };
+      return;
+    }
+    const targetFolder = deps.linkedFolders?.find(
+      (folder) => folder.status === "granted",
+    );
+    const previewOnly = !targetFolder;
+    if (!deps.awaitBinaryWriteAck || !deps.binaryWorkItems) {
+      await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+      try {
+        await deps.checkpointClient.markTerminal({
+          mediaJobId: ids.mediaJobId,
+          terminalState: "released",
+        });
+      } catch {
+        /* best-effort */
+      }
+      yield {
+        kind: "orchestrator-media-job-progress",
+        planId: deps.planId,
+        subtaskId: deps.subtask.id,
+        mediaJobId: ids.mediaJobId,
+        status: "error",
+        label: deps.subtask.title,
+        detail: "VIDEO_GENERATE_DELIVERY_UNAVAILABLE",
+      };
+      return;
+    }
+    const invocationId = randomUUID();
+    const outputId = randomUUID();
+    const outputPath = deriveVideoOutputFilename(deps.subtask, result.mimeType);
+    const { request, chunks } = deps.binaryWorkItems.createOutputWriteRequest({
+      sessionId: deps.sessionId ?? "",
+      agentTurnId: deps.agentTurnId,
+      invocationId,
+      toolName: "video.generate" as BinaryWorkItemToolName,
+      operationId: `video.generate:${invocationId}`,
+      outputId,
+      outputPath,
+      outputBytes: result.videoBytes,
+      maxOutputBytes: videoSizeCap,
     });
+    const writePayload: ClientOnlyBinaryWrite = previewOnly
+      ? {
+          folderId: "",
+          displayName: "",
+          request,
+          chunks,
+          previewOnly: true,
+        }
+      : {
+          folderId: targetFolder!.folderId,
+          displayName: targetFolder!.displayName,
+          request,
+          chunks,
+        };
+    yield { kind: "binary-write-request", payload: writePayload };
+    const ack = await deps.awaitBinaryWriteAck(writePayload);
+    if (ack.outcome === "ok") {
+      await deps.budgetClient.reconcile({
+        holdId: hold.holdId,
+        status: "debited",
+        actualQuotaUnits: result.actualQuotaUnits,
+        billingReceiptId: result.billingReceiptId,
+      });
+      // Mark terminal so a later resume of this turn cannot re-poll + re-deliver
+      // an already-completed + already-debited job. Best-effort: billing is
+      // already settled; if this write fails the row simply expires.
+      try {
+        await deps.checkpointClient.markTerminal({
+          mediaJobId: ids.mediaJobId,
+          terminalState: "debited",
+        });
+      } catch {
+        /* best-effort terminal hygiene */
+      }
+      yield {
+        kind: "orchestrator-media-job-progress",
+        planId: deps.planId,
+        subtaskId: deps.subtask.id,
+        mediaJobId: ids.mediaJobId,
+        status: "done",
+        label: deps.subtask.title,
+      };
+      return;
+    }
+    // Client declined the save, or the write failed / timed out. Nothing landed,
+    // so release the hold and report honestly. A user-declined save is a
+    // `blocked` terminal (an explicit choice); any other outcome is an `error`.
+    await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+    try {
+      await deps.checkpointClient.markTerminal({
+        mediaJobId: ids.mediaJobId,
+        terminalState: "released",
+      });
+    } catch {
+      /* best-effort */
+    }
+    const denied = ack.outcome === "denied_by_user";
     yield {
       kind: "orchestrator-media-job-progress",
       planId: deps.planId,
       subtaskId: deps.subtask.id,
       mediaJobId: ids.mediaJobId,
-      status: "done",
+      status: denied ? "blocked" : "error",
       label: deps.subtask.title,
+      detail:
+        ack.reason ??
+        (denied ? "VIDEO_GENERATE_SAVE_DECLINED" : "VIDEO_GENERATE_WRITE_FAILED"),
     };
+    return;
   } catch (error) {
     let detail = error instanceof Error ? error.message : "VIDEO_PROVIDER_EXCEPTION";
     if (providerJobId) {
@@ -839,6 +1032,442 @@ export async function* runMediaSubtask(
     };
     return;
   }
+}
+
+// ─── Image generation/edit (synchronous) ──────────────────────────────────
+//
+// The image sibling of the video job flow. Image generation is a single
+// provider request/response — no provider-side job, polling, checkpoint, or
+// resume — so it runs the trust spine SYNCHRONOUSLY: budget reserve →
+// (image_edit only) consent-gate the provider-visible input image →
+// adapter.generate → provenance-sign the OUTPUT (bound to its sha256, attesting
+// TEE origin) → encrypt (metadata trail only) → DELIVER the bytes via the
+// binary write-ACK path (write to the linked folder behind the client's "Ask
+// before saving" confirmation — the SAME path image.transform uses) → budget
+// reconcile on the ACK outcome (debited on save, released on decline/fail). On
+// ANY failure it reconciles the hold and emits a clean error — never throws out
+// of the generator.
+
+function deriveImagePrompt(subtask: AgentSubtask): string {
+  // The (already on-device-masked) subtask objective is the image instruction;
+  // fall back to the title. Bounded to a sane provider prompt length.
+  const text = (subtask.objective || subtask.title || "").trim();
+  return text.slice(0, 4000);
+}
+
+// File extension for the generated output's mime type. The client/binary-write
+// path treats the path as opaque (it resolves collisions like the transform
+// path), but a correct extension makes the saved file open in the right viewer.
+function imageOutputExtension(mimeType: ImageOutputMimeType): string {
+  switch (mimeType) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    case "image/png":
+    default:
+      return "png";
+  }
+}
+
+// Slugified, bounded filename from the subtask title (e.g. "Generate bake-sale
+// poster" → "generate-bake-sale-poster.png"); falls back to a stable default
+// when the title has no usable characters. The client resolves collisions, so
+// this need only be a sane, deterministic base name.
+function deriveImageOutputFilename(
+  subtask: AgentSubtask,
+  mimeType: ImageOutputMimeType,
+): string {
+  const ext = imageOutputExtension(mimeType);
+  const slug = (subtask.title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64)
+    .replace(/-+$/g, "");
+  return `${slug || "calypso-image"}.${ext}`;
+}
+
+function videoOutputExtension(mimeType: "video/mp4" | "video/webm"): string {
+  return mimeType === "video/webm" ? "webm" : "mp4";
+}
+
+// Slugified, bounded filename from the subtask title — the video analogue of
+// deriveImageOutputFilename. The client resolves collisions, so this need only
+// be a sane, deterministic base name.
+function deriveVideoOutputFilename(
+  subtask: AgentSubtask,
+  mimeType: "video/mp4" | "video/webm",
+): string {
+  const ext = videoOutputExtension(mimeType);
+  const slug = (subtask.title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64)
+    .replace(/-+$/g, "");
+  return `${slug || "calypso-video"}.${ext}`;
+}
+
+// Operator-configurable per-video delivery ceiling (default 100 MB). A generated
+// clip routinely exceeds the 5 MB image/linked-folder write budget. NOTE: the
+// enclave inherently holds the whole clip in memory (the provider returns it
+// base64-in-JSON), so the practical large-video ceiling is bounded by the
+// provider response shape, not this cap — this guards against pathologically
+// large outputs and is the value the client mirrors (defense in depth).
+function videoMaxOutputBytes(): number {
+  const raw = Number(process.env.MEDIA_VIDEO_MAX_OUTPUT_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 100 * 1024 * 1024;
+}
+
+// Sniff the input image's real format from magic bytes so an image_edit source
+// is labelled correctly to the provider (defaulting everything to PNG made a
+// JPEG/WebP source mis-typed). Returns undefined for an unrecognised header,
+// which lets the adapter fall back to its default.
+function sniffImageInputMimeType(
+  bytes: Uint8Array,
+): ImageInputMimeType | undefined {
+  if (bytes.length >= 8 &&
+    bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+    return "image/png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && // "RIFF"
+    bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50 // "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return undefined;
+}
+
+export async function* runGenerateImageSubtask(
+  deps: RunMediaSubtaskDeps,
+): AsyncGenerator<RunMediaSubtaskEvent> {
+  const operation = deps.subtask.media?.operation;
+  if (operation !== "image_generate" && operation !== "image_edit") {
+    yield imageProgress(deps, "error", "MEDIA_OPERATION_UNSUPPORTED");
+    return;
+  }
+  const adapter = deps.imageAdapters?.[deps.route.providerId];
+  if (!adapter) {
+    yield imageProgress(deps, "error", "IMAGE_ADAPTER_UNAVAILABLE");
+    return;
+  }
+  if (!deps.provenanceSigner) {
+    // Provenance signing is part of the trust story — never emit a generated
+    // image artifact the enclave cannot attest to.
+    yield imageProgress(deps, "error", "IMAGE_PROVENANCE_SIGNER_MISSING");
+    return;
+  }
+  const ids = createMediaJobIds({
+    agentTurnId: deps.agentTurnId,
+    planId: deps.planId,
+    subtaskId: deps.subtask.id,
+  });
+  const now = deps.now ?? new Date();
+
+  yield {
+    kind: "orchestrator-media-job-progress",
+    planId: deps.planId,
+    subtaskId: deps.subtask.id,
+    mediaJobId: ids.mediaJobId,
+    status: "starting",
+    label: deps.subtask.title,
+  };
+
+  const hold = await deps.budgetClient.reserve({
+    mediaJobId: ids.mediaJobId,
+    quotaUnits: IMAGE_GENERATE_QUOTA_UNITS,
+    providerId: deps.route.providerId,
+    modelId: deps.route.modelId,
+    routeKind: "image_generate",
+  });
+  if (!hold.ok) {
+    yield imageJobProgress(deps, ids.mediaJobId, "blocked", hold.reason);
+    return;
+  }
+
+  try {
+    // image_edit sends a user-authorised source image to the provider — a
+    // provider-visible input that must clear the same custody + consent gate
+    // the video flow uses. image_generate is text → image (no user file): the
+    // prompt is provider-visible by nature, like a chat message.
+    let inputImageBytes: Uint8Array | undefined;
+    let inputImageMimeType: ImageInputMimeType | undefined;
+    // image_generate: the masked subtask objective is the instruction.
+    // image_edit overrides this below with the CONSENTED prompt-handle text.
+    let imagePrompt = deriveImagePrompt(deps.subtask);
+    if (operation === "image_edit") {
+      if (
+        !deps.providerInput ||
+        !deps.handleStore ||
+        !deps.consentVerifier
+      ) {
+        await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+        yield imageJobProgress(deps, ids.mediaJobId, "error", "IMAGE_EDIT_PROVIDER_INPUT_MISSING");
+        return;
+      }
+      const prepared = await prepareProviderVisibleInput({
+        promptHandleId: deps.providerInput.promptHandleId,
+        inputHandleIds: deps.providerInput.inputHandleIds,
+        handleStore: deps.handleStore,
+        recordsByHandleId: deps.recordsByHandleId ?? new Map(),
+        signer: deps.provenanceSigner,
+        now,
+      });
+      if (!prepared.ok) {
+        await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+        yield imageJobProgress(deps, ids.mediaJobId, "blocked", prepared.reason);
+        return;
+      }
+      const consent = deps.providerInput.consent;
+      if (!consent) {
+        await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+        yield imageJobProgress(deps, ids.mediaJobId, "waiting_for_consent", "PROVIDER_VISIBLE_INPUT_CONSENT_REQUIRED");
+        return;
+      }
+      const consentResult = await verifyProviderVisibleInputConsent({
+        consent,
+        expected: {
+          planId: deps.planId,
+          subtaskId: deps.subtask.id,
+          providerId: deps.route.providerId,
+          modelId: deps.route.modelId,
+          inputHandleSetHash: prepared.inputHandleSetHash,
+          enclaveNonce: deps.providerInput.enclaveNonce,
+          pinnedSignerKeyId: deps.providerInput.pinnedSignerKeyId,
+          revokedSignerKeyIds: deps.providerInput.revokedSignerKeyIds,
+        },
+        verifier: deps.consentVerifier,
+        now,
+        seenConsentIds: deps.providerInput.seenConsentIds,
+      });
+      if (!consentResult.ok) {
+        await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+        yield imageJobProgress(deps, ids.mediaJobId, "blocked", consentResult.reason);
+        return;
+      }
+      if (!prepared.inputImageBytes) {
+        await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+        yield imageJobProgress(deps, ids.mediaJobId, "error", "IMAGE_EDIT_INPUT_IMAGE_MISSING");
+        return;
+      }
+      inputImageBytes = prepared.inputImageBytes;
+      // Label the source image by its real format (not always PNG) so the
+      // provider accepts it; sniff from magic bytes.
+      inputImageMimeType = sniffImageInputMimeType(prepared.inputImageBytes);
+      // Transmit the CONSENTED prompt-handle text alongside the user's private
+      // image, not the post-hoc subtask objective, so the instruction matches
+      // what the provider-visible-input consent covered.
+      if (prepared.promptText) imagePrompt = prepared.promptText;
+    }
+
+    const outputMimeType: ImageOutputMimeType = "image/png";
+    const generated = await adapter.generate({
+      operation,
+      modelId: deps.route.modelId,
+      prompt: imagePrompt,
+      inputImageBytes,
+      inputImageMimeType,
+      size: "auto",
+      outputMimeType,
+      localIdempotencyKey: ids.providerIdempotencyKey,
+      abortSignal: deps.abortSignal,
+    });
+    if (generated.status === "failed") {
+      await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+      yield imageJobProgress(deps, ids.mediaJobId, "error", generated.reason);
+      return;
+    }
+
+    // Provenance: sign a record attesting the TEE produced this image, bound to
+    // the output sha256. `generated_from_private` distinguishes an edit of a
+    // (provider-visible) user image from a pure text→image generation.
+    const provenance = createProvenanceRecord(
+      {
+        handleId: `mh_${ids.mediaJobId.slice(3)}`,
+        kind: "image",
+        origin: operation === "image_edit" ? "generated_from_private" : "generated",
+        providerVisible: true,
+        sourceHandleIds: [],
+        createdBy: deps.route.modelId,
+        createdAt: now,
+        ttlSeconds: GENERATED_MEDIA_TTL_SECONDS,
+        byteSize: generated.imageBytes.byteLength,
+        bytes: generated.imageBytes,
+      },
+      deps.provenanceSigner,
+    );
+    // Surface that provenance was signed — observable in the decrypted
+    // orchestrator trail, and a defence-in-depth self-check that the signed
+    // record verifies against the exact output bytes (signature + sha256 + ttl)
+    // before the artifact is emitted.
+    if (!verifyProvenanceRecord(provenance, generated.imageBytes, deps.provenanceSigner, now)) {
+      await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+      yield imageJobProgress(deps, ids.mediaJobId, "error", "IMAGE_PROVENANCE_SELF_VERIFY_FAILED");
+      return;
+    }
+    yield imageJobProgress(
+      deps,
+      ids.mediaJobId,
+      "running",
+      `IMAGE_PROVENANCE_SIGNED:${provenance.handleId}`,
+    );
+
+    // Delivery rides the binary write-ACK path — the SAME path image.transform
+    // uses. With a GRANTED folder the bytes are saved to it behind the client's
+    // "Ask before saving" confirmation. With NO granted folder we no longer fail
+    // closed: a generated image is the result, so we deliver a PREVIEW-ONLY write
+    // (previewOnly: true, empty folderId) — the client reassembles + sha-verifies
+    // the bytes and renders the in-app preview, performing no folder write. The
+    // binary delivery deps are still REQUIRED in both cases (no deps ⇒ we cannot
+    // hand the bytes to the client at all, so fail closed + release the hold).
+    const targetFolder = deps.linkedFolders?.find(
+      (folder) => folder.status === "granted",
+    );
+    const previewOnly = !targetFolder;
+    if (!deps.awaitBinaryWriteAck || !deps.binaryWorkItems) {
+      await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+      yield imageJobProgress(deps, ids.mediaJobId, "error", "IMAGE_GENERATE_DELIVERY_UNAVAILABLE");
+      return;
+    }
+
+    // encryptArtifact only feeds the metadata trail event below (sha/ref); the
+    // binary write-ACK is the real delivery. KEEP emitting orchestrator-artifact
+    // for the receipt/trail, but it is NO LONGER how the bytes reach the device.
+    const artifact = await deps.encryptArtifact({
+      bytes: generated.imageBytes,
+      mimeType: generated.mimeType,
+      title: deps.subtask.title,
+    });
+    yield {
+      kind: "orchestrator-artifact",
+      planId: deps.planId,
+      subtaskId: deps.subtask.id,
+      artifactId: artifact.artifactId,
+      artifactKind: generated.mimeType,
+      title: deps.subtask.title,
+      byteSize: artifact.byteSize,
+      sha256: artifact.sha256,
+      ciphertextRef: artifact.ciphertextRef,
+    };
+
+    const invocationId = randomUUID();
+    const outputId = randomUUID();
+    const outputPath = deriveImageOutputFilename(deps.subtask, generated.mimeType);
+    const { request, chunks } = deps.binaryWorkItems.createOutputWriteRequest({
+      sessionId: deps.sessionId ?? "",
+      agentTurnId: deps.agentTurnId,
+      invocationId,
+      // Label the binary output with the generating tool so the client Activity
+      // trail and telemetry are honest. The client routes the bytes by outputId,
+      // not toolName, so this is purely a label. image_edit (image→image) is
+      // tagged image.edit; pure text→image is image.generate.
+      toolName: (operation === "image_edit"
+        ? "image.edit"
+        : "image.generate") as BinaryWorkItemToolName,
+      operationId: `image.generate:${invocationId}`,
+      outputId,
+      outputPath,
+      outputBytes: generated.imageBytes,
+    });
+    const writePayload: ClientOnlyBinaryWrite = previewOnly
+      ? {
+          // No destination folder: deliver for in-app preview only. The client
+          // renders the bytes and skips the folder write (folderId is empty).
+          folderId: "",
+          displayName: "",
+          request,
+          chunks,
+          previewOnly: true,
+          // #1: deliver the in-TEE-signed provenance record alongside the bytes
+          // so the client verifies the image against the attestation-published
+          // key (pairs with the bytes by request.outputId). Metadata only.
+          provenance,
+        }
+      : {
+          folderId: targetFolder!.folderId,
+          displayName: targetFolder!.displayName,
+          request,
+          chunks,
+          provenance,
+        };
+    // Emit the write_request + chunk frames to the client (the index.ts wire
+    // pump's `binary-write-request` case relays them), then block on the ACK —
+    // exactly the worker image.transform sequence.
+    yield { kind: "binary-write-request", payload: writePayload };
+    const ack = await deps.awaitBinaryWriteAck(writePayload);
+    if (ack.outcome === "ok") {
+      await deps.budgetClient.reconcile({
+        holdId: hold.holdId,
+        status: "debited",
+        actualQuotaUnits: generated.actualQuotaUnits,
+        billingReceiptId: generated.billingReceiptId,
+      });
+      yield imageJobProgress(deps, ids.mediaJobId, "done", undefined);
+      return;
+    }
+    // Client declined the save, or the write failed / timed out. Nothing landed,
+    // so release the hold and report honestly. A user-declined save is a
+    // `blocked` terminal (an explicit choice, not an error); any other outcome
+    // is a genuine `error`.
+    await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+    const denied = ack.outcome === "denied_by_user";
+    yield imageJobProgress(
+      deps,
+      ids.mediaJobId,
+      denied ? "blocked" : "error",
+      ack.reason ?? (denied ? "IMAGE_GENERATE_SAVE_DECLINED" : "IMAGE_GENERATE_WRITE_FAILED"),
+    );
+  } catch {
+    try {
+      await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+    } catch {
+      // best-effort release; the budget reaper reclaims an orphaned hold.
+    }
+    // Body-free fixed code only. encryptArtifact / prepareProviderVisibleInput /
+    // createProvenanceRecord can throw with internal/provider context; forwarding
+    // error.message into the host-relayed progress detail would leak it (the
+    // adapters themselves never throw — they return body-free failure reasons).
+    yield imageJobProgress(deps, ids.mediaJobId, "error", "IMAGE_PROVIDER_EXCEPTION");
+    return;
+  }
+}
+
+function imageProgress(
+  deps: RunMediaSubtaskDeps,
+  status: "error",
+  detail: string,
+): OrchestratorExecutorEvent {
+  return {
+    kind: "orchestrator-progress",
+    planId: deps.planId,
+    subtaskId: deps.subtask.id,
+    status,
+    label: deps.subtask.title,
+    detail,
+  };
+}
+
+function imageJobProgress(
+  deps: RunMediaSubtaskDeps,
+  mediaJobId: string,
+  status: "starting" | "running" | "blocked" | "waiting_for_consent" | "done" | "error",
+  detail: string | undefined,
+): OrchestratorExecutorEvent {
+  return {
+    kind: "orchestrator-media-job-progress",
+    planId: deps.planId,
+    subtaskId: deps.subtask.id,
+    mediaJobId,
+    status,
+    label: deps.subtask.title,
+    ...(detail !== undefined ? { detail } : {}),
+  };
 }
 
 export async function reconcileCancelledProviderCompletions(deps: {

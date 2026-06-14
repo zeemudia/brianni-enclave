@@ -220,6 +220,15 @@ export class EgressTaintLedger {
   private readonly grams = new Set<string>();
   private readonly tokens = new Set<string>();
   private observedPrivateRead = false;
+  // User-promoted data: the grams + tokens of the specific datums the user has
+  // EXPLICITLY authorised to cross the egress boundary (consent-gated bridge).
+  // Whitelisting at the SAME gram/token granularity the guard matches — rather
+  // than only stripping the exact full promoted string — lets a legitimate web
+  // lookup send a SUBSET of an approved datum (e.g. just `Hargreaves Lettings
+  // Ltd` out of an approved folder-read summary) and still pass, while every
+  // UN-promoted harvested gram/token stays blocked. Bounded FIFO.
+  private readonly promotedGrams = new Set<string>();
+  private readonly promotedTokens = new Set<string>();
 
   /**
    * Record that a private read tool was successfully dispatched this turn,
@@ -289,15 +298,59 @@ export class EgressTaintLedger {
     }
   }
 
+  /**
+   * Promote a specific datum across the egress boundary (consent-gated bridge).
+   * Whitelists the datum's grams + tokens (same granularity the guard matches),
+   * so an egress that reproduces this datum OR ANY SUBSET of it is no longer
+   * tainted, while every un-promoted harvested gram/token stays blocked. No-op
+   * for input too short to harvest. FIFO-bounded.
+   */
+  promote(datum: string): void {
+    const norm = normalise(datum);
+    if (norm.length < MIN_TOKEN) return; // too short to harvest/scope
+    for (let i = 0; i + NGRAM <= norm.length; i++) {
+      this.addPromotedGram(norm.slice(i, i + NGRAM));
+    }
+    // The whole normalised datum, plus each whitespace-delimited word, as tokens
+    // — mirrors addText so a word- or full-string token match is whitelisted.
+    if (norm.length >= MIN_TOKEN) this.addPromotedToken(norm);
+    for (const chunk of datum.split(/\s+/)) {
+      const n = normalise(chunk);
+      if (n.length >= MIN_TOKEN) this.addPromotedToken(n);
+    }
+  }
+
+  private addPromotedGram(g: string): void {
+    if (this.promotedGrams.has(g)) return;
+    this.promotedGrams.add(g);
+    if (this.promotedGrams.size > MAX_GRAMS) {
+      const oldest = this.promotedGrams.values().next().value;
+      if (oldest !== undefined) this.promotedGrams.delete(oldest);
+    }
+  }
+
+  private addPromotedToken(t: string): void {
+    if (this.promotedTokens.has(t)) return;
+    this.promotedTokens.add(t);
+    if (this.promotedTokens.size > MAX_TOKENS) {
+      const oldest = this.promotedTokens.values().next().value;
+      if (oldest !== undefined) this.promotedTokens.delete(oldest);
+    }
+  }
+
   /** True if `egress` (already normalised) reproduces harvested content. */
   private matchesNormalised(egress: string): boolean {
     if (egress.length === 0) return false;
     if (egress.length >= NGRAM) {
       for (let i = 0; i + NGRAM <= egress.length; i++) {
-        if (this.grams.has(egress.slice(i, i + NGRAM))) return true;
+        const gram = egress.slice(i, i + NGRAM);
+        // A user-promoted gram is authorised to cross — skip it.
+        if (this.grams.has(gram) && !this.promotedGrams.has(gram)) return true;
       }
     }
     for (const token of this.tokens) {
+      // A user-promoted token is authorised to cross — skip it.
+      if (this.promotedTokens.has(token)) continue;
       if (egress.includes(token)) return true;
     }
     return false;

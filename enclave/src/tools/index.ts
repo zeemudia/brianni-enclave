@@ -3,6 +3,7 @@ import {
   MEMORY_NAMESPACES,
   type AgentLinkedFolderContext,
   type BinaryWorkItemWriteRequestFrame,
+  type MediaProvenanceRecord,
   type MemoryMutationEnvelope,
   type MemoryNamespace,
   type SkillPack,
@@ -221,6 +222,24 @@ export type DispatchResult = ToolResultFrame & {
     displayName: string;
     request: BinaryWorkItemWriteRequestFrame;
     chunks: BinaryOutputChunk[];
+    /**
+     * Preview-only delivery (F1 image generation with no granted folder). When
+     * true the client reassembles + sha-verifies the bytes and surfaces the
+     * in-app preview, but performs NO folder write (folderId is empty). Absent /
+     * false = the normal folder-save path. Worker binary tools never set this.
+     */
+    previewOnly?: boolean;
+    /**
+     * #1 attestation-rooted provenance: the in-TEE-signed MediaProvenanceRecord
+     * for a generated IMAGE output, delivered alongside the bytes so the client
+     * can verify the image against the attestation-published provenance public
+     * key (verifyMediaProvenance). Rides this payload so it pairs with the bytes
+     * by request.outputId. Metadata-only (ids/kind/sha256/signature) — carries
+     * NO plaintext prompt/content. Only the image-generate path sets this;
+     * worker binary tools (document.edit/pdf.edit/image.transform) leave it
+     * absent, and the client fails closed (renders "unverified") when absent.
+     */
+    provenance?: MediaProvenanceRecord;
   };
 };
 
@@ -458,6 +477,18 @@ export class ToolGateway {
    */
   isQuestionEgressTainted(text: string): boolean {
     return this.egressTaint.isEgressTainted(text, '');
+  }
+
+  /**
+   * Consent-gated private-read → web bridge: promote a SPECIFIC private datum
+   * the user has explicitly authorised across the egress boundary. After this,
+   * an egress reproducing only the promoted datum passes the taint guard; every
+   * un-promoted harvested datum stays blocked. The orchestrator calls this only
+   * after a user APPROVED a promotion via the bridge consent surface (default
+   * deny) — never automatically.
+   */
+  promoteEgress(datum: string): void {
+    this.egressTaint.promote(datum);
   }
 
   /**

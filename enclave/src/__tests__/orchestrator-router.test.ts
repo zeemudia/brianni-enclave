@@ -811,3 +811,68 @@ describe('selectModelForSubtask', () => {
     ).toThrow('NO_MODEL_FOR_SUBTASK');
   });
 });
+
+describe('selectModelForSubtask — image generation routing (both gates open)', () => {
+  const imageModel: ModelCapability = {
+    modelId: 'gpt-image-2',
+    providerId: 'openai',
+    strengths: ['image_generation'],
+    strengthQuality: [{ strength: 'image_generation', tier: 'frontier' }],
+    modalities: ['text_in', 'image_in', 'image_out'],
+    endpointFamily: 'image',
+    costTier: 'high',
+    latencyTier: 'standard',
+    routingStatus: 'enabled',
+    requiredGatewayTools: ['image.generate', 'image.edit'],
+  };
+  const chatModel: ModelCapability = {
+    modelId: 'gpt-5.5',
+    providerId: 'openai',
+    strengths: ['general_reasoning', 'writing'],
+    strengthQuality: [{ strength: 'writing', tier: 'frontier' }],
+    modalities: ['text_in', 'text_out'],
+    endpointFamily: 'chat',
+    costTier: 'high',
+    latencyTier: 'standard',
+    routingStatus: 'enabled',
+    requiredGatewayTools: [],
+  };
+  const imageSubtask = {
+    id: 'st_image',
+    title: 'Generate poster',
+    objective: 'Generate a bake-sale poster image.',
+    kind: 'image' as const,
+    requiredCapabilities: ['image_generation' as const, 'general_reasoning' as const],
+    allowedTools: ['image.generate' as const],
+    dependsOn: [],
+    producesArtifact: true,
+    risk: 'low' as const,
+  };
+
+  it('routes an image_generate subtask to the enabled image model when the image endpoint family + gateway tools are enabled', () => {
+    const decision = selectModelForSubtask([imageSubtask][0], [chatModel, imageModel], {
+      enabledEndpointFamilies: ['chat', 'image'],
+      enabledGatewayTools: ['image.generate', 'image.edit'],
+    });
+    expect(decision.modelId).toBe('gpt-image-2');
+    expect(decision.providerId).toBe('openai');
+  });
+
+  it('fails closed (NO_MODEL_FOR_SUBTASK) when the image endpoint family is NOT enabled — the fail-closed gate', () => {
+    expect(() =>
+      selectModelForSubtask(imageSubtask, [chatModel, imageModel], {
+        enabledEndpointFamilies: ['chat'], // image family withheld
+        enabledGatewayTools: ['image.generate', 'image.edit'],
+      }),
+    ).toThrow('NO_MODEL_FOR_SUBTASK');
+  });
+
+  it('fails closed when the image model is registered_pending_gateway (not enabled)', () => {
+    expect(() =>
+      selectModelForSubtask(imageSubtask, [chatModel, { ...imageModel, routingStatus: 'registered_pending_gateway' }], {
+        enabledEndpointFamilies: ['chat', 'image'],
+        enabledGatewayTools: ['image.generate', 'image.edit'],
+      }),
+    ).toThrow('NO_MODEL_FOR_SUBTASK');
+  });
+});

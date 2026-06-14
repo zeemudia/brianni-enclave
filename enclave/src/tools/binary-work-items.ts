@@ -103,6 +103,11 @@ export interface BinaryOutputWriteRequestInput {
   outputPath: string;
   outputBytes: Buffer | Uint8Array;
   outputChunkSize?: number;
+  // Per-call total-size ceiling. Defaults to the manager's totalByteCap (the
+  // 5 MB linked-folder write budget). Video delivery raises this to an
+  // operator-configurable cap (MEDIA_VIDEO_MAX_OUTPUT_BYTES), since a generated
+  // clip routinely exceeds the image/file budget.
+  maxOutputBytes?: number;
 }
 
 export interface BinaryOutputChunk {
@@ -385,7 +390,8 @@ export class BinaryWorkItemManager {
     modelResult: BinaryOutputAwaitingStatus;
   } {
     const bytes = Buffer.from(input.outputBytes);
-    if (bytes.byteLength > this.totalByteCap) {
+    const sizeCap = input.maxOutputBytes ?? this.totalByteCap;
+    if (bytes.byteLength > sizeCap) {
       zeroBuffer(bytes);
       throw new Error(`BINARY_WORK_ITEM_TOO_LARGE:${bytes.byteLength}`);
     }

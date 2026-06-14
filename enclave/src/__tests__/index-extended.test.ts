@@ -641,7 +641,7 @@ describe("EnclaveRouter — extended", () => {
     // @ts-expect-error
     r.fetchKeysFromKMS = async () => {
       callOrder.push("keys");
-      return {};
+      return { providerKeys: {}, mediaRootSecret: null };
     };
 
     await r.init();

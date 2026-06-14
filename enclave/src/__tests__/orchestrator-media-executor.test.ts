@@ -8,9 +8,25 @@ import {
   reconcileCancelledProviderCompletions,
   runMediaSubtask,
 } from "../orchestrator/media-executor";
+import { BinaryWorkItemManager } from "../tools/binary-work-items";
 
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+// Fake awaitBinaryWriteAck: records payloads, returns a caller-supplied outcome.
+function fakeBinaryWriteAck(outcome: "ok" | "denied_by_user" | "error" = "ok", reason?: string) {
+  const calls: any[] = [];
+  const fn = async (payload: any) => {
+    calls.push(payload);
+    return {
+      invocationId: "inv_test",
+      outcome,
+      ...(reason ? { reason } : {}),
+      resultJson: { status: outcome === "ok" ? "committed" : "error" },
+    } as any;
+  };
+  return { fn, calls };
 }
 
 const promptBytes = new TextEncoder().encode("Generate an 8 second teaser");
@@ -103,8 +119,11 @@ function makeRecords(record: MediaProvenanceRecord = promptRecord) {
 const FIXED_NOW = new Date("2026-05-19T08:00:30.000Z");
 
 describe("orchestrator media executor", () => {
-  it("emits progress and artifact for a specialist video job after provenance checks", async () => {
+  it("delivers a video clip via the binary write-ACK path (preview-only, debits on ok)", async () => {
     const events: any[] = [];
+    const reconciles: any[] = [];
+    const terminals: any[] = [];
+    const ack = fakeBinaryWriteAck("ok");
     for await (const event of runMediaSubtask({
       agentTurnId: "turn_1",
       planId: "plan_1",
@@ -127,14 +146,29 @@ describe("orchestrator media executor", () => {
       handleStore,
       provenanceSigner,
       consentVerifier,
-      budgetClient,
-      checkpointClient,
+      budgetClient: {
+        reserve: async () => ({ ok: true, holdId: "hold_1" }) as const,
+        reconcile: async (input) => {
+          reconciles.push(input);
+        },
+      },
+      checkpointClient: {
+        ...checkpointClient,
+        markTerminal: async (input) => {
+          terminals.push(input);
+        },
+      },
+      binaryWorkItems: new BinaryWorkItemManager({ sweepIntervalMs: null }),
+      awaitBinaryWriteAck: ack.fn,
+      // No granted folder ⇒ preview-only delivery.
+      linkedFolders: [],
+      sessionId: "sess_1",
       now: FIXED_NOW,
       maxProviderPolls: 1,
       providerPollDelayMs: 0,
       encryptArtifact: async () => ({
         artifactId: "artifact_1",
-        ciphertextRef: "blob_1",
+        ciphertextRef: "",
         sha256: sha256(new TextEncoder().encode("mp4")),
         byteSize: 3,
       }),
@@ -142,8 +176,74 @@ describe("orchestrator media executor", () => {
       events.push(event);
     }
 
-    expect(events.some((event) => event.kind === "orchestrator-media-job-progress")).toBe(true);
     expect(events.some((event) => event.kind === "orchestrator-artifact")).toBe(true);
+    // The bytes were delivered through the binary write-ACK path, preview-only.
+    const writeEvent = events.find((e) => e.kind === "binary-write-request");
+    expect(writeEvent).toBeDefined();
+    expect(writeEvent.payload.previewOnly).toBe(true);
+    expect(writeEvent.payload.request.toolName).toBe("video.generate");
+    expect(writeEvent.payload.request.outputPath.endsWith(".mp4")).toBe(true);
+    expect(ack.calls.length).toBe(1);
+    // Debited only after a successful write, with the provider's actual units.
+    expect(reconciles.some((r) => r.status === "debited" && r.actualQuotaUnits === 200)).toBe(true);
+    // Terminal hygiene so a resume cannot re-deliver.
+    expect(terminals.some((t) => t.terminalState === "debited")).toBe(true);
+    expect(events.some((e) => e.status === "done")).toBe(true);
+  });
+
+  it("releases the hold (no debit) when the user declines the video save", async () => {
+    const reconciles: any[] = [];
+    const events: any[] = [];
+    const ack = fakeBinaryWriteAck("denied_by_user");
+    for await (const event of runMediaSubtask({
+      agentTurnId: "turn_1",
+      planId: "plan_1",
+      subtask: { ...baseSubtask, media: baseGenerateMedia },
+      route: baseRoute,
+      videoAdapters: {
+        google: {
+          start: async () => ({ providerJobId: "op-1" }),
+          poll: async () => ({
+            status: "done",
+            videoBytes: new TextEncoder().encode("mp4"),
+            mimeType: "video/mp4",
+            actualQuotaUnits: 200,
+            billingSource: "provider_operation_metadata",
+          }),
+        },
+      },
+      providerInput: baseProviderInput,
+      recordsByHandleId: makeRecords(),
+      handleStore,
+      provenanceSigner,
+      consentVerifier,
+      budgetClient: {
+        reserve: async () => ({ ok: true, holdId: "hold_1" }) as const,
+        reconcile: async (input) => {
+          reconciles.push(input);
+        },
+      },
+      checkpointClient,
+      binaryWorkItems: new BinaryWorkItemManager({ sweepIntervalMs: null }),
+      awaitBinaryWriteAck: ack.fn,
+      linkedFolders: [{ folderId: "fld_1", displayName: "Movies", status: "granted" }],
+      sessionId: "sess_1",
+      now: FIXED_NOW,
+      maxProviderPolls: 1,
+      providerPollDelayMs: 0,
+      encryptArtifact: async () => ({
+        artifactId: "artifact_1",
+        ciphertextRef: "",
+        sha256: sha256(new TextEncoder().encode("mp4")),
+        byteSize: 3,
+      }),
+    })) {
+      events.push(event);
+    }
+
+    expect(reconciles.some((r) => r.status === "released")).toBe(true);
+    expect(reconciles.some((r) => r.status === "debited")).toBe(false);
+    expect(events.some((e) => e.status === "blocked")).toBe(true);
   });
 
   it("blocks resumed specialist jobs when the provenance snapshot changed", async () => {

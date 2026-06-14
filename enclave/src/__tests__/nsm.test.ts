@@ -126,6 +126,46 @@ describe('NsmSidecar', () => {
     expect(result.pcrs.PCR0).toBe('aa');
   });
 
+  it('includes user_data in the request when provided (provenance key publishing)', async () => {
+    const proc = makeMockProcess();
+    spawnMock.mockReturnValue(proc);
+
+    const { NsmSidecar } = await import('../nsm');
+    const sidecar = new NsmSidecar();
+    const startPromise = sidecar.start();
+    setTimeout(() => proc.stdout.emit('data', Buffer.from('NSM_READY\n')), 5);
+    await startPromise;
+
+    const nonce = Buffer.alloc(32, 1);
+    const pubkey = Buffer.alloc(65, 2);
+    const userData = Buffer.from('{"v":1,"mediaProvenancePublicKey":"abc"}');
+    sidecar.getAttestationDoc(nonce, pubkey, userData);
+
+    await new Promise((r) => setTimeout(r, 5));
+    const written = (proc.stdin.write as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
+    const req = JSON.parse(written.trim());
+    expect(req.user_data).toBe(userData.toString('base64'));
+  });
+
+  it('omits user_data when none is provided (back-compat)', async () => {
+    const proc = makeMockProcess();
+    spawnMock.mockReturnValue(proc);
+
+    const { NsmSidecar } = await import('../nsm');
+    const sidecar = new NsmSidecar();
+    const startPromise = sidecar.start();
+    setTimeout(() => proc.stdout.emit('data', Buffer.from('NSM_READY\n')), 5);
+    await startPromise;
+
+    sidecar.getAttestationDoc(Buffer.alloc(32, 1), Buffer.alloc(65, 2));
+    await new Promise((r) => setTimeout(r, 5));
+    const written = (proc.stdin.write as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
+    const req = JSON.parse(written.trim());
+    expect(req.user_data).toBeUndefined();
+  });
+
   it('serialises concurrent requests (one spawn, one stdin write per request)', async () => {
     const proc = makeMockProcess();
     spawnMock.mockReturnValue(proc);

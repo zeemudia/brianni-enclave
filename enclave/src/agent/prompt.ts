@@ -149,6 +149,41 @@ function hasPromptToolSchema(name: ToolName): name is AdvertisedToolName {
   return Object.prototype.hasOwnProperty.call(TOOL_SCHEMAS, name);
 }
 
+/**
+ * The web-access clause of the tool-availability contract. web.fetch is the
+ * ungated quick-lookup path; research.ask is the GATED path that delegates a
+ * PUBLIC-facts question to an air-gapped researcher AND requires the user to
+ * approve the exact outbound query first (a flagship trust surface). Never names
+ * a tool the subtask does not scope (a guard test asserts unscoped tool names
+ * never appear in the prompt).
+ */
+function webAccessContractLine(toolScopes: readonly ToolName[]): string {
+  const hasWebFetch = toolScopes.includes('web.fetch');
+  const hasResearchAsk = toolScopes.includes('research.ask');
+  if (hasWebFetch && hasResearchAsk) {
+    return (
+      'There is no web.search tool. Two web paths exist: web.fetch retrieves a ' +
+      'specific public URL or query the user already named (a quick lookup), and ' +
+      'research.ask delegates a PUBLIC-facts question to an air-gapped researcher ' +
+      'and the user must approve the exact outbound query first. Prefer research.ask ' +
+      'when the answer needs authoritative external sources (statutes, regulator/ ' +
+      'insurer/market norms, entitlements, "is this normal/typical"); use web.fetch ' +
+      'for a quick lookup of a named URL.'
+    );
+  }
+  if (hasResearchAsk) {
+    return (
+      'Web access this turn is ONLY via research.ask: it delegates a PUBLIC-facts ' +
+      'question to an air-gapped researcher and the user must approve the exact ' +
+      'outbound query first. There is no web.fetch or web.search tool.'
+    );
+  }
+  if (hasWebFetch) {
+    return 'There is no web.search tool — web.fetch is the only web tool.';
+  }
+  return 'No web access is available this turn: complete the task without the web and say plainly what you could not look up.';
+}
+
 export interface AgentPromptContext {
   linkedFolders?: AgentLinkedFolderContext[];
   writePermissionMode?: AgentWritePermissionMode;
@@ -289,10 +324,13 @@ export function assembleSystemPrompt(
       "Tool availability contract: the Available tools list below is authoritative for this turn and may be narrower than the skill's general description. Only those tools are callable. Use exact tool names only; do not invent aliases or unlisted tool names.",
       // Name the live trap only when web access exists; when it does not,
       // say so without naming out-of-scope tools (a guard test asserts
-      // unscoped tool names never appear in the prompt).
-      pack.toolScopes.includes('web.fetch')
-        ? 'There is no web.search tool — web.fetch is the only web tool.'
-        : 'No web access is available this turn: complete the task without the web and say plainly what you could not look up.',
+      // unscoped tool names never appear in the prompt). research.ask is the
+      // GATED web path (the user approves the exact public-facts query); when a
+      // subtask is scoped with research.ask only (the planner routes
+      // research-heavy work there), the contract must describe it as the web
+      // path — not claim the web is unavailable, which would suppress the
+      // verbatim-query approval modal.
+      webAccessContractLine(pack.toolScopes),
     ].join(' '),
     '',
     'Available tools:',

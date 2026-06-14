@@ -290,6 +290,13 @@ export interface VsockMessageType {
   // like every other agent frame — the relaying server must never learn the
   // exercised namespace set (server-blindness invariant).
   CLAIMS_SUMMARY: 0x17;
+  // Consent-gated private-read -> web egress bridge (finding 11). When a
+  // web-capable subtask is denied private-derived context, EGRESS_PROMOTION_REQUEST
+  // is an enclave->client request listing the SPECIFIC private datums the user
+  // may promote across the boundary (default DENY); EGRESS_PROMOTION_RESULT is
+  // the client->enclave response carrying the approved candidate ids.
+  EGRESS_PROMOTION_REQUEST: 0x18;
+  EGRESS_PROMOTION_RESULT: 0x19;
 }
 
 export const MSG = {
@@ -316,6 +323,8 @@ export const MSG = {
   RESEARCH_QUERY_APPROVAL: 0x15,
   RESEARCH_QUERY_APPROVAL_RESULT: 0x16,
   CLAIMS_SUMMARY: 0x17,
+  EGRESS_PROMOTION_REQUEST: 0x18,
+  EGRESS_PROMOTION_RESULT: 0x19,
 } as const satisfies VsockMessageType;
 
 export const DREAM_MSG = {
@@ -385,6 +394,17 @@ export {
   type ToolName,
   type BannedPackId,
 } from "./skill-pack";
+
+export {
+  SkillPromptBundleSchema,
+  MIN_SKILL_PROMPTS_VERSION,
+  type SkillPromptBundle,
+} from "./skill-prompts";
+
+export {
+  canonicalSkillPromptsSigningInput,
+  SKILL_PROMPTS_SIGNING_DOMAIN,
+} from "./canonical-skill-prompts";
 
 export {
   SIGNED_DELETION_JOB_KINDS,
@@ -506,3 +526,57 @@ export {
   type VideoCompositionSpec,
   type VideoTemplateId,
 } from "./media";
+
+export {
+  MediaBudgetRouteKindSchema,
+  MediaBudgetReconcileStatusSchema,
+  MediaBudgetReserveRequestSchema,
+  MediaBudgetReconcileRequestSchema,
+  MediaBudgetRequestSchema,
+  MediaBudgetReserveResultSchema,
+  MediaBudgetReconcileResultSchema,
+  MAX_MEDIA_BUDGET_RPC_BYTES,
+  encodeMediaBudgetRequest,
+  decodeMediaBudgetRequest,
+  encodeMediaBudgetReserveResult,
+  decodeMediaBudgetReserveResult,
+  encodeMediaBudgetReconcileResult,
+  decodeMediaBudgetReconcileResult,
+  type MediaBudgetRouteKind,
+  type MediaBudgetReconcileStatus,
+  type MediaBudgetReserveRequest,
+  type MediaBudgetReconcileRequest,
+  type MediaBudgetRequest,
+  type MediaBudgetRequestInput,
+  type MediaBudgetReserveResult,
+  type MediaBudgetReconcileResult,
+} from "./media-budget";
+
+export {
+  VideoCheckpointStateSchema,
+  VideoCheckpointTerminalStateSchema,
+  VideoCheckpointRequestSchema,
+  VideoCheckpointLoadResultSchema,
+  VideoCheckpointWriteResultSchema,
+  VideoCheckpointCancelledListResultSchema,
+  VideoCheckpointBillingListResultSchema,
+  MAX_VIDEO_CHECKPOINT_RPC_BYTES,
+  encodeVideoCheckpointRequest,
+  decodeVideoCheckpointRequest,
+  encodeVideoCheckpointLoadResult,
+  decodeVideoCheckpointLoadResult,
+  encodeVideoCheckpointWriteResult,
+  decodeVideoCheckpointWriteResult,
+  encodeVideoCheckpointCancelledListResult,
+  decodeVideoCheckpointCancelledListResult,
+  encodeVideoCheckpointBillingListResult,
+  decodeVideoCheckpointBillingListResult,
+  type VideoCheckpointState,
+  type VideoCheckpointTerminalState,
+  type VideoCheckpointRequest,
+  type VideoCheckpointLoadResult,
+  type VideoCheckpointWriteResult,
+  type VideoCheckpointCancelledListResult,
+  type VideoCheckpointBillingListResult,
+  type VideoOperatorAlert,
+} from "./video-checkpoint";

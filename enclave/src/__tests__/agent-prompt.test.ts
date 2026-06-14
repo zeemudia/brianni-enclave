@@ -253,6 +253,52 @@ describe("assembleSystemPrompt", () => {
     expect(out).toContain("at least one of maxWidth/maxHeight");
   });
 
+  it("keeps the web.search trap line when only web.fetch is scoped", () => {
+    const out = assembleSystemPrompt({
+      ...defaultPack,
+      toolScopes: ["web.fetch"],
+    });
+    expect(out).toContain("There is no web.search tool");
+    expect(out).toContain("web.fetch");
+    expect(out).not.toContain("No web access is available this turn");
+  });
+
+  it("does NOT say web access is unavailable when only research.ask is scoped (it IS the gated web path)", () => {
+    // Regression: the planner routes a research-heavy subtask to research.ask
+    // ONLY (web.fetch stripped). The worker prompt must then describe
+    // research.ask as the (gated) web path, not claim the web is unavailable —
+    // otherwise the model declines to look anything up and the verbatim-query
+    // approval modal never fires.
+    const out = assembleSystemPrompt({
+      ...defaultPack,
+      toolScopes: ["memory.read", "research.ask"],
+    });
+    expect(out).not.toContain("No web access is available this turn");
+    expect(out).toContain("research.ask");
+    expect(out.toLowerCase()).toContain("approve");
+  });
+
+  it("explains when to prefer research.ask over web.fetch when both are scoped", () => {
+    const out = assembleSystemPrompt({
+      ...defaultPack,
+      toolScopes: ["web.fetch", "research.ask"],
+    });
+    expect(out).toContain("research.ask");
+    expect(out).toContain("web.fetch");
+    expect(out).not.toContain("web.fetch is the only web tool");
+    expect(out).not.toContain("No web access is available this turn");
+  });
+
+  it("says the web is unavailable when neither web tool is scoped", () => {
+    const out = assembleSystemPrompt({
+      ...defaultPack,
+      toolScopes: ["memory.read", "folder.read"],
+    });
+    expect(out).toContain("No web access is available this turn");
+    expect(out).not.toContain("research.ask");
+    expect(out).not.toContain("web.fetch");
+  });
+
   it("states that the available tool list is exhaustive for scoped subtasks", () => {
     const out = assembleSystemPrompt({
       ...defaultPack,

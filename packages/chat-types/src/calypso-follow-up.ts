@@ -20,6 +20,16 @@ export function buildCalypsoTaskMessageHistory(input: {
   errorCode: string | null;
   nextUserText: string;
   priorAssistantContainsPrivateDerivedText?: boolean;
+  /**
+   * Set when the user EXPLICITLY chose to refine THIS completed result
+   * ("Refine this result" affordance, X3). The prior answer is then attached
+   * even when it is private-derived — the user is editing a draft they are
+   * looking at, and the agent path re-masks the content on-device before it
+   * leaves, so the masking round-trip still holds. Left false/undefined for a
+   * normal follow-up, which keeps the conservative omission so private-derived
+   * content is not silently carried into an unrelated next task.
+   */
+  includePrivateDerivedPriorAnswer?: boolean;
 }): CalypsoFollowUpMessage[] {
   const priorPrompt = input.priorPrompt?.trim();
   if (!priorPrompt || input.priorStatus === "running") {
@@ -29,9 +39,11 @@ export function buildCalypsoTaskMessageHistory(input: {
   const messages: CalypsoFollowUpMessage[] = [
     { role: "user", content: priorPrompt },
   ];
-  const priorAssistant = input.priorAssistantContainsPrivateDerivedText
-    ? PRIVATE_DERIVED_PRIOR_ANSWER_OMISSION
-    : buildPriorCalypsoAssistantText(input);
+  const priorAssistant =
+    input.priorAssistantContainsPrivateDerivedText &&
+    !input.includePrivateDerivedPriorAnswer
+      ? PRIVATE_DERIVED_PRIOR_ANSWER_OMISSION
+      : buildPriorCalypsoAssistantText(input);
   if (priorAssistant) {
     messages.push({ role: "assistant", content: priorAssistant });
   }

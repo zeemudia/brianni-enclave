@@ -59,6 +59,41 @@ describe("BinaryWorkItemManager", () => {
     ).toThrow(`BINARY_WORK_ITEM_TOO_LARGE:${DEFAULT_BINARY_WORK_ITEM_TOTAL_CAP + 1}`);
   });
 
+  it("honours a per-call maxOutputBytes cap (video delivery raises the ceiling)", () => {
+    const manager = new BinaryWorkItemManager({ sweepIntervalMs: null });
+    // 6 MB exceeds the default 5 MB cap but is allowed with a higher per-call cap.
+    expect(() =>
+      manager.createOutputWriteRequest({
+        sessionId: SESSION,
+        agentTurnId: TURN,
+        invocationId: INV,
+        toolName: "video.generate",
+        operationId: "op-video",
+        outputId: "out-video",
+        outputPath: "videos/teaser.mp4",
+        outputBytes: Buffer.alloc(6 * 1024 * 1024),
+        maxOutputBytes: 10 * 1024 * 1024,
+      }),
+    ).not.toThrow();
+  });
+
+  it("still rejects an output above its per-call maxOutputBytes cap", () => {
+    const manager = new BinaryWorkItemManager({ sweepIntervalMs: null });
+    expect(() =>
+      manager.createOutputWriteRequest({
+        sessionId: SESSION,
+        agentTurnId: TURN,
+        invocationId: INV,
+        toolName: "video.generate",
+        operationId: "op-video",
+        outputId: "out-video",
+        outputPath: "videos/teaser.mp4",
+        outputBytes: Buffer.alloc(2049),
+        maxOutputBytes: 2048,
+      }),
+    ).toThrow("BINARY_WORK_ITEM_TOO_LARGE:2049");
+  });
+
   it("streams source bytes without producing model-visible binary", () => {
     const manager = new BinaryWorkItemManager({
       sweepIntervalMs: null,

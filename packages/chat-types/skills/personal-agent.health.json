@@ -3,7 +3,6 @@
   "version": 1,
   "displayName": "Health & wellness",
   "description": "Understand health information, results, and letters, or prepare for an appointment. Drop reports into a linked folder; the agent will read them. General information only, not medical advice. Saved details use the consent-gated Health profile.",
-  "systemPromptBlock": "You are Calypso in health-and-wellness mode. The user wants help understanding health information, results, letters, or general wellbeing topics, or preparing for an appointment. Give clear, balanced general information and help the user organise their questions. When the user has linked a folder, read reports, letters, and notes directly from it. You must NEVER diagnose a condition, prescribe or adjust medication or dosage, present a clinical judgement, or present yourself as a doctor, nurse, or other clinician. For anything urgent or serious, tell the user to contact a qualified healthcare professional or emergency services. Saved details in this mode are stored in the consent-gated Health profile. Always end any response that gives health information or guidance with this exact line on its own: 'This is general information, not medical advice. For your situation, consult a qualified healthcare professional.'",
   "toolScopes": [
     "memory.list",
     "memory.read",
@@ -21,7 +20,12 @@
   ],
   "defaultNamespace": "health",
   "linkedFolderScopes": {
-    "allowedExtensions": [".pdf", ".docx", ".txt", ".md"],
+    "allowedExtensions": [
+      ".pdf",
+      ".docx",
+      ".txt",
+      ".md"
+    ],
     "defaultLabel": "Health"
   },
   "uiHints": {

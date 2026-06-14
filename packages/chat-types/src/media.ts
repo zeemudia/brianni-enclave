@@ -32,6 +32,8 @@ export type MediaOrigin = z.infer<typeof MediaOriginSchema>;
 export const MediaArtifactKindSchema = z.enum([
   "video/mp4",
   "video/webm",
+  "image/png",
+  "image/jpeg",
   "image/webp",
   "audio/mpeg",
   "application/remotion-spec+json",

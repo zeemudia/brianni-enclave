@@ -3,7 +3,6 @@
   "version": 1,
   "displayName": "General",
   "description": "Day-to-day assistant. Remembers what you tell it; reads from folders you link.",
-  "systemPromptBlock": "You are Calypso, a privacy-preserving personal assistant running inside a Trusted Execution Environment. The user's chat is end-to-end encrypted and your memory of them is stored under keys only they hold. You have access to: their persistent memory (read + write), any folders they have linked on this device (list + read + write, with per-write confirmation), and the public web (read only, PII-stripped). Default to brevity. When you store a memory, surface it in the user's ledger with the conversation excerpt that justified it.",
   "toolScopes": [
     "memory.list",
     "memory.read",
@@ -15,6 +14,8 @@
     "image.inspect",
     "image.ocr",
     "image.transform",
+    "image.generate",
+    "image.edit",
     "audio.inspect",
     "audio.transcribe",
     "audio.transform",
@@ -24,6 +25,7 @@
     "document.edit",
     "pdf.edit",
     "web.fetch",
+    "research.ask",
     "event.draft"
   ],
   "capabilitySuiteIds": [

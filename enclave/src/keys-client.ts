@@ -37,6 +37,14 @@ export const KEYS_BROKER_MALFORMED = 'KEYS_BROKER_MALFORMED';
 export interface EncryptedKeysBlob {
   kmsKeyArn: string;
   providers: Record<string, string>;
+  /**
+   * Optional KMS ciphertext of the media-root secret (base64). Wrapped under
+   * the same PCR0-gated KMS key as the provider keys; decrypted in kms-client
+   * and HKDF-derived into the stable media-provenance signing key. Absent on
+   * blobs provisioned before attestation-rooted provenance landed (the enclave
+   * then falls back to an ephemeral per-boot provenance key).
+   */
+  mediaRootSecret?: string;
 }
 
 /**
@@ -156,6 +164,18 @@ export async function fetchKeysBlobFromBroker(): Promise<EncryptedKeysBlob> {
         `${KEYS_BROKER_MALFORMED}: provider "${id}" value is not a non-empty string`,
       );
     }
+  }
+
+  // Optional media-root secret ciphertext. When present it MUST be a non-empty
+  // string (a malformed value would silently disable provenance rooting).
+  const mediaRootSecret = (parsed as any).mediaRootSecret;
+  if (
+    mediaRootSecret !== undefined &&
+    (typeof mediaRootSecret !== 'string' || mediaRootSecret.length === 0)
+  ) {
+    throw new Error(
+      `${KEYS_BROKER_MALFORMED}: mediaRootSecret present but not a non-empty string`,
+    );
   }
 
   return parsed as EncryptedKeysBlob;

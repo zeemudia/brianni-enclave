@@ -10,5 +10,8 @@
   },
   "scripts": {
     "test": "vitest run"
+  },
+  "devDependencies": {
+    "@noble/curves": "^1.9.7"
   }
 }

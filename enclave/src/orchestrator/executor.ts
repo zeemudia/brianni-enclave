@@ -105,8 +105,28 @@ export interface RunOrchestratorDeps {
   enabledEndpointFamilies: readonly ModelEndpointFamily[];
   messages: ChatMessage[];
   requestContext?: AgentRequestContext;
+  /**
+   * Session id the binary work item is keyed under (so an image-generate write
+   * ACK round-trips to the right resolver). Optional: tests omit it and the
+   * media executor defaults to '' just like the worker binary-write path.
+   */
+  sessionId?: string;
   awaitBinaryWriteAck?: AgentLoopDeps['awaitBinaryWriteAck'];
   awaitMemoryWriteAck?: AgentLoopDeps['awaitMemoryWriteAck'];
+  /**
+   * Consent-gated private-read → web egress bridge. When a web.fetch subtask is
+   * denied private-derived working memory by the egress isolation, the
+   * orchestrator offers the user specific datums to PROMOTE across the boundary
+   * (default DENY). Returns the candidate ids the user approved; undefined / a
+   * throw / an absent callback all mean DENY (fail-closed). The orchestrator
+   * never auto-carries private data — only an approved datum crosses.
+   */
+  awaitEgressPromotion?: (payload: {
+    agentTurnId: string;
+    planId: string;
+    subtaskId: string;
+    candidates: ReadonlyArray<{ id: string; label: string; content: string }>;
+  }) => Promise<{ approvedIds: string[] } | undefined>;
   abortSignal?: AbortSignal;
   providerCallBudget?: number;
   plannerTimeoutMs?: number;
@@ -123,6 +143,12 @@ export interface RunOrchestratorDeps {
   nowMs?: () => number;
   media?: {
     videoAdapters: RunMediaSubtaskDeps['videoAdapters'];
+    imageAdapters?: RunMediaSubtaskDeps['imageAdapters'];
+    // Mints the image-generate binary write request + chunks. image.generate
+    // delivers its bytes through the binary write-ACK path (see media-executor),
+    // so the executor threads this + the orchestrator's awaitBinaryWriteAck +
+    // requestContext linked folders into runMediaSubtask.
+    binaryWorkItems?: RunMediaSubtaskDeps['binaryWorkItems'];
     checkpointClient: RunMediaSubtaskDeps['checkpointClient'];
     budgetClient: RunMediaSubtaskDeps['budgetClient'];
     handleStore?: RunMediaSubtaskDeps['handleStore'];
@@ -514,7 +540,7 @@ export async function* runOrchestrator(
       label: subtask.title,
     };
 
-    if (usesProviderVideoExecutor(subtask)) {
+    if (usesProviderMediaExecutor(subtask)) {
       if (!deps.media) {
         yield {
           kind: 'orchestrator-progress',
@@ -577,6 +603,15 @@ export async function* runOrchestrator(
           subtask,
           route,
           videoAdapters: deps.media.videoAdapters,
+          imageAdapters: deps.media.imageAdapters,
+          // image.generate delivers its bytes via the binary write-ACK path —
+          // the same builder workers use (index.ts), the binary-work-item
+          // manager, the destination linked folders, and the session id the
+          // ACK round-trips under.
+          awaitBinaryWriteAck: deps.awaitBinaryWriteAck,
+          binaryWorkItems: deps.media.binaryWorkItems,
+          linkedFolders: deps.requestContext?.linkedFolders,
+          sessionId: deps.sessionId,
           checkpointClient: deps.media.checkpointClient,
           budgetClient: deps.media.budgetClient,
           handleStore: deps.media.handleStore,
@@ -690,6 +725,69 @@ export async function* runOrchestrator(
       let workerCompleted = false;
       let lastWorkerError: unknown;
 
+      // ── Consent-gated private-read → web egress bridge ──────────────────────
+      // A web.fetch subtask is denied private-derived working memory by default
+      // (egress isolation). Before it runs, if such memory exists, offer the
+      // user the SPECIFIC datums to promote across the boundary (default DENY).
+      // Approved datums are whitelisted in the egress-taint guard AND injected
+      // into the worker's visible memory; declined datums never cross, and the
+      // worker is told the user declined so it can answer honestly instead of
+      // dead-ending on a missing input. Runs ONCE per subtask (not per retry).
+      const promotedEgressEntries: OrchestratorWorkingMemoryEntry[] = [];
+      let egressPromotionDeclined = false;
+      if (subtask.allowedTools.includes('web.fetch') && deps.awaitEgressPromotion) {
+        const deniedPrivate = workingMemory.filter((entry) =>
+          isPrivateDerivedEntry(entry, privateDerivedSubtaskIds),
+        );
+        if (deniedPrivate.length > 0) {
+          const candidates = deniedPrivate.map((entry, i) => ({
+            id: `egress_cand_${i}`,
+            label: entry.label,
+            content: entry.content,
+          }));
+          yield {
+            kind: 'orchestrator-progress',
+            planId: plan.planId,
+            subtaskId: subtask.id,
+            status: 'blocked',
+            label: subtask.title,
+            detail: 'EGRESS_PROMOTION_AWAITING_CONSENT',
+          };
+          let decision: { approvedIds: string[] } | undefined;
+          try {
+            decision = await deps.awaitEgressPromotion({
+              agentTurnId: deps.agentTurnId,
+              planId: plan.planId,
+              subtaskId: subtask.id,
+              candidates,
+            });
+          } catch {
+            decision = undefined; // fail-closed: a broken channel denies
+          }
+          const approvedIds = new Set(decision?.approvedIds ?? []);
+          candidates.forEach((candidate, i) => {
+            if (!approvedIds.has(candidate.id)) return;
+            const entry = deniedPrivate[i];
+            // Whitelist the EXACT approved datum in the taint guard and inject
+            // it into the worker's visible context.
+            deps.gateway.promoteEgress(entry.content);
+            promotedEgressEntries.push({
+              ...entry,
+              label: `User-approved to send to the web (${entry.label})`,
+            });
+          });
+          egressPromotionDeclined = promotedEgressEntries.length === 0;
+          yield {
+            kind: 'orchestrator-progress',
+            planId: plan.planId,
+            subtaskId: subtask.id,
+            status: 'running',
+            label: subtask.title,
+            detail: `EGRESS_PROMOTION_RESOLVED:${promotedEgressEntries.length}/${candidates.length}`,
+          };
+        }
+      }
+
       while (!workerCompleted && attemptsUsed < 3) {
         const [modelId] = buildAttemptModelIds(
           route,
@@ -713,11 +811,32 @@ export async function* runOrchestrator(
           // (runtime taint), so its own summary is later excluded from egress
           // workers. This closes the read -> no-tool relay -> fetch path that a
           // purely static (tools + declared deps) classification misses.
-          const visibleMemory = visibleWorkingMemoryForSubtask(
+          const baseVisibleMemory = visibleWorkingMemoryForSubtask(
             workingMemory,
             subtask,
             privateDerivedSubtaskIds,
           );
+          // Re-attach ONLY the user-promoted private datums (egress bridge), or,
+          // if the user declined, a content-free note so the worker explains the
+          // gap honestly instead of dead-ending on a missing input.
+          const declineNote: OrchestratorWorkingMemoryEntry[] = egressPromotionDeclined
+            ? [
+                {
+                  planId: plan.planId,
+                  subtaskId: subtask.id,
+                  kind: 'user_decision',
+                  label: 'Private detail withheld from the web',
+                  content:
+                    'You chose not to send the private detail this step needs to the web. Do not guess or fabricate it. Complete what you can from public information only, and tell the user plainly that you could not look it up because the private detail was kept off the web.',
+                  sourceToolNames: [],
+                },
+              ]
+            : [];
+          const visibleMemory = [
+            ...baseVisibleMemory,
+            ...promotedEgressEntries,
+            ...declineNote,
+          ];
           if (
             !subtask.allowedTools.includes('web.fetch') &&
             visibleMemory.some((entry) =>
@@ -1312,14 +1431,27 @@ function restrictPackToSubtaskTools(pack: SkillPack, subtask: AgentSubtask): Ski
   };
 }
 
-function usesProviderVideoExecutor(subtask: AgentSubtask): boolean {
-  return (
+function usesProviderMediaExecutor(subtask: AgentSubtask): boolean {
+  if (
     subtask.kind === 'video' &&
     (subtask.media?.operation === 'video_generate' ||
       subtask.media?.operation === 'video_render' ||
       subtask.allowedTools.includes('video.generate') ||
       subtask.allowedTools.includes('video.render'))
-  );
+  ) {
+    return true;
+  }
+  // Image generation/edit runs through the (synchronous) media executor too.
+  if (
+    subtask.kind === 'image' &&
+    (subtask.media?.operation === 'image_generate' ||
+      subtask.media?.operation === 'image_edit' ||
+      subtask.allowedTools.includes('image.generate') ||
+      subtask.allowedTools.includes('image.edit'))
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function hasDirectDependents(

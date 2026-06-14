@@ -13,15 +13,15 @@ The verification protocol is:
 ```bash
 git clone https://github.com/zeemudia/brianni-enclave
 cd brianni-enclave
-git checkout v1.0.0-pcr0-ded8266a
+git checkout v1.0.0-pcr0-590f8004
 
 # Verify the signed release tag before rebuilding.
 cat > /tmp/brianni-enclave.allowed_signers <<'EOF'
-iosazee1@gmail.com,zee@zeemudia.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICLa1pk4xbbrWr2cX8t+D4d9OmJaRwVWxnv0vTrlhafG
+zee@zeemudia.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICLa1pk4xbbrWr2cX8t+D4d9OmJaRwVWxnv0vTrlhafG
 EOF
 git config --local gpg.format ssh
 git config --local gpg.ssh.allowedSignersFile /tmp/brianni-enclave.allowed_signers
-git verify-tag v1.0.0-pcr0-ded8266a
+git verify-tag v1.0.0-pcr0-590f8004
 
 ./infra/docker/vendor-deps.sh
 ./enclave/build.sh --offline
@@ -46,20 +46,20 @@ least one external verifier, the trust surface narrows to "the operator
 AND the verifier must collude" for the public PCR0 to differ from the
 deployed one.
 
-## Latest release: v1.0.0-pcr0-ded8266a (2026-06-13)
+## Latest release: v1.0.0-pcr0-590f8004 (2026-06-14)
 
-- **Published PCR0:** `ded8266aa3dbd43601d19f6afb896c8b775b8aebc068804fe13e7fa76304fbc12998526b6ec8e7774d81795f713da09a`
+- **Published PCR0:** `590f8004083546f3e2453ec476ab4f0ffdfbd25adb94dbc62ccae7d9f70c3f63f1ea9a5e5c839eb0db2ca300f897585c`
 - **Published PCR1:** `4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493` (kernel / initramfs — normally stable)
-- **Published PCR2:** `9304612543e8a16eafeac32557269bc6e564d0036166f346d3d3a981b499565b82b2acabf109a640d7f1ba685fea85ef` (application layer — rotates on any enclave code change)
-- **Vendor manifest SHA256:** `791623b5afd1eedcb5007ea06b537867d95f80e1c154766e2479cdb4090a21fb`
-- **Published source commit:** [`c300e5d0ebe3ff119edca19b13431a23e2c7d4d9`](https://github.com/zeemudia/brianni-enclave/commit/c300e5d0ebe3ff119edca19b13431a23e2c7d4d9)
+- **Published PCR2:** `ba42500b24daf77964ec02f1261634f42aa830e2352706a831cca52c03b8b8c912dd32add07ad99885e8afc45c7af641` (application layer — rotates on any enclave code change)
+- **Vendor manifest SHA256:** `6455840a641aa7e1408d93fce4f0de8749c0e461654ef03ff5a445fd9dbde1f4`
+- **Published source commit:** [`3a8526b1f53cd8094eea5dd8b25d964eb9242af8`](https://github.com/zeemudia/brianni-enclave/commit/3a8526b1f53cd8094eea5dd8b25d964eb9242af8)
 - **Release gate:** clean-host builder/appliance proof before public promotion.
 
 ### Verifications table
 
 | Verifier | Date (UTC) | Build host (AMI / OS / region) | Observed PCR0 | Result |
 |---|---|---|---|---|
-| Clean-host release proof | 2026-06-13 | Temporary Nitro builder + separate Nitro host, Amazon Linux 2023 | `ded8266aa3dbd43601d19f6afb896c8b775b8aebc068804fe13e7fa76304fbc12998526b6ec8e7774d81795f713da09a` | EIF measurement matched, release-mode enclave booted, local vsock health OK, public attestation valid |
+| Clean-host release proof | 2026-06-14 | Temporary Nitro builder + separate Nitro host, Amazon Linux 2023 | `590f8004083546f3e2453ec476ab4f0ffdfbd25adb94dbc62ccae7d9f70c3f63f1ea9a5e5c839eb0db2ca300f897585c` | EIF measurement matched, release-mode enclave booted, local vsock health OK, public attestation valid |
 
 External independent rows should be added below the operator proof once a
 third-party verifier rebuilds the tag and reports a matching PCR0. The launch

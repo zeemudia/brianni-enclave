@@ -450,3 +450,112 @@ describe('orchestrator egress memory isolation', () => {
     }
   });
 });
+
+describe('orchestrator egress bridge (consent-gated private-read -> web)', () => {
+  // Reuses READ_FETCH_REPORT_PLAN: st_read (private) emits CANARY into working
+  // memory; st_fetch (web.fetch-only) is denied it by isolation. The bridge
+  // offers the user the candidate datum; approval crosses it, denial does not.
+  function bridgeWorkerFactory(fetchInbound: string[]): () => ChatProcessor {
+    return () => ({
+      async *streamChat(messages: ChatMessage[]): AsyncGenerator<ChatChunk> {
+        const text = lastUserContent(messages);
+        if (/Subtask: Read private file/.test(text)) {
+          yield { id: 'c', choices: [{ delta: { content: `The file canary is ${CANARY}.` }, finish_reason: null }] };
+          return;
+        }
+        if (/Subtask: Fetch public page/.test(text)) {
+          const sawToolResult = messages.some(
+            (m) => m.role === 'user' && /Tool result — web\.fetch/.test(m.content),
+          );
+          if (!sawToolResult) {
+            fetchInbound.push(messages.map((m) => m.content).join('\n'));
+            yield {
+              id: 'c',
+              choices: [{ delta: { content: '<tool>{"toolName":"web.fetch","args":{"url":"https://example.com/","query":"status"}}</tool>' }, finish_reason: null }],
+            };
+            return;
+          }
+          yield { id: 'c', choices: [{ delta: { content: 'The page returned 200.' }, finish_reason: null }] };
+          return;
+        }
+        yield { id: 'c', choices: [{ delta: { content: 'ok' }, finish_reason: null }] };
+      },
+    });
+  }
+
+  function bridgeDeps(
+    fetchInbound: string[],
+    awaitEgressPromotion: RunOrchestratorDeps['awaitEgressPromotion'],
+  ): RunOrchestratorDeps {
+    const invokeClient = vi.fn(
+      async (frame: ToolInvocationFrame): Promise<ToolResultFrame> => ({
+        invocationId: frame.invocationId,
+        outcome: 'ok',
+        resultJson: { status: 200, bodyText: 'Example Domain.' },
+      }),
+    );
+    return {
+      agentTurnId: 'turn_bridge',
+      gateway: new ToolGateway({ clientBridge: { invokeClient } }),
+      pack,
+      plannerProvider: planner(READ_FETCH_REPORT_PLAN),
+      workerProviderFactory: bridgeWorkerFactory(fetchInbound),
+      plannerModel: 'gpt-5.5',
+      summaryModel: 'gpt-5.5',
+      models,
+      enabledGatewayTools: pack.toolScopes,
+      enabledEndpointFamilies: ['chat'],
+      messages: [
+        {
+          role: 'user' as const,
+          content:
+            'Read my private notes file from the linked Documents folder, then fetch https://example.com and write a short report.',
+        },
+      ],
+      requestContext: {
+        linkedFolders: [{ folderId: 'fld_docs', displayName: 'Documents', status: 'granted' as const }],
+        writePermissionMode: 'always_ask' as const,
+      },
+      awaitEgressPromotion,
+      workerTimeoutMs: 5_000,
+      summaryTimeoutMs: 5_000,
+    };
+  }
+
+  it('APPROVED: the user-promoted private datum crosses into the web.fetch worker', async () => {
+    const fetchInbound: string[] = [];
+    const seenCandidates: Array<{ id: string; content: string }> = [];
+    const approve: RunOrchestratorDeps['awaitEgressPromotion'] = async (payload) => {
+      for (const c of payload.candidates) seenCandidates.push({ id: c.id, content: c.content });
+      return { approvedIds: payload.candidates.map((c) => c.id) };
+    };
+
+    await collect(runOrchestrator(bridgeDeps(fetchInbound, approve)));
+
+    // The bridge offered the private-derived datum as a candidate...
+    expect(seenCandidates.some((c) => c.content.includes(CANARY))).toBe(true);
+    // ...and once approved it reached the egress worker's context.
+    expect(fetchInbound.length).toBeGreaterThan(0);
+    expect(fetchInbound.join('\n')).toContain(CANARY);
+  });
+
+  it('DENIED: the datum never crosses and the worker gets an honest decline note (no frozen running)', async () => {
+    const fetchInbound: string[] = [];
+    const deny: RunOrchestratorDeps['awaitEgressPromotion'] = async () => ({ approvedIds: [] });
+
+    await collect(runOrchestrator(bridgeDeps(fetchInbound, deny)));
+
+    expect(fetchInbound.length).toBeGreaterThan(0);
+    // Isolation holds: the private datum did NOT cross.
+    expect(fetchInbound.join('\n')).not.toContain(CANARY);
+    // The worker is told to answer honestly rather than dead-end.
+    expect(fetchInbound.join('\n')).toContain('could not look it up');
+  });
+
+  it('FAIL-CLOSED: an absent promotion channel denies (no datum crosses)', async () => {
+    const fetchInbound: string[] = [];
+    // No awaitEgressPromotion wired at all.
+    await collect(runOrchestrator(bridgeDeps(fetchInbound, undefined)));
+    expect(fetchInbound.join('\n')).not.toContain(CANARY);
+  });
+});

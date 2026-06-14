@@ -17,6 +17,7 @@ import {
 import { ProviderError } from '../providers/errors';
 import type { ProviderResponseLike } from '../usage-report';
 import { ToolGateway } from '../tools';
+import { BinaryWorkItemManager } from '../tools/binary-work-items';
 
 function mkPack(scopes: SkillPack['toolScopes']): SkillPack {
   return {
@@ -467,9 +468,8 @@ describe('runOrchestrator', () => {
     expect(events.at(-1)).toMatchObject({ kind: 'done' });
   });
 
-  it('forwards enabled specialist endpoint families to media subtask routing', async () => {
+  it('routes an image subtask to the image model and through the synchronous media executor (both gates open)', async () => {
     const imagePack = mkPack([...pack.toolScopes, 'image.generate']);
-    const capturedModelIds: string[] = [];
     const imageModel: ModelCapability = {
       modelId: 'gpt-image-test',
       providerId: 'openai',
@@ -481,6 +481,52 @@ describe('runOrchestrator', () => {
       latencyTier: 'standard',
       routingStatus: 'enabled',
       requiredGatewayTools: ['image.generate'],
+    };
+    // The image subtask is now handled by the synchronous media executor, not
+    // the chat worker. Provide a media stub whose image adapter records the
+    // routed model id and returns bytes.
+    const capturedAdapterModelIds: string[] = [];
+    const media = {
+      videoAdapters: {},
+      imageAdapters: {
+        openai: {
+          generate: async (input: { modelId: string }) => {
+            capturedAdapterModelIds.push(input.modelId);
+            return {
+              status: 'done' as const,
+              imageBytes: new TextEncoder().encode('PNGDATA'),
+              mimeType: 'image/png' as const,
+              actualQuotaUnits: 3,
+            };
+          },
+        },
+      },
+      checkpointClient: {
+        load: async () => null,
+        savePendingStart: async () => undefined,
+        saveProviderJob: async () => undefined,
+        markCancelled: async () => undefined,
+        markBillingPending: async () => undefined,
+        listCancelledPending: async () => [],
+        listBillingPending: async () => [],
+        markBillingSlaEscalated: async () => undefined,
+        markTerminal: async () => undefined,
+      },
+      budgetClient: {
+        reserve: async () => ({ ok: true as const, holdId: 'hold_img' }),
+        reconcile: async () => undefined,
+      },
+      provenanceSigner: { sign: () => 'sig', verify: () => true },
+      encryptArtifact: async (i: { bytes: Uint8Array }) => ({
+        artifactId: 'art_1',
+        ciphertextRef: 'ref_1',
+        sha256: '0'.repeat(64),
+        byteSize: i.bytes.byteLength,
+      }),
+      // image.generate delivers via the binary write-ACK path; the production
+      // gateway threads the shared BinaryWorkItemManager. The fixture's
+      // awaitBinaryWriteAck (below, on the orchestrator deps) ACKs an ok save.
+      binaryWorkItems: new BinaryWorkItemManager(),
     };
 
     const events = await collectEvents(
@@ -501,22 +547,33 @@ describe('runOrchestrator', () => {
                 "allowedTools": ["image.generate"],
                 "dependsOn": [],
                 "producesArtifact": true,
-                "risk": "medium"
+                "risk": "medium",
+                "media": { "operation": "image_generate", "privacyPolicy": "sanitized_only" }
               }
             ]
           }`),
-          workerProviderFactory: (modelId) => {
-            capturedModelIds.push(modelId);
-            return processor('Image generated.');
-          },
           models: [...models, imageModel],
           enabledGatewayTools: imagePack.toolScopes,
           enabledEndpointFamilies: ['chat', 'image'],
+          media: media as unknown as RunOrchestratorDeps['media'],
+          sessionId: 'sess_img',
+          // The image bytes are delivered to the (baseDeps) granted folder; the
+          // client ACKs an ok save so the subtask reaches DONE.
+          awaitBinaryWriteAck: async () => ({
+            invocationId: 'inv',
+            outcome: 'ok' as const,
+            resultJson: { status: 'committed' },
+          }),
         }),
       ),
     );
 
-    expect(capturedModelIds[0]).toBe('gpt-image-test');
+    // Routed to the image model and ran the media executor.
+    expect(capturedAdapterModelIds[0]).toBe('gpt-image-test');
+    const artifact = events.find((e) => e.kind === 'orchestrator-artifact');
+    expect(artifact).toMatchObject({ artifactKind: 'image/png' });
+    // Delivery went through the binary write-ACK path.
+    expect(events.some((e) => e.kind === 'binary-write-request')).toBe(true);
     expect(events.at(-1)).toMatchObject({ kind: 'done' });
   });
 

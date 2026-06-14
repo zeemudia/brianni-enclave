@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "prompts": {
+    "personal-agent.default": "Sample persona prompt for personal-agent.default. The real persona prompts are operator-signed and host-served at /etc/calypso/skill-prompts.json; they are not in this public audit repo and are not baked into the EIF (only skill-prompts-verify-key.pem is).",
+    "personal-agent.career": "Sample persona prompt for personal-agent.career. The real persona prompts are operator-signed and host-served at /etc/calypso/skill-prompts.json; they are not in this public audit repo and are not baked into the EIF (only skill-prompts-verify-key.pem is).",
+    "personal-agent.legal-tenant": "Sample persona prompt for personal-agent.legal-tenant. The real persona prompts are operator-signed and host-served at /etc/calypso/skill-prompts.json; they are not in this public audit repo and are not baked into the EIF (only skill-prompts-verify-key.pem is).",
+    "personal-agent.health": "Sample persona prompt for personal-agent.health. The real persona prompts are operator-signed and host-served at /etc/calypso/skill-prompts.json; they are not in this public audit repo and are not baked into the EIF (only skill-prompts-verify-key.pem is).",
+    "personal-agent.claims": "Sample persona prompt for personal-agent.claims. The real persona prompts are operator-signed and host-served at /etc/calypso/skill-prompts.json; they are not in this public audit repo and are not baked into the EIF (only skill-prompts-verify-key.pem is)."
+  },
+  "signature": "SAMPLE-NOT-A-VALID-SIGNATURE"
+}

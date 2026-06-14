@@ -55,50 +55,92 @@ export function getActivePackOrDefault(id: string | null | undefined): SkillPack
   return getSkillPack(id) ?? getSkillPack(DEFAULT_PACK_ID)!;
 }
 
-const EFFECTIVE_PACKS = new Map<string, SkillPack>();
+/**
+ * Resolves a pack id to its verified system-prompt block. Supplied ONLY by the
+ * enclave, after it fetches + Ed25519-verifies the host-served skill-prompts
+ * bundle. Clients never pass a resolver, so client-side effective packs carry
+ * NO `systemPromptBlock` — the prompt text is in no client bundle.
+ */
+export type SkillPromptResolver = (packId: string) => string | undefined;
+
+// Metadata composition (toolScopes / capabilities) is prompt-independent and
+// cacheable. The prompt is layered on per call from the resolver, so this cache
+// never holds prompt text.
+const EFFECTIVE_METADATA = new Map<string, SkillPack>();
 
 /**
  * Returns the runtime capability view for the selected pack.
  *
  * Specialist packs are additive over General: selecting Career, Legal, or
- * Health focuses namespace/prompt/folder defaults without removing the base
- * General tools. The raw packs remain available via getSkillPack() for settings
- * display and registry validation.
+ * Health focuses namespace/folder defaults without removing the base General
+ * tools. The raw packs remain available via getSkillPack() for settings display
+ * and registry validation.
+ *
+ * The system prompt is composed ONLY when `resolvePrompt` is supplied (the
+ * enclave, after verifying the signed skill-prompts bundle). Without it — every
+ * client call — the returned pack has NO `systemPromptBlock`; this is what keeps
+ * the persona prompts out of the web/mobile bundles. When a resolver IS given, a
+ * missing prompt for an active pack THROWS (fail closed): a host that omits a
+ * prompt must never yield a silently-unprompted agent.
  */
-export function getEffectiveSkillPack(id: string | null | undefined): SkillPack {
+export function getEffectiveSkillPack(
+  id: string | null | undefined,
+  resolvePrompt?: SkillPromptResolver,
+): SkillPack {
   const active = getActivePackOrDefault(id);
-  const cached = EFFECTIVE_PACKS.get(active.id);
-  if (cached) return cached;
-
   const base = getSkillPack(DEFAULT_PACK_ID)!;
-  if (active.id === base.id) {
-    EFFECTIVE_PACKS.set(active.id, base);
-    return base;
+
+  let metadata = EFFECTIVE_METADATA.get(active.id);
+  if (!metadata) {
+    if (active.id === base.id) {
+      metadata = base;
+    } else {
+      // Cross-pack packs are restrictive: they declare exactly the tools they
+      // need and must not inherit write tools (e.g. memory.write) from the base
+      // pack, since combining cross-namespace reads with writes would widen the
+      // exfil surface. All existing packs lack crossPackNamespaces.
+      const isRestrictive = Array.isArray(active.crossPackNamespaces);
+      metadata = SkillPackSchema.parse({
+        ...active,
+        systemPromptBlock: undefined,
+        toolScopes: isRestrictive
+          ? active.toolScopes
+          : uniquePreservingOrder(base.toolScopes, active.toolScopes),
+        capabilitySuiteIds: uniquePreservingOrder(
+          base.capabilitySuiteIds,
+          active.capabilitySuiteIds,
+        ),
+      });
+    }
+    EFFECTIVE_METADATA.set(active.id, metadata);
   }
 
-  // Cross-pack packs are restrictive: they declare exactly the tools they need
-  // and must not inherit write tools (e.g. memory.write) from the base pack,
-  // since combining cross-namespace reads with writes would widen the exfil
-  // surface. All existing packs lack crossPackNamespaces and are unaffected.
-  const isRestrictive = Array.isArray(active.crossPackNamespaces);
-  const effective = SkillPackSchema.parse({
-    ...active,
-    systemPromptBlock: [
-      base.systemPromptBlock,
+  if (!resolvePrompt) return metadata;
+
+  const basePrompt = resolvePrompt(base.id);
+  if (!basePrompt) {
+    throw new Error(
+      `[skills] missing verified system prompt for base pack ${base.id}`,
+    );
+  }
+  let systemPromptBlock: string;
+  if (active.id === base.id) {
+    systemPromptBlock = basePrompt;
+  } else {
+    const specialistPrompt = resolvePrompt(active.id);
+    if (!specialistPrompt) {
+      throw new Error(
+        `[skills] missing verified system prompt for pack ${active.id}`,
+      );
+    }
+    systemPromptBlock = [
+      basePrompt,
       "",
       `Specialist skill layer (${active.displayName}):`,
-      active.systemPromptBlock,
-    ].join("\n"),
-    toolScopes: isRestrictive
-      ? active.toolScopes
-      : uniquePreservingOrder(base.toolScopes, active.toolScopes),
-    capabilitySuiteIds: uniquePreservingOrder(
-      base.capabilitySuiteIds,
-      active.capabilitySuiteIds,
-    ),
-  });
-  EFFECTIVE_PACKS.set(active.id, effective);
-  return effective;
+      specialistPrompt,
+    ].join("\n");
+  }
+  return { ...metadata, systemPromptBlock };
 }
 
 /** Returns true iff `id` matches a pack in the canonical registry. */

@@ -229,6 +229,8 @@ COPY --from=builder /app/packages ./packages
 COPY --from=builder /app/enclave/src/tools/media_tools_service.py ./dist/tools/media_tools_service.py
 # Verify key for provider registry signature (public key — safe to bundle).
 COPY --from=builder /app/enclave/src/providers/registry-verify-key.pem ./dist/providers/registry-verify-key.pem
+# Verify key for skill-prompts signature (public key — safe to bundle).
+COPY --from=builder /app/enclave/src/skills/skill-prompts-verify-key.pem ./dist/skills/skill-prompts-verify-key.pem
 
 # NSM attestation helper (Python script called by nsm.ts for /dev/nsm ioctl)
 COPY --from=builder /app/enclave/src/nsm_helper.py ./dist/nsm_helper.py
@@ -244,21 +246,27 @@ RUN chmod +x /usr/local/bin/kmstool_enclave_cli && \
     echo /usr/local/lib > /etc/ld.so.conf.d/aws-nitro.conf && \
     ldconfig
 
-# Provider-key ciphertext and provider registry are BOTH host-served
-# at boot time rather than baked into the EIF. See:
-#   infra/host/keys-broker.py    (vsock:8102, serves /etc/calypso/encrypted-keys.json)
+# Provider-key ciphertext, the provider registry, and the persona
+# skill-prompts are ALL host-served at boot time rather than baked into
+# the EIF. See:
+#   infra/host/keys-broker.py     (vsock:8102, serves /etc/calypso/encrypted-keys.json)
 #   infra/host/registry-broker.py (vsock:8101, serves /etc/calypso/providers.json)
+#   infra/host/skills-broker.py   (vsock:8103, serves /etc/calypso/skill-prompts.json)
 # Enclave-side clients:
-#   enclave/src/keys-client.ts    (fetches + validates encrypted-keys blob)
+#   enclave/src/keys-client.ts     (fetches + validates encrypted-keys blob)
 #   enclave/src/registry-client.ts (fetches + Ed25519-verifies providers.json)
-# Why host-served rather than baked: any change to either file would
-# otherwise rotate PCR0, forcing a KMS policy rotation AND a mobile/
-# web client release. Host-serving decouples the two lifecycles so
-# provider-key rotation and registry updates are laptop/host-only
-# operations. Trust model: encrypted-keys is protected by the KMS
-# attestation policy (PCR0-bound); providers.json is Ed25519-signed
-# against a baked verify key (registry-verify-key.pem, already bundled
-# in the builder stage). DO NOT re-introduce a COPY of either file —
+#   enclave/src/skills-client.ts   (fetches + Ed25519-verifies skill-prompts.json)
+# Why host-served rather than baked: any change to these files would
+# otherwise rotate PCR0, forcing a KMS policy rotation AND a mobile/web
+# client release. Host-serving decouples the lifecycles so provider-key
+# rotation, registry updates, and persona-prompt edits are laptop/host-only
+# operations. The skill-prompts case ALSO keeps the persona-prompt IP out
+# of the measured image AND out of every client bundle. Trust model:
+# encrypted-keys is protected by the KMS attestation policy (PCR0-bound);
+# providers.json and skill-prompts.json are Ed25519-signed (domain-
+# separated) against baked verify keys (registry-verify-key.pem and
+# skill-prompts-verify-key.pem, bundled in the builder stage). DO NOT
+# re-introduce a COPY of these data files —
 # the P8 static gate (enclave/__tests__/p8-registry-stability.test.ts)
 # will catch it and fail CI.
 

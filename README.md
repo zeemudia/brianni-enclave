@@ -11,13 +11,13 @@ If a rebuild on the documented toolchain stops matching the pinned PCR0, treat i
 ## Current pinned measurement
 
 ```
-PCR0: ded8266aa3dbd43601d19f6afb896c8b775b8aebc068804fe13e7fa76304fbc12998526b6ec8e7774d81795f713da09a
+PCR0: 590f8004083546f3e2453ec476ab4f0ffdfbd25adb94dbc62ccae7d9f70c3f63f1ea9a5e5c839eb0db2ca300f897585c
 PCR1: 4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493
-PCR2: 9304612543e8a16eafeac32557269bc6e564d0036166f346d3d3a981b499565b82b2acabf109a640d7f1ba685fea85ef
+PCR2: ba42500b24daf77964ec02f1261634f42aa830e2352706a831cca52c03b8b8c912dd32add07ad99885e8afc45c7af641
 ```
 
 - **Verified through the clean-host release path.** On 2026-06-12, this EIF was built from a clean git ref on a temporary Nitro builder, booted in Nitro release mode on a separate Nitro host, and verified through local vsock health plus public attestation health. Every entry is appended to [`VERIFICATIONS.md`](./VERIFICATIONS.md) — contribute your own rebuild there.
-- **Vendor manifest SHA256:** `791623b5afd1eedcb5007ea06b537867d95f80e1c154766e2479cdb4090a21fb`. This is a pre-build checksum over every vendored dependency (apt `.deb`s, pip wheels, Yarn cache, node headers). If your `infra/docker/VENDOR-MANIFEST.sha256` matches this value before you build, you have the same dependency bytes we do.
+- **Vendor manifest SHA256:** `6455840a641aa7e1408d93fce4f0de8749c0e461654ef03ff5a445fd9dbde1f4`. This is a pre-build checksum over every vendored dependency (apt `.deb`s, pip wheels, Yarn cache, node headers). If your `infra/docker/VENDOR-MANIFEST.sha256` matches this value before you build, you have the same dependency bytes we do.
 - **Enforced simultaneously by clients, KMS, and this repo.** Divergence takes the product offline rather than silently downgrading: clients reject mismatched attestation, KMS rejects mismatched decrypts, and `enclave/measurement.json` carries the same PCR triple.
 
 ---
@@ -89,7 +89,7 @@ not produce PCR0; that still requires a Nitro-capable EC2 host.
 # 1. Clone this repo onto a Nitro host.
 git clone https://github.com/zeemudia/brianni-enclave.git
 cd brianni-enclave
-git checkout v1.0.0-pcr0-ded8266a
+git checkout v1.0.0-pcr0-590f8004
 
 # Verify the signed release tag. The expected Brianni release key fingerprint is:
 # SHA256:vgDASzXg3D8A2xNUFxDkzbCX8ZbauHknSoSilN+AwIA
@@ -98,7 +98,7 @@ iosazee1@gmail.com,zee@zeemudia.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI
 EOF
 git config --local gpg.format ssh
 git config --local gpg.ssh.allowedSignersFile /tmp/brianni-enclave.allowed_signers
-git verify-tag v1.0.0-pcr0-ded8266a
+git verify-tag v1.0.0-pcr0-590f8004
 
 # 2. One-time bootstrap on Amazon Linux 2023:
 sudo dnf install -y docker aws-nitro-enclaves-cli \
@@ -125,7 +125,7 @@ cd infra/enclave-artefacts && sha256sum -c SHA256SUMS && cd ../..
 # this README. If it doesn't, stop — some upstream drifted and the
 # resulting build won't match the pinned PCR0.
 sha256sum infra/docker/VENDOR-MANIFEST.sha256
-# Expect: 791623b5afd1eedcb5007ea06b537867d95f80e1c154766e2479cdb4090a21fb
+# Expect: 6455840a641aa7e1408d93fce4f0de8749c0e461654ef03ff5a445fd9dbde1f4
 
 # 5. Build the EIF with --network=none (needs no network after step 4).
 ./enclave/build.sh --offline

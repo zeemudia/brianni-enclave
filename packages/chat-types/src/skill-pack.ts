@@ -81,7 +81,13 @@ export const SkillPackSchema = z.object({
   version: z.literal(1),
   displayName: z.string().min(1).max(64),
   description: z.string().min(1).max(280),
-  systemPromptBlock: z.string().min(1).max(4096),
+  // systemPromptBlock no longer ships in client-distributed pack metadata (it
+  // leaked in the web browser bundle and the mobile binary). It lives ONLY in
+  // the signed, host-served skill-prompts bundle (see ./skill-prompts) and is
+  // composed onto the pack by the enclave at request time via
+  // getEffectiveSkillPack(id, resolvePrompt). Optional so metadata-only packs
+  // (clients) and prompt-composed packs (enclave) share one type.
+  systemPromptBlock: z.string().min(1).max(4096).optional(),
   toolScopes: z.array(ToolNameSchema).min(1),
   capabilitySuiteIds: z.array(CapabilitySuiteIdSchema).default(["text"]),
   defaultNamespace: MemoryNamespaceSchema,

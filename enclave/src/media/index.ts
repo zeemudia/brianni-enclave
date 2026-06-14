@@ -6,6 +6,7 @@ export * from "./custody-gate";
 export * from "./jobs";
 export * from "./nitro-attestation";
 export * from "./provenance";
+export * from "./provenance-key";
 export * from "./provider-consent";
 export * from "./provider-visible-input";
 export * from "./remotion-core-skill";

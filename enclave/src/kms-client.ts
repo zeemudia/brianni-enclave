@@ -56,6 +56,17 @@ interface IamCredentials {
   Expiration: string;
 }
 
+export interface AttestedKmsResult {
+  /** Map of provider ID to decrypted API key (subset of registry). */
+  providerKeys: Record<string, string>;
+  /**
+   * Decrypted media-root secret, or null when the blob carries none (a
+   * pre-rotation blob). HKDF-derived into the stable media-provenance signer;
+   * its absence makes the enclave fall back to an ephemeral per-boot key.
+   */
+  mediaRootSecret: string | null;
+}
+
 /**
  * Fetch provider API keys from KMS using attested delivery via kmstool_enclave_cli.
  *
@@ -63,11 +74,11 @@ interface IamCredentials {
  *   Used for the post-decrypt cross-check: the blob must not carry
  *   provider IDs the registry does not know about. Pass an empty Set
  *   only in tests that intentionally bypass the cross-check.
- * @returns Map of provider ID to decrypted API key (subset of registry)
+ * @returns Provider keys (subset of registry) + the optional media-root secret.
  */
 export async function fetchKeysViaAttestedKMS(
   registryProviderIds: Set<string>,
-): Promise<Record<string, string>> {
+): Promise<AttestedKmsResult> {
   if (!existsSync(NSM_DEVICE)) {
     throw new Error(
       'KMS attested delivery requires /dev/nsm (Nitro Enclave). ' +
@@ -122,11 +133,18 @@ export async function fetchKeysViaAttestedKMS(
     decryptedKeys[providerId] = decryptWithKmstool(ciphertext, creds);
   }
 
+  // Decrypt the media-root secret if the blob carries one. Wrapped under the
+  // same PCR0-gated KMS key, so the same attested-decrypt path applies.
+  const mediaRootSecret = blob.mediaRootSecret
+    ? decryptWithKmstool(blob.mediaRootSecret, creds)
+    : null;
+
   console.log(
-    `[enclave] KMS attested delivery: ${Object.keys(decryptedKeys).length} provider keys loaded`,
+    `[enclave] KMS attested delivery: ${Object.keys(decryptedKeys).length} provider keys loaded` +
+      (mediaRootSecret ? ' + media-root secret' : ''),
   );
 
-  return decryptedKeys;
+  return { providerKeys: decryptedKeys, mediaRootSecret };
 }
 
 /**

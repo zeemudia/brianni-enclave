@@ -77,16 +77,19 @@ def nsm_request(request_cbor: bytes) -> bytes:
     return resp_buf.raw[: msg.response.iov_len]
 
 
-def get_attestation(nonce: bytes, public_key: bytes) -> dict:
-    """Request an attestation document from NSM with nonce and public key."""
+def get_attestation(nonce: bytes, public_key: bytes, user_data: bytes = b"") -> dict:
+    """Request an attestation document from NSM with nonce, public key, and
+    optional user_data (the media-provenance public key, bound into the
+    attested document so a client can verify it against the pinned PCR0)."""
     import cbor2
 
-    request = {
-        "Attestation": {
-            "nonce": nonce,
-            "public_key": public_key,
-        }
+    attestation = {
+        "nonce": nonce,
+        "public_key": public_key,
     }
+    if user_data:
+        attestation["user_data"] = user_data
+    request = {"Attestation": attestation}
     request_bytes = cbor2.dumps(request)
     response_bytes = nsm_request(request_bytes)
     response = cbor2.loads(response_bytes)
@@ -129,7 +132,8 @@ def daemon_loop():
             req = json.loads(line)
             nonce = base64.b64decode(req["nonce"])
             public_key = base64.b64decode(req["public_key"])
-            result = get_attestation(nonce, public_key)
+            user_data = base64.b64decode(req["user_data"]) if req.get("user_data") else b""
+            result = get_attestation(nonce, public_key, user_data)
             sys.stdout.write(json.dumps({"status": "ok", **result}) + "\n")
         except Exception as e:
             sys.stdout.write(json.dumps({"status": "error", "error": str(e)}) + "\n")
@@ -142,6 +146,7 @@ def main():
                         help="Run as a stdin/stdout JSON-line daemon")
     parser.add_argument("--nonce", help="Base64-encoded nonce (one-shot mode)")
     parser.add_argument("--public-key", help="Base64-encoded ECDH public key (one-shot mode)")
+    parser.add_argument("--user-data", help="Base64-encoded attested user_data (one-shot mode)")
     args = parser.parse_args()
 
     if args.daemon:
@@ -154,7 +159,8 @@ def main():
     try:
         nonce = base64.b64decode(args.nonce)
         public_key = base64.b64decode(args.public_key)
-        result = get_attestation(nonce, public_key)
+        user_data = base64.b64decode(args.user_data) if args.user_data else b""
+        result = get_attestation(nonce, public_key, user_data)
         print(json.dumps({"status": "ok", **result}))
     except Exception as e:
         print(json.dumps({"status": "error", "error": str(e)}))

@@ -61,6 +61,24 @@ describe("binary work item protocol", () => {
     expect(ack.outcome).toBe("ok");
   });
 
+  it("accepts image.generate and image.edit as binary output tool names", () => {
+    for (const toolName of ["image.generate", "image.edit"] as const) {
+      const request = BinaryWorkItemWriteRequestFrameSchema.parse({
+        kind: "binary_work_item.write_request",
+        agentTurnId: "turn-1",
+        invocationId: "inv-1",
+        toolName,
+        operationId: "op-1",
+        outputId: "out-1",
+        outputPath: "generated/image.calypso.png",
+        sha256Hex: "c".repeat(64),
+        byteLength: 12,
+        chunkCount: 1,
+      });
+      expect(request.toolName).toBe(toolName);
+    }
+  });
+
   it("rejects malformed hashes and unsupported binary tool names", () => {
     expect(() =>
       BinaryWorkItemChunkFrameSchema.parse({

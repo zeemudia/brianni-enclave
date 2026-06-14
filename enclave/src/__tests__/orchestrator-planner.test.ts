@@ -1539,3 +1539,335 @@ ${injected}
     );
   });
 });
+
+// image generation routing (finding 10: R4 "make me a poster image" produced
+// NO_MODEL_FOR_SUBTASK under a false DONE because no image subtask was shaped
+// for the image-output model). The planner must shape a routable image_generate
+// subtask (kind 'image', image_generation capability, image.generate tool,
+// media.operation) when image.generate is scoped.
+describe('createTaskPlan — image generation routing', () => {
+  const IMAGE_SCOPES: ToolName[] = [
+    'memory.list',
+    'memory.read',
+    'folder.read',
+    'file.read',
+    'image.generate',
+    'image.edit',
+    'image.inspect',
+    'image.ocr',
+    'image.transform',
+  ];
+
+  it('shapes a routable image_generate subtask for a "make me an image" request (fallback)', async () => {
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'), // deterministic fallback
+      model: 'gpt-5.5',
+      userText:
+        'make me a poster image for the school bake sale, saturday 10am at the village hall, cheerful but not naff',
+      toolScopes: [...IMAGE_SCOPES],
+      linkedFolderCount: 0,
+    });
+
+    const imageStep = plan.subtasks.find((s) => s.allowedTools.includes('image.generate'));
+    expect(imageStep).toBeDefined();
+    expect(imageStep?.kind).toBe('image');
+    expect(imageStep?.requiredCapabilities).toContain('image_generation');
+    expect(imageStep?.media?.operation).toBe('image_generate');
+    // It must NOT be mis-shaped as a read/ocr/transform of an existing image.
+    expect(imageStep?.allowedTools).not.toContain('image.ocr');
+  });
+
+  it('tags media.operation + image_generation on an LLM-planned image.generate subtask that omitted them', async () => {
+    const provider = processorWithText(`
+<plan id="planner_img">
+{
+  "planId": "plan_img",
+  "title": "Plan party and make a poster",
+  "summary": "Make a poster image for the party.",
+  "subtasks": [
+    {
+      "id": "st_poster",
+      "title": "Generate poster image",
+      "objective": "Generate a cheerful poster image for the bake sale.",
+      "kind": "image",
+      "requiredCapabilities": ["general_reasoning"],
+      "allowedTools": ["image.generate"],
+      "dependsOn": [],
+      "producesArtifact": true,
+      "risk": "low"
+    }
+  ]
+}
+</plan>`);
+
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_img',
+      userText: 'make me a poster image for the bake sale',
+      toolScopes: [...IMAGE_SCOPES],
+      linkedFolderCount: 0,
+    });
+
+    const imageStep = plan.subtasks.find((s) => s.id === 'st_poster');
+    expect(imageStep?.media?.operation).toBe('image_generate');
+    expect(imageStep?.requiredCapabilities).toContain('image_generation');
+  });
+
+  it('does NOT shape an image_generate subtask for a read/transform image request', async () => {
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'),
+      model: 'gpt-5.5',
+      userText: 'resize photo.png to 800px wide',
+      toolScopes: [...IMAGE_SCOPES],
+      linkedFolderCount: 1,
+    });
+
+    const allTools = plan.subtasks.flatMap((s) => s.allowedTools);
+    expect(allTools).not.toContain('image.generate');
+    expect(plan.subtasks.every((s) => s.media?.operation !== 'image_generate')).toBe(true);
+  });
+
+  it('strips LOCAL image tools from an LLM-planned image_generate subtask (router hard-cap bypass guard)', async () => {
+    // A local image tool (image.transform) satisfies image_generation in the
+    // router's LOCAL_MODALITY_TOOL_FAMILIES; leaving it on a generation subtask
+    // would let a chat model satisfy the hard gate and dead-end in
+    // IMAGE_ADAPTER_UNAVAILABLE. The generation subtask must scope only the
+    // provider image tool.
+    const provider = processorWithText(`
+<plan id="planner_img2">
+{
+  "planId": "plan_img2",
+  "title": "Generate poster",
+  "summary": "Generate a poster image.",
+  "subtasks": [
+    {
+      "id": "st_poster",
+      "title": "Generate poster image",
+      "objective": "Generate a cheerful poster image.",
+      "kind": "image",
+      "requiredCapabilities": ["vision"],
+      "allowedTools": ["image.generate", "image.transform", "image.inspect"],
+      "dependsOn": [],
+      "producesArtifact": true,
+      "risk": "low"
+    }
+  ]
+}
+</plan>`);
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_img2',
+      userText: 'make me a poster image',
+      toolScopes: [...IMAGE_SCOPES],
+      linkedFolderCount: 0,
+    });
+    const imageStep = plan.subtasks.find((s) => s.id === 'st_poster');
+    expect(imageStep?.allowedTools).toContain('image.generate');
+    expect(imageStep?.allowedTools).not.toContain('image.transform');
+    expect(imageStep?.allowedTools).not.toContain('image.inspect');
+    expect(imageStep?.requiredCapabilities).toContain('image_generation');
+  });
+
+  it('routes an explicit image-production request to image_generate even when research.ask is scoped and a research keyword is present', async () => {
+    // isImageGenerateRequest is checked BEFORE isResearchAskRequest, so an
+    // explicit "design a logo" intent is not shadowed by a research keyword.
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'),
+      model: 'gpt-5.5',
+      userText: 'design a logo with the best festive gift ideas baked in',
+      toolScopes: [...IMAGE_SCOPES, 'research.ask'],
+      linkedFolderCount: 0,
+    });
+    const allTools = plan.subtasks.flatMap((s) => s.allowedTools);
+    expect(allTools).toContain('image.generate');
+    expect(allTools).not.toContain('research.ask');
+    expect(plan.subtasks.some((s) => s.media?.operation === 'image_generate')).toBe(true);
+  });
+});
+
+// research.ask routing (finding: the gated verbatim-query approval modal — a
+// flagship trust surface — never fired because the planner had no notion of
+// research.ask, so research-heavy requests fell to web.fetch / provider-native
+// search. Research-heavy / external-authoritative-source requests must route to
+// the gated research.ask path; quick single-source lookups keep web.fetch.
+describe('createTaskPlan — research.ask routing', () => {
+  const RESEARCH_SCOPES: ToolName[] = [...DEFAULT_PROOF_SCOPES, 'research.ask'];
+
+  it('routes a research-heavy request to the gated research.ask path, not web.fetch (fallback)', async () => {
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'), // forces deterministic fallback
+      model: 'gpt-5.5',
+      userText:
+        'my car insurance renewal came in at £680, last year was £490. is that normal right now? draft me something to haggle them down',
+      toolScopes: [...RESEARCH_SCOPES],
+      linkedFolderCount: 0,
+    });
+
+    const allTools = plan.subtasks.flatMap((subtask) => subtask.allowedTools);
+    expect(allTools).toContain('research.ask');
+    expect(allTools).not.toContain('web.fetch');
+  });
+
+  it('routes a statutory-entitlement research request (CL2 flight compensation) to research.ask', async () => {
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'),
+      model: 'gpt-5.5',
+      userText:
+        'BA cancelled my flight to malaga last month with 4 hours notice. what am i owed and write the claim',
+      toolScopes: [...RESEARCH_SCOPES],
+      linkedFolderCount: 0,
+    });
+
+    const allTools = plan.subtasks.flatMap((subtask) => subtask.allowedTools);
+    expect(allTools).toContain('research.ask');
+    expect(allTools).not.toContain('web.fetch');
+  });
+
+  it('keeps web.fetch (the quick-lookup / native-search path) for a bare single-URL fetch even when research.ask is available', async () => {
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'),
+      model: 'gpt-5.5',
+      userText: 'fetch https://example.com using the web tool and summarise it.',
+      toolScopes: [...RESEARCH_SCOPES],
+      linkedFolderCount: 0,
+    });
+
+    const allTools = plan.subtasks.flatMap((subtask) => subtask.allowedTools);
+    expect(allTools).toContain('web.fetch');
+    expect(allTools).not.toContain('research.ask');
+  });
+
+  it('swaps web.fetch -> research.ask on an LLM-planned research subtask for a research-heavy request', async () => {
+    const provider = processorWithText(`
+<plan id="planner_research">
+{
+  "planId": "plan_research",
+  "title": "Research market rate and draft",
+  "summary": "Research whether the renewal is normal, then draft a haggle email.",
+  "subtasks": [
+    {
+      "id": "st_research",
+      "title": "Research insurance market rates",
+      "objective": "Research whether a renewal increase like this is normal right now.",
+      "kind": "research",
+      "requiredCapabilities": ["research", "general_reasoning"],
+      "allowedTools": ["web.fetch"],
+      "dependsOn": [],
+      "producesArtifact": false,
+      "risk": "low"
+    },
+    {
+      "id": "st_draft",
+      "title": "Draft haggle email",
+      "objective": "Draft an email to haggle the renewal down.",
+      "kind": "writing",
+      "requiredCapabilities": ["writing", "general_reasoning"],
+      "allowedTools": ["email.draft"],
+      "dependsOn": ["st_research"],
+      "producesArtifact": true,
+      "risk": "low"
+    }
+  ]
+}
+</plan>`);
+
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_research',
+      userText:
+        'my car insurance renewal came in at £680, last year was £490. is that normal right now? draft me something to haggle them down',
+      toolScopes: [...RESEARCH_SCOPES, 'email.draft'],
+      linkedFolderCount: 0,
+    });
+
+    const researchStep = plan.subtasks.find(
+      (subtask) => subtask.id === 'st_research',
+    );
+    expect(researchStep?.allowedTools).toContain('research.ask');
+    expect(researchStep?.allowedTools).not.toContain('web.fetch');
+    // The draft step is untouched.
+    const draftStep = plan.subtasks.find((subtask) => subtask.id === 'st_draft');
+    expect(draftStep?.allowedTools).toEqual(['email.draft']);
+  });
+
+  it('does NOT invent research.ask for a research-heavy request when the pack lacks it (web.fetch stays)', async () => {
+    // Health/Legal packs have web.fetch but not research.ask; a research-heavy
+    // request must degrade to web.fetch, never reference an unscoped tool.
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'),
+      model: 'gpt-5.5',
+      userText:
+        'is a 40% rent increase normal in london right now? what are my rights',
+      toolScopes: ['memory.list', 'memory.read', 'folder.read', 'file.read', 'web.fetch', 'doc.draft'],
+      linkedFolderCount: 0,
+    });
+
+    const allTools = plan.subtasks.flatMap((subtask) => subtask.allowedTools);
+    expect(allTools).not.toContain('research.ask');
+  });
+});
+
+// Video generation: a "make me a video" request must shape a routable
+// video_generate subtask (kind 'video', video_generation capability,
+// video.generate tool, media.operation) when video.generate is scoped — and
+// must NOT be mis-shaped as an inspect/transcribe of an existing video.
+describe('createTaskPlan — video generation routing', () => {
+  const VIDEO_SCOPES: ToolName[] = [
+    'memory.list',
+    'memory.read',
+    'folder.read',
+    'file.read',
+    'video.generate',
+    'video.inspect',
+    'video.transcribe',
+    'video.transform',
+  ];
+
+  it('shapes a routable video_generate subtask for a "make me a video" request (fallback)', async () => {
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'), // deterministic fallback
+      model: 'gpt-5.5',
+      userText: 'make me an 8 second teaser video of a sunrise over snowy mountains, cinematic',
+      toolScopes: [...VIDEO_SCOPES],
+      linkedFolderCount: 0,
+    });
+
+    const videoStep = plan.subtasks.find((s) => s.allowedTools.includes('video.generate'));
+    expect(videoStep).toBeDefined();
+    expect(videoStep?.kind).toBe('video');
+    expect(videoStep?.requiredCapabilities).toContain('video_generation');
+    expect(videoStep?.media?.operation).toBe('video_generate');
+    // Not mis-shaped as a read/transcribe/transform of an existing clip.
+    expect(videoStep?.allowedTools).not.toContain('video.transcribe');
+  });
+
+  it('does NOT shape a video_generate subtask for a read/transcribe video request', async () => {
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'),
+      model: 'gpt-5.5',
+      userText: 'transcribe the audio in meeting.mp4 and summarise it',
+      toolScopes: [...VIDEO_SCOPES],
+      linkedFolderCount: 1,
+    });
+
+    expect(plan.subtasks.every((s) => s.media?.operation !== 'video_generate')).toBe(true);
+  });
+
+  it('does NOT shape a video_generate subtask when video.generate is not scoped (fail-closed gate stripped it)', async () => {
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'),
+      model: 'gpt-5.5',
+      userText: 'make me an 8 second teaser video of a sunrise',
+      // video.generate absent (gate stripped it — no routable video model).
+      toolScopes: ['memory.list', 'memory.read', 'folder.read', 'file.read'],
+      linkedFolderCount: 0,
+    });
+
+    const allTools = plan.subtasks.flatMap((s) => s.allowedTools);
+    expect(allTools).not.toContain('video.generate');
+    expect(plan.subtasks.every((s) => s.media?.operation !== 'video_generate')).toBe(true);
+  });
+});

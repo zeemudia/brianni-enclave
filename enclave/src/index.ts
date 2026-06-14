@@ -1,6 +1,14 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { type Socket } from "node:net";
+import {
+  createHash,
+  generateKeyPairSync,
+  randomUUID,
+  sign as cryptoSign,
+  verify as cryptoVerify,
+  type KeyObject,
+} from "node:crypto";
 import { decodeFrame, encodeFrame, MSG } from "./vsock";
 import {
   EnclaveSessionManager,
@@ -11,16 +19,44 @@ import {
   initRegistry,
   getProviderForCustomModel,
   getProviderForModel,
+  getProviderById,
   createProcessor,
   getAllProviders,
   type ModelConfig,
+  type ProviderConfig,
 } from "./providers/registry";
+import { OpenAIImageProcessor } from "./providers/adapters/openai-image-v1";
+import { GoogleImageProcessor } from "./providers/adapters/google-image-v1";
+import type { ImageProviderAdapter } from "./media/image-provider";
+import {
+  deriveProvenanceSigner,
+  buildProvenanceUserData,
+  GoogleVeoVideoAdapter,
+  type ProvenanceSigner,
+  type VideoProviderAdapter,
+} from "./media";
+import { createMediaBudgetClient } from "./media-budget-client";
+import { createVideoCheckpointClient } from "./video-checkpoint-store";
+import { createVideoProviderInputContext } from "./media-provider-input";
+import {
+  isVideoGenerationRoutable,
+  computeMediaToolStripSet,
+} from "./media-routability";
+import {
+  runVideoReconcilerOnce,
+  VIDEO_RECONCILER_INTERVAL_MS,
+} from "./video-reconciler";
 import { buildProviderDisplayNameMap } from "./providers/display-name";
 import { effectiveNativeWebSearchMode } from "./providers/native-web-search";
 import { getNSMAttestationDoc, initNsmSidecar } from "./nsm";
 import { createEnclaveListener } from "./vsock-listener";
-import { fetchKeysViaAttestedKMS } from "./kms-client";
+import { fetchKeysViaAttestedKMS, type AttestedKmsResult } from "./kms-client";
 import { fetchRegistryFromBroker } from "./registry-client";
+import { fetchSkillPromptsFromBroker } from "./skills-client";
+import {
+  loadAndVerifySkillPrompts,
+  buildPromptResolver,
+} from "./skills/verify-skill-prompts";
 import { startOutboundBridges } from "./vsock-proxy-bridge";
 import {
   extractUsageFromProviderResponse,
@@ -56,6 +92,7 @@ import {
   type ModelEndpointFamily,
   type SkillPack,
   type ToolInvocationFrame,
+  type ToolName,
   type ToolResultFrame,
 } from "@calypso/chat-types";
 import { CLAIMS_PACK_ID, resolveCrossPackGrant } from "./agent/cross-pack-grant";
@@ -63,6 +100,7 @@ import {
   DEFAULT_PACK_ID,
   getEffectiveSkillPack,
   isKnownSkillPackId,
+  type SkillPromptResolver,
 } from "@calypso/chat-types/skills";
 import { ToolGateway, type ClientBridge } from "./tools";
 import {
@@ -395,11 +433,38 @@ export class EnclaveRouter {
   private readonly binaryWorkItems = new BinaryWorkItemManager();
   private readonly mediaTools = new MediaToolsClient();
   private providerKeys: Record<string, string> = {};
+  // KMS-released, PCR0-gated media-root secret (null when the blob predates
+  // attestation-rooted provenance). HKDF-derived into the stable media
+  // provenance signer in buildProductionMedia().
+  private mediaRootSecret: string | null = null;
+  // Raw 32-byte Ed25519 media-provenance public key, published in the session
+  // attestation `user_data` so a client can verify image provenance against
+  // the attested enclave identity. Set in buildProductionMedia().
+  private provenancePublicKey: Uint8Array | null = null;
   private providerDisplayNames: ReadonlyMap<string, string> = new Map();
+
+  // Verified persona-prompt resolver, populated at init() from the signed
+  // skill-prompts bundle (host-served in prod, bundled fallback in dev/test).
+  // null until loaded; the request path passes it to getEffectiveSkillPack so
+  // the prompt is composed from verified bytes, never from a client bundle.
+  private skillPromptResolver: SkillPromptResolver | null = null;
   private bootTime = Date.now();
   private dreamLlmTransport?: LlmTransport;
   private readonly agentLoopProcessorFactory?: (model: string) => ChatProcessor;
-  private readonly media?: RunOrchestratorDeps["media"];
+  // Set from opts.media (tests inject their own) OR constructed lazily in
+  // init() once provider keys are available (production media gateway). Not
+  // readonly: production assigns it post-key-fetch.
+  private media?: RunOrchestratorDeps["media"];
+  // Video providers disabled at runtime by the reconciler (billing-metadata SLA
+  // breach). The fail-closed video gate drops a disabled provider from routing.
+  private readonly disabledVideoProviders = new Set<string>();
+  // Recurring orphan/billing reconciler tick (video). Started in init() once a
+  // video adapter is wired; cleared in dispose().
+  private videoReconcilerTimer: ReturnType<typeof setInterval> | null = null;
+  // True only when `this.media` was constructed by buildProductionMedia (the
+  // real gateway), NOT when a test injected its own media. Gates the per-request
+  // budgetClient override so injected test budget clients are never replaced.
+  private productionMediaWired = false;
   private readonly orchestratorModels?: ModelCapability[];
   private readonly invocationTimeoutMs: number;
 
@@ -457,6 +522,20 @@ export class EnclaveRouter {
 
   /** Monotonic counter for research-approval ids within this router. */
   private researchApprovalCounter = 0;
+
+  /**
+   * Egress-promotion reverse-channel (finding 11): an EGRESS_PROMOTION_REQUEST is
+   * settled by an EGRESS_PROMOTION_RESULT carrying the approved candidate ids, or
+   * by a fail-closed empty (DENY) timeout. Same shared-across-sockets + session-
+   * binding contract as {@link pendingResearchApprovalResolvers}.
+   */
+  private pendingEgressPromotionResolvers = new Map<
+    string,
+    (approvedIds: string[]) => void
+  >();
+
+  /** Monotonic counter for egress-promotion ids within this router. */
+  private egressPromotionCounter = 0;
 
   private pendingBinaryWriteAckResolvers = new Map<
     string,
@@ -557,7 +636,35 @@ export class EnclaveRouter {
     this.toolResultReassembler.stop();
     this.binaryWorkItems.stop();
     this.mediaTools.stop();
+    if (this.videoReconcilerTimer) {
+      clearInterval(this.videoReconcilerTimer);
+      this.videoReconcilerTimer = null;
+    }
     this.clearPendingBinaryWriteAcksForSession();
+  }
+
+  /**
+   * Start the recurring video orphan/billing reconciler. No-op unless a video
+   * adapter is wired. Each tick sweeps the durable checkpoint store and settles
+   * holds for jobs cancelled/interrupted after their provider job started. Tick
+   * errors are isolated + logged inside runVideoReconcilerOnce; the timer is
+   * unref'd so it never keeps the process alive.
+   */
+  private startVideoReconciler(): void {
+    if (this.videoReconcilerTimer) return;
+    const videoAdapters = this.media?.videoAdapters;
+    if (!videoAdapters || Object.keys(videoAdapters).length === 0) return;
+    const tick = () =>
+      void runVideoReconcilerOnce({
+        videoAdapters,
+        disabledVideoProviders: this.disabledVideoProviders,
+      });
+    this.videoReconcilerTimer = setInterval(tick, VIDEO_RECONCILER_INTERVAL_MS);
+    this.videoReconcilerTimer.unref?.();
+    console.log(
+      "[enclave] EnclaveRouter.init(): video reconciler started:",
+      Object.keys(videoAdapters),
+    );
   }
 
   private clearPendingBinaryWriteAcksForSession(sessionId?: string): void {
@@ -591,10 +698,13 @@ export class EnclaveRouter {
     // relies on the registry already being in memory.
     console.log("[enclave] EnclaveRouter.init(): loading provider registry...");
     await this.loadProviderRegistry();
+    await this.loadSkillPrompts();
     console.log("[enclave] EnclaveRouter.init(): provider registry loaded.");
 
     console.log("[enclave] EnclaveRouter.init(): fetching keys from KMS...");
-    this.providerKeys = await this.fetchKeysFromKMS();
+    const kms = await this.fetchKeysFromKMS();
+    this.providerKeys = kms.providerKeys;
+    this.mediaRootSecret = kms.mediaRootSecret;
     console.log(
       "[enclave] EnclaveRouter.init(): keys fetched successfully. Providers loaded:",
       Object.keys(this.providerKeys),
@@ -615,6 +725,25 @@ export class EnclaveRouter {
         apiKey: anthropicKey,
         baseUrl: anthropicProvider?.baseUrl ?? "https://api.anthropic.com",
       });
+    }
+
+    // Construct the production orchestrator media gateway (image generation)
+    // now that provider keys + the registry are loaded. Skip when a media was
+    // injected (tests) or an agentLoopProcessorFactory is set (the test seam
+    // resolves processors without the real registry, so the real adapters are
+    // meaningless). Wiring this opens the fail-closed imageMediaExecutorWired
+    // gate so a routable image model can actually deliver a saved file.
+    if (!this.media && !this.agentLoopProcessorFactory) {
+      this.media = this.buildProductionMedia();
+      console.log(
+        "[enclave] EnclaveRouter.init(): media gateway wired:",
+        this.media?.imageAdapters
+          ? Object.keys(this.media.imageAdapters)
+          : "none (no image provider key)",
+      );
+      // Start the orphan/billing reconciler ONLY when a video adapter is wired
+      // (image generation is synchronous and never leaves a hold to reconcile).
+      this.startVideoReconciler();
     }
 
     // Spawn the long-running NSM helper daemon. No-op on local dev (no /dev/nsm).
@@ -718,13 +847,107 @@ export class EnclaveRouter {
     }
   }
 
-  private async fetchKeysFromKMS(): Promise<Record<string, string>> {
-    // Test / local dev: use env vars directly (no NSM hardware available)
+  private async loadSkillPrompts(): Promise<void> {
+    // The skill-prompts bundle (persona system prompts) is NOT baked into the
+    // EIF and is NOT in any client bundle. Production fetches it from the
+    // host-side skills-broker over vsock at boot; the enclave verifies the
+    // Ed25519 signature (signed offline, domain-separated from the provider
+    // registry) against the baked verify key before composing any prompt. This
+    // keeps the persona-prompt IP out of the measured image AND the apps while
+    // remaining attested for integrity. Mirrors loadProviderRegistry.
+    //
+    // Dev / test: filesystem fallback to the bundled skill-prompts.json so the
+    // enclave boots without a host sidecar running.
+    const verifyKeyPath =
+      process.env.SKILL_PROMPTS_VERIFY_KEY_PATH ||
+      resolve(
+        import.meta.dirname ?? __dirname,
+        "skills/skill-prompts-verify-key.pem",
+      );
+
+    let bundleJson: string | null = null;
+
+    // 1. Prefer SKILL_PROMPTS_PATH (filesystem) when explicitly set — dev.
+    const overridePath = process.env.SKILL_PROMPTS_PATH;
+    if (overridePath && existsSync(overridePath)) {
+      bundleJson = readFileSync(overridePath, "utf-8");
+    }
+
+    // 2. Try the vsock broker (production path on real Nitro hardware).
+    if (
+      bundleJson === null &&
+      process.env.NODE_ENV !== "test" &&
+      process.env.MOCK_KMS !== "true"
+    ) {
+      try {
+        bundleJson = await fetchSkillPromptsFromBroker();
+      } catch (err) {
+        // Production: FATAL. The bundled fallback below is gated to
+        // test/MOCK_KMS, so bundleJson stays null and the loud throw fires —
+        // never a silently-unprompted or stale-persona agent.
+        console.warn(
+          `[enclave] skills-broker fetch failed: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    // 3. Dev/test fallback: bundled bundle shipped alongside the code.
+    // PRODUCTION must NOT take this path (mirrors loadProviderRegistry L4).
+    const bundledFallbackAllowed =
+      process.env.NODE_ENV === "test" || process.env.MOCK_KMS === "true";
+    if (bundleJson === null && bundledFallbackAllowed) {
+      const bundledPath = resolve(
+        import.meta.dirname ?? __dirname,
+        "skills/skill-prompts.json",
+      );
+      if (existsSync(bundledPath)) {
+        bundleJson = readFileSync(bundledPath, "utf-8");
+        console.warn("[enclave] Using bundled skill-prompts (development mode)");
+      }
+    }
+
+    if (bundleJson === null) {
+      if (process.env.NODE_ENV === "test") {
+        console.warn(
+          "[enclave] Skill-prompts loading skipped in test environment",
+        );
+        return;
+      }
+      throw new Error(
+        "Skill prompts unavailable: no SKILL_PROMPTS_PATH, no skills-broker reachable, no bundled dev fallback.",
+      );
+    }
+
+    try {
+      const bundleData = JSON.parse(bundleJson);
+      const verifyKey = readFileSync(verifyKeyPath, "utf-8");
+      const verified = loadAndVerifySkillPrompts(bundleData, verifyKey);
+      this.skillPromptResolver = buildPromptResolver(verified);
+    } catch (err) {
+      if (process.env.NODE_ENV === "test") {
+        console.warn(
+          "[enclave] Skill-prompts loading skipped in test environment",
+        );
+        return;
+      }
+      throw new Error(
+        `Failed to load skill prompts: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  private async fetchKeysFromKMS(): Promise<AttestedKmsResult> {
+    // Test / local dev: use env vars directly (no NSM hardware available).
+    // MEDIA_ROOT_SECRET (optional) lets local dev exercise the stable derived
+    // provenance key; absent ⇒ the ephemeral per-boot fallback.
     if (process.env.NODE_ENV === "test" || process.env.MOCK_KMS === "true") {
       return {
-        openai: process.env.OPENAI_API_KEY || "test-key",
-        anthropic: process.env.ANTHROPIC_API_KEY || "test-key",
-        google: process.env.GOOGLE_API_KEY || "test-key",
+        providerKeys: {
+          openai: process.env.OPENAI_API_KEY || "test-key",
+          anthropic: process.env.ANTHROPIC_API_KEY || "test-key",
+          google: process.env.GOOGLE_API_KEY || "test-key",
+        },
+        mediaRootSecret: process.env.MEDIA_ROOT_SECRET ?? null,
       };
     }
 
@@ -774,10 +997,16 @@ export class EnclaveRouter {
 
           // Request real attestation document from NSM hardware when available.
           // The public key is included in the attestation document so the client
-          // can verify the ECDH key was generated inside the enclave.
+          // can verify the ECDH key was generated inside the enclave. The
+          // media-provenance public key (when the media gateway is wired) is
+          // published in user_data, binding it to the attested PCR0 so a client
+          // can verify generated-image provenance against this enclave identity.
           const nsmResult = await getNSMAttestationDoc(
             nonce,
             Buffer.from(result.ephemeralPublicKey),
+            this.provenancePublicKey
+              ? buildProvenanceUserData(this.provenancePublicKey)
+              : undefined,
           );
 
           yield encodeFrame(
@@ -1501,7 +1730,10 @@ export class EnclaveRouter {
           // single authoritative gate — the model's advertised tools and the
           // gateway's per-dispatch enforcement both read pack.toolScopes.
           const pack: SkillPack = scopePackToPlan(
-            getEffectiveSkillPack(outerPackId),
+            getEffectiveSkillPack(
+              outerPackId,
+              this.skillPromptResolver ?? undefined,
+            ),
             subscriptionPlanId,
           );
 
@@ -1842,6 +2074,29 @@ export class EnclaveRouter {
             });
           };
 
+          // Egress-promotion resolver (finding 11). Mirrors the research-approval
+          // resolver, but the decision is the set of approved candidate ids
+          // (default DENY = empty on timeout). No private datum crosses the
+          // egress boundary without an explicit approved id.
+          const buildEgressPromotionResolverPromise = (
+            promotionId: string,
+          ): Promise<{ approvedIds: string[] }> => {
+            return new Promise<{ approvedIds: string[] }>((resolve) => {
+              const timer = setTimeout(() => {
+                this.pendingEgressPromotionResolvers.delete(promotionId);
+                resolve({ approvedIds: [] }); // fail-closed: deny
+              }, this.invocationTimeoutMs);
+              this.pendingEgressPromotionResolvers.set(
+                promotionId,
+                (approvedIds: string[]) => {
+                  clearTimeout(timer);
+                  this.pendingEgressPromotionResolvers.delete(promotionId);
+                  resolve({ approvedIds });
+                },
+              );
+            });
+          };
+
           // Concurrent output queue (Phase 3 Layer-3 reverse-channel). BOTH the
           // orchestrator/agent-loop pump (below) AND clientBridge.approveQuery
           // feed frames here; the OUTER handler iterates this queue. This is
@@ -1994,8 +2249,65 @@ export class EnclaveRouter {
           const chatRoutableModels = routableModels.filter(
             (model) => model.endpointFamily === "chat",
           );
+          // Fail-closed image-generation gate (finding 10): only offer
+          // image.generate/image.edit to the planner/agent when an image-output
+          // model is actually routable (enabled + image endpoint family + its
+          // required gateway tools scoped). Otherwise strip them from the
+          // effective pack so the planner shapes no unroutable image subtask —
+          // which used to dead-end in NO_MODEL_FOR_SUBTASK under a false
+          // "CALYPSO DONE". Auto-re-enables the moment a routable image model
+          // lands (e.g. the registry flip + adapter wiring below).
+          // Truly fail-closed: an image model being "enabled" in the registry
+          // is necessary but NOT sufficient — the production orchestrator media
+          // gateway (imageAdapters + budget/provenance/encrypt deps) must also
+          // be wired (this.media). Without it an offered image subtask would hit
+          // MEDIA_EXECUTOR_UNAVAILABLE. Requiring BOTH lets the registry flip to
+          // `enabled` land safely ahead of the media-gateway wiring: image gen
+          // simply stays gated off until the gateway is present.
+          const imageMediaExecutorWired =
+            !!this.media?.imageAdapters &&
+            Object.keys(this.media.imageAdapters).length > 0;
+          const imageGenerationRoutable =
+            imageMediaExecutorWired &&
+            isImageGenerationRoutable(routableModels, pack.toolScopes);
+          // Video generate: a wired video adapter + a routable enabled video
+          // model (necessary AND sufficient — mirrors the image gate). Video
+          // render: a wired render backend (the attested Remotion appliance);
+          // until one is wired, video.render stays fail-closed (gated off) so the
+          // planner never shapes an unrenderable composition subtask.
+          // A video provider is usable only if its adapter is wired AND it has
+          // not been runtime-disabled by the reconciler (billing-metadata SLA
+          // breach). With every video provider disabled, video generation gates
+          // off (fail-closed) until an operator re-enables it.
+          const videoMediaExecutorWired =
+            !!this.media?.videoAdapters &&
+            Object.keys(this.media.videoAdapters).some(
+              (providerId) => !this.disabledVideoProviders.has(providerId),
+            );
+          const videoGenerateRoutable =
+            videoMediaExecutorWired &&
+            isVideoGenerationRoutable(routableModels, pack.toolScopes);
+          const videoRenderRoutable = !!this.media?.renderBackend;
+          const mediaToolStrip = computeMediaToolStripSet({
+            imageGenerationRoutable,
+            videoGenerateRoutable,
+            videoRenderRoutable,
+          });
+          const effectivePack: SkillPack =
+            mediaToolStrip.size === 0
+              ? pack
+              : {
+                  ...pack,
+                  toolScopes: pack.toolScopes.filter(
+                    (tool) => !mediaToolStrip.has(tool),
+                  ),
+                };
           const enabledEndpointFamilies =
-            getEnabledEndpointFamiliesForCanonicalPack(pack, this.media);
+            getEnabledEndpointFamiliesForCanonicalPack(
+              effectivePack,
+              this.media,
+              imageGenerationRoutable,
+            );
           const plannerModelCandidates = choosePlannerModelIds(
             chatRoutableModels,
             orchestratorContext.preferredModelId,
@@ -2040,7 +2352,7 @@ export class EnclaveRouter {
             orchestratorContext.runMode === "orchestrator"
               ? runOrchestrator({
                   gateway,
-                  pack,
+                  pack: effectivePack,
                   agentTurnId: agentTurnId!,
                   plannerProvider: this.createProcessorForModelId(
                     plannerModelCandidates[0] ??
@@ -2058,10 +2370,13 @@ export class EnclaveRouter {
                   summaryModelCandidates,
                   providerDisplayNames: this.providerDisplayNames,
                   models: routableModels,
-                  enabledGatewayTools: pack.toolScopes,
+                  enabledGatewayTools: effectivePack.toolScopes,
                   enabledEndpointFamilies,
                   messages: body.messages,
                   requestContext: maskedRequestContext.requestContext,
+                  // Keys the image-generate binary work item so its write ACK
+                  // round-trips to the resolver registered below.
+                  sessionId: sessionId!,
                   awaitBinaryWriteAck: (payload) => {
                     const key = invocationKey(
                       sessionId!,
@@ -2092,9 +2407,83 @@ export class EnclaveRouter {
                     }
                     return buildMemoryWriteAckPromise(key);
                   },
+                  // Consent-gated private-read → web egress bridge (finding 11).
+                  // Emits an EGRESS_PROMOTION_REQUEST carrying the candidate
+                  // datums and awaits the client's approved-id set (default DENY
+                  // on timeout). Like approveQuery, the frame must travel via
+                  // outQueue because the orchestrator is suspended awaiting it.
+                  awaitEgressPromotion: (req) => {
+                    this.egressPromotionCounter += 1;
+                    const promotionId = `${sessionId!}:${req.agentTurnId}:egress:${this.egressPromotionCounter}`;
+                    const promise =
+                      buildEgressPromotionResolverPromise(promotionId);
+                    return encryptChunk(
+                      sessionKey,
+                      Buffer.from(
+                        JSON.stringify({
+                          promotionId,
+                          // turnId is REQUIRED by both client transports
+                          // (handleEgressPromotion fails closed without it) so
+                          // the client can address the result POST back to this
+                          // turn — mirrors approveQuery's turnId. Omitting it
+                          // left every promotion silently denying after a
+                          // timeout stall (the modal never showed).
+                          turnId: req.agentTurnId,
+                          planId: req.planId,
+                          subtaskId: req.subtaskId,
+                          candidates: req.candidates,
+                        }),
+                      ),
+                    ).then((encrypted) => {
+                      outQueue.push(
+                        encodeFrame(MSG.EGRESS_PROMOTION_REQUEST, encrypted),
+                      );
+                      return promise;
+                    });
+                  },
                   providerCallBudget:
                     ORCHESTRATOR_PROVIDER_CALL_BUDGET_BY_PLAN[subscriptionPlanId],
-                  media: this.media,
+                  // Hard metering: bind the REAL per-user budget client to this
+                  // request's authenticated userId/planId, overriding the
+                  // fail-closed boot-time default. Only for the production
+                  // gateway — injected test media keeps its own budgetClient.
+                  media:
+                    this.productionMediaWired && this.media && authenticatedUserId
+                      ? {
+                          ...this.media,
+                          budgetClient: createMediaBudgetClient({
+                            userId: authenticatedUserId,
+                            planId: subscriptionPlanId,
+                          }),
+                          // Durable video checkpoint store, bound to this
+                          // request's user. Image generation never touches it;
+                          // video load/save/cancel/billing route to the durable
+                          // server-backed store over the video-checkpoint broker.
+                          checkpointClient: createVideoCheckpointClient({
+                            userId: authenticatedUserId,
+                          }),
+                          // Provider-visible-input bundle for video_generate: the
+                          // (on-device-masked) prompt is stored as a signed
+                          // "public"-origin TEXT handle so it clears the same
+                          // custody/provenance gate the media flow requires
+                          // (media-executor ~L505). Request-scoped, built from the
+                          // gateway's stable provenance signer.
+                          ...(this.media.provenanceSigner
+                            ? (() => {
+                                const ctx = createVideoProviderInputContext({
+                                  provenanceSigner: this.media.provenanceSigner,
+                                  userId: authenticatedUserId,
+                                });
+                                return {
+                                  handleStore: ctx.handleStore,
+                                  consentVerifier: ctx.consentVerifier,
+                                  resolveProviderInput: ctx.resolveProviderInput,
+                                  resolveRecords: ctx.resolveRecords,
+                                };
+                              })()
+                            : {}),
+                        }
+                      : this.media,
                   // L1: stop orchestration when the host connection dies.
                   abortSignal: connectionSignal,
                 })
@@ -2104,7 +2493,7 @@ export class EnclaveRouter {
                     provider: this.agentLoopProcessorFactory
                       ? this.agentLoopProcessorFactory(singleModeAgentModel)
                       : this.resolveProductionProcessor(singleModeAgentModel),
-                    pack,
+                    pack: effectivePack,
                     agentTurnId: agentTurnId!,
                     // FREE single-mode turns get a tighter per-turn fan-out cap
                     // (vs the default 10) so "5 messages/day" can't expand into
@@ -2555,6 +2944,19 @@ export class EnclaveRouter {
                   this.pendingResearchApprovalResolvers.get(approvalId);
                 this.pendingResearchApprovalResolvers.delete(approvalId);
                 if (resolve) resolve(false);
+              }
+            }
+            // Fail closed: settle any still-pending egress promotions for this
+            // turn as DENY (empty) on teardown so an awaiting awaitEgressPromotion
+            // promise resolves rather than leaking — no private datum crosses.
+            for (const promotionId of [
+              ...this.pendingEgressPromotionResolvers.keys(),
+            ]) {
+              if (promotionId.startsWith(approvalPrefix)) {
+                const resolve =
+                  this.pendingEgressPromotionResolvers.get(promotionId);
+                this.pendingEgressPromotionResolvers.delete(promotionId);
+                if (resolve) resolve([]);
               }
             }
             // Drop any in-flight reassembly buffers for this turn —
@@ -3105,6 +3507,61 @@ export class EnclaveRouter {
         break;
       }
 
+      case MSG.EGRESS_PROMOTION_RESULT: {
+        // Finding 11 reverse-channel: the client's decision on an
+        // EGRESS_PROMOTION_REQUEST it was shown. Same session-binding + ignore-
+        // unknown contract as RESEARCH_QUERY_APPROVAL_RESULT — a forged result
+        // from a colluding host can't auto-promote a victim's private datum
+        // because the promotionId must be namespaced under the decrypting
+        // session, and only the candidate ids the enclave itself offered (and
+        // the user approved) are resolved. approvedIds is validated to a string
+        // array; anything else collapses to DENY (empty).
+        try {
+          const req = JSON.parse(payload.toString()) as {
+            session_id: string;
+            ciphertext: string;
+          };
+          const sessionId = req.session_id;
+          const sessionKey = await this.sessionManager.getSessionKey(sessionId);
+          const ciphertext = Buffer.from(req.ciphertext, "base64");
+          const plaintext = await decryptChunk(sessionKey, ciphertext);
+          try {
+            let raw: Record<string, unknown>;
+            try {
+              raw = JSON.parse(plaintext.toString());
+            } catch {
+              throw new Error(
+                "EGRESS_PROMOTION_RESULT_INVALID: decrypted body is not valid JSON",
+              );
+            }
+            const promotionId =
+              typeof raw.promotionId === "string" ? raw.promotionId : "";
+            const approvedIds = Array.isArray(raw.approvedIds)
+              ? raw.approvedIds.filter(
+                  (id): id is string => typeof id === "string",
+                )
+              : [];
+            if (promotionId.startsWith(`${sessionId}:`)) {
+              const resolve =
+                this.pendingEgressPromotionResolvers.get(promotionId);
+              if (resolve) {
+                this.pendingEgressPromotionResolvers.delete(promotionId);
+                resolve(approvedIds);
+              }
+            }
+          } finally {
+            zeroBuffer(plaintext);
+          }
+        } catch (err) {
+          logRedactedHandlerError("EGRESS_PROMOTION_RESULT", err);
+          yield encodeFrame(
+            MSG.CHAT_ERROR,
+            wireErrorPayload(err, "EGRESS_PROMOTION_RESULT_FAILED"),
+          );
+        }
+        break;
+      }
+
       default:
         yield encodeFrame(
           MSG.CHAT_ERROR,
@@ -3116,6 +3573,200 @@ export class EnclaveRouter {
           ),
         );
     }
+  }
+
+  /**
+   * Construct the production orchestrator media gateway for image generation.
+   * Wired in init() once provider keys are available; gated off when an
+   * agentLoopProcessorFactory is set (the test seam injects its own media so
+   * tests never hit the real adapters/registry). Building this opens the
+   * fail-closed `imageMediaExecutorWired` gate (image generation stays routed
+   * off until both this AND a routable image model are present).
+   *
+   * Image AND video generation are wired: imageAdapters + videoAdapters are
+   * built per provider key. The boot-time checkpoint client is a fail-closed
+   * default; the AGENT_REQUEST handler binds the REAL per-user durable video
+   * checkpoint client + the video provider-visible-input bundle. Video RENDER
+   * (Remotion composition) stays gated off until a render backend is wired — the
+   * fail-closed videoRenderRoutable gate keeps video.render out of the pack.
+   */
+  private buildProductionMedia(): RunOrchestratorDeps["media"] | undefined {
+    // Build an image adapter for each provider whose key is present, mirroring
+    // resolveProductionProcessor: provider baseUrl + id from the signed
+    // registry, key from the KMS-delivered providerKeys.
+    const imageAdapters: Record<string, ImageProviderAdapter> = {};
+    const tryProvider = (
+      providerId: string,
+      make: (provider: ProviderConfig, apiKey: string) => ImageProviderAdapter,
+    ): void => {
+      const apiKey = this.providerKeys[providerId];
+      if (!apiKey) return;
+      let provider: ProviderConfig;
+      try {
+        provider = getProviderById(providerId);
+      } catch {
+        // Provider not in the loaded registry — skip (key without a provider
+        // entry cannot be routed anyway).
+        return;
+      }
+      imageAdapters[providerId] = make(provider, apiKey);
+    };
+    tryProvider(
+      "openai",
+      (provider, apiKey) =>
+        new OpenAIImageProcessor(provider.baseUrl, apiKey, {
+          providerId: provider.id,
+          providerName: provider.displayName,
+        }),
+    );
+    tryProvider(
+      "google",
+      (provider, apiKey) =>
+        new GoogleImageProcessor(provider.baseUrl, apiKey, {
+          providerId: provider.id,
+          providerName: provider.displayName,
+        }),
+    );
+
+    // Video adapters, mirroring the image wiring: provider baseUrl + id from the
+    // signed registry, key from the KMS-delivered providerKeys. Veo (google)
+    // today; the fail-closed videoGenerateRoutable gate keeps video routed off
+    // until BOTH a wired adapter here AND a routable enabled video model exist.
+    const videoAdapters: Record<string, VideoProviderAdapter> = {};
+    const tryVideoProvider = (
+      providerId: string,
+      make: (provider: ProviderConfig, apiKey: string) => VideoProviderAdapter,
+    ): void => {
+      const apiKey = this.providerKeys[providerId];
+      if (!apiKey) return;
+      let provider: ProviderConfig;
+      try {
+        provider = getProviderById(providerId);
+      } catch {
+        return;
+      }
+      videoAdapters[providerId] = make(provider, apiKey);
+    };
+    tryVideoProvider(
+      "google",
+      (provider, apiKey) =>
+        new GoogleVeoVideoAdapter({ baseUrl: provider.baseUrl, apiKey }),
+    );
+
+    // No provider key for ANY media provider ⇒ leave media unwired so the
+    // fail-closed gate keeps image + video generation routed off (better than a
+    // half-wired gateway that hits MEDIA_EXECUTOR_UNAVAILABLE mid-subtask).
+    if (
+      Object.keys(imageAdapters).length === 0 &&
+      Object.keys(videoAdapters).length === 0
+    ) {
+      return undefined;
+    }
+
+    // Media-provenance signer. PREFERRED: HKDF-derive a STABLE Ed25519 keypair
+    // from the KMS-released, PCR0-gated media-root secret — stable across boots
+    // and transitively rooted in the attestation chain (only a genuine,
+    // measured enclave can decrypt the secret). The raw public key is published
+    // in the session attestation `user_data` (ATTESTATION_RESPONSE) so a client
+    // can verify image provenance against the attested enclave identity.
+    // FALLBACK (no media-root secret in the blob — pre-rotation): an ephemeral
+    // per-boot key. Still published in user_data, so a client can verify within
+    // that boot; it just is not stable across boots.
+    let provenanceSigner: ProvenanceSigner;
+    if (this.mediaRootSecret) {
+      const derived = deriveProvenanceSigner(
+        Buffer.from(this.mediaRootSecret, "utf8"),
+      );
+      provenanceSigner = derived.signer;
+      this.provenancePublicKey = derived.publicKeyRaw;
+      console.log(
+        "[enclave] EnclaveRouter.init(): media provenance key = attestation-rooted (stable, derived from media-root secret).",
+      );
+    } else {
+      const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+      provenanceSigner = {
+        sign: (canonical: string): string =>
+          cryptoSign(null, Buffer.from(canonical, "utf8"), privateKey).toString(
+            "base64",
+          ),
+        verify: (canonical: string, signatureB64: string): boolean => {
+          try {
+            return cryptoVerify(
+              null,
+              Buffer.from(canonical, "utf8"),
+              publicKey as KeyObject,
+              Buffer.from(signatureB64, "base64"),
+            );
+          } catch {
+            return false;
+          }
+        },
+      };
+      // Publish the ephemeral public key too (raw 32 bytes from the SPKI tail),
+      // so in-boot client verification still works pre-rotation.
+      this.provenancePublicKey = Uint8Array.prototype.slice.call(
+        publicKey.export({ format: "der", type: "spki" }),
+        12,
+      );
+      console.log(
+        "[enclave] EnclaveRouter.init(): media provenance key = ephemeral per-boot (no media-root secret; pre-rotation fallback).",
+      );
+    }
+
+    // Hard metering: the REAL per-user budget client is bound per AGENT_REQUEST
+    // (createMediaBudgetClient with the authenticated userId/planId) — see the
+    // AGENT_REQUEST handler, which overrides this field. This boot-time default
+    // is FAIL CLOSED: if a request ever reaches the gateway without the
+    // per-request override (e.g. an unauthenticated path), reserve refuses so
+    // no image is generated unmetered.
+    const budgetClient: NonNullable<
+      RunOrchestratorDeps["media"]
+    >["budgetClient"] = {
+      reserve: async () => ({
+        ok: false as const,
+        reason: "MEDIA_BUDGET_USER_CONTEXT_MISSING",
+      }),
+      reconcile: async () => undefined,
+    };
+
+    // Boot-time checkpoint client: FAIL CLOSED. The REAL per-user durable client
+    // (createVideoCheckpointClient with the authenticated userId) is bound per
+    // AGENT_REQUEST — see the handler, which overrides this field alongside
+    // budgetClient. Constructed with no user, its user-scoped ops throw rather
+    // than silently returning null, so a video subtask that ever reached the
+    // gateway without the per-request override fails closed (the executor's
+    // per-subtask catch releases the hold) instead of starting an un-checkpointed
+    // provider job. Image generation is synchronous and never touches it.
+    const checkpointClient: NonNullable<
+      RunOrchestratorDeps["media"]
+    >["checkpointClient"] = createVideoCheckpointClient({});
+
+    // Mark that the production gateway is wired so AGENT_REQUEST overrides the
+    // fail-closed budgetClient with the real per-user one (injected test media
+    // never sets this flag, so its budgetClient is left untouched).
+    this.productionMediaWired = true;
+
+    return {
+      videoAdapters,
+      imageAdapters,
+      binaryWorkItems: this.binaryWorkItems,
+      checkpointClient,
+      budgetClient,
+      provenanceSigner,
+      // The binary write-ACK is the real delivery; this only feeds the
+      // orchestrator-artifact metadata trail event (its sha256/byteSize). No
+      // ciphertext is persisted server-side, so ciphertextRef is empty.
+      encryptArtifact: async (input) => ({
+        artifactId: randomUUID(),
+        ciphertextRef: "",
+        sha256: createHash("sha256").update(input.bytes).digest("hex"),
+        byteSize: input.bytes.byteLength,
+      }),
+      // `now` is intentionally omitted: the media type expects a fixed Date,
+      // but this router is long-lived, so a single boot-time Date would freeze
+      // provenance timestamps. The executor defaults to `new Date()` per call
+      // when `now` is absent — the correct behaviour here.
+    };
   }
 
   private resolveProductionProcessor(model: string): ChatProcessor {
@@ -3215,15 +3866,44 @@ export function getRoutableModelCapabilities(
 function getEnabledEndpointFamiliesForCanonicalPack(
   pack: SkillPack,
   media?: RunOrchestratorDeps["media"],
+  imageGenerationRoutable = false,
 ): ModelEndpointFamily[] {
+  const families: ModelEndpointFamily[] = ["chat"];
   if (
     media &&
     (pack.toolScopes.includes("video.generate") ||
       pack.toolScopes.includes("video.render"))
   ) {
-    return ["chat", "video"];
+    families.push("video");
   }
-  return ["chat"];
+  // Enable the image endpoint family only when an image-output model is
+  // routable AND the (already image-gate-filtered) pack still scopes an
+  // image-generation tool — keeping the router fail-closed: no routable image
+  // model ⇒ no "image" family ⇒ an image subtask can never be routed.
+  if (
+    imageGenerationRoutable &&
+    (pack.toolScopes.includes("image.generate") ||
+      pack.toolScopes.includes("image.edit"))
+  ) {
+    families.push("image");
+  }
+  return families;
+}
+
+// An image-output model is routable iff an enabled model with the "image"
+// endpoint family exists whose required gateway tools are all scoped by the
+// pack. Drives the fail-closed image-generation gate (finding 10).
+function isImageGenerationRoutable(
+  models: readonly ModelCapability[],
+  packToolScopes: readonly ToolName[],
+): boolean {
+  const scoped = new Set<string>(packToolScopes);
+  return models.some(
+    (model) =>
+      model.routingStatus === "enabled" &&
+      model.endpointFamily === "image" &&
+      model.requiredGatewayTools.every((tool) => scoped.has(tool)),
+  );
 }
 
 function choosePlannerModelId(

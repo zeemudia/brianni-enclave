@@ -41,12 +41,22 @@ export const BinaryWorkItemToolNameSchema = z.enum([
   "image.inspect",
   "image.ocr",
   "image.transform",
+  // Generated-image outputs (text→image and image→image edit). These produce
+  // a binary image artefact delivered over the same write_request/chunk frames
+  // as image.transform; the client routes the bytes by outputId, so the name is
+  // a telemetry/label distinction only.
+  "image.generate",
+  "image.edit",
   "audio.inspect",
   "audio.transcribe",
   "audio.transform",
   "video.inspect",
   "video.transcribe",
   "video.transform",
+  // Generated-video outputs (text→video). Produces a binary video artefact
+  // delivered over the same write_request/chunk frames as video.transform; the
+  // client routes the bytes by outputId, so the name is a telemetry/label only.
+  "video.generate",
   "document.edit",
   "pdf.edit",
 ]);

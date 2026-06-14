@@ -232,6 +232,10 @@ describe('Privacy invariant P8 — Dockerfile.enclave must not bake providers.js
       '/app/enclave/src/tools/media_tools_service.py',
       '/app/enclave/src/nsm_helper.py',
       '/app/enclave/src/providers/registry-verify-key.pem',
+      // Skill-prompts verify key — same role as the registry verify key: the
+      // signed skill-prompts bundle is host-served (NOT baked), and this public
+      // key is the verification anchor. Adding it bakes no prompt.
+      '/app/enclave/src/skills/skill-prompts-verify-key.pem',
     ];
 
     const fromBuilderCopies = finalStageCopyLines.filter((l) =>

@@ -72,7 +72,7 @@ describe('fetchKeysViaAttestedKMS — provider-set cross-check', () => {
     });
     mockKmstool('sk-fake');
     const registryProviderIds = new Set(['openai', 'anthropic', 'google']);
-    const keys = await fetchKeysViaAttestedKMS(registryProviderIds);
+    const { providerKeys: keys } = await fetchKeysViaAttestedKMS(registryProviderIds);
     expect(Object.keys(keys).sort()).toEqual(['anthropic', 'openai']);
   });
 
@@ -95,8 +95,42 @@ describe('fetchKeysViaAttestedKMS — provider-set cross-check', () => {
     });
     mockKmstool('sk-fake');
     const registryProviderIds = new Set(['openai', 'anthropic', 'mistral']);
-    const keys = await fetchKeysViaAttestedKMS(registryProviderIds);
+    const { providerKeys: keys } = await fetchKeysViaAttestedKMS(registryProviderIds);
     expect(Object.keys(keys)).toEqual(['openai']);
+  });
+});
+
+describe('fetchKeysViaAttestedKMS — media-root secret delivery (#1 provenance rooting)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.MOCK_KMS = 'true';
+  });
+  afterEach(() => {
+    delete process.env.MOCK_KMS;
+  });
+
+  it('decrypts and returns the mediaRootSecret when the blob carries one', async () => {
+    vi.mocked(fetchKeysBlobFromBroker).mockResolvedValueOnce({
+      kmsKeyArn: 'arn:abc',
+      providers: { openai: 'c1' },
+      mediaRootSecret: 'cipher-media-root',
+    });
+    // Every ciphertext decrypts to this fixed plaintext via the mock.
+    mockKmstool('media-root-secret-base64==');
+    const result = await fetchKeysViaAttestedKMS(new Set(['openai']));
+    expect(result.providerKeys).toEqual({ openai: 'media-root-secret-base64==' });
+    expect(result.mediaRootSecret).toBe('media-root-secret-base64==');
+  });
+
+  it('returns mediaRootSecret = null when the blob omits it (back-compat / pre-rotation)', async () => {
+    vi.mocked(fetchKeysBlobFromBroker).mockResolvedValueOnce({
+      kmsKeyArn: 'arn:abc',
+      providers: { openai: 'c1' },
+    });
+    mockKmstool('sk-fake');
+    const result = await fetchKeysViaAttestedKMS(new Set(['openai']));
+    expect(result.mediaRootSecret).toBeNull();
+    expect(result.providerKeys).toEqual({ openai: 'sk-fake' });
   });
 });
 
@@ -173,7 +207,7 @@ describe('fetchKeysViaAttestedKMS — EXPECTED_KMS_KEY_ARN pin', () => {
       providers: { openai: 'c1' },
     });
     mockKmstool('sk-fake');
-    const keys = await fresh(new Set(['openai']));
+    const { providerKeys: keys } = await fresh(new Set(['openai']));
     expect(Object.keys(keys)).toEqual(['openai']);
   });
 
@@ -198,7 +232,7 @@ describe('fetchKeysViaAttestedKMS — EXPECTED_KMS_KEY_ARN pin', () => {
       providers: { openai: 'c1' },
     });
     mockKmstool('sk-fake');
-    const keys = await fresh(new Set(['openai']));
+    const { providerKeys: keys } = await fresh(new Set(['openai']));
     expect(Object.keys(keys)).toEqual(['openai']);
   });
 });

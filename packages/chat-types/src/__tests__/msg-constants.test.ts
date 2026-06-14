@@ -33,6 +33,11 @@ describe("MSG agent-loop constants (Chunk H wire contract)", () => {
     expect(MSG.CLAIMS_SUMMARY).toBe(0x17);
   });
 
+  it("EGRESS_PROMOTION_REQUEST/RESULT === 0x18/0x19 (consent-gated private->web bridge)", () => {
+    expect(MSG.EGRESS_PROMOTION_REQUEST).toBe(0x18);
+    expect(MSG.EGRESS_PROMOTION_RESULT).toBe(0x19);
+  });
+
   it("no two MSG values collide", () => {
     const values = Object.values(MSG);
     expect(new Set(values).size).toBe(values.length);

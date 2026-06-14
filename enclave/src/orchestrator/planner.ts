@@ -4,6 +4,7 @@ import {
   AgentSubtaskKindSchema,
   EGRESS_TAINT_READ_TOOLS,
   ModelStrengthSchema,
+  type AgentMediaSubtask,
   type AgentSubtask,
   type AgentSubtaskKind,
   type AgentTaskPlan,
@@ -51,6 +52,14 @@ const MEMORY_READ_TOOLS = [
   'memory.read',
 ] as const satisfies readonly ToolName[];
 
+// Draft tools a research-heavy request may also need ("research X, then draft
+// me a Y"). Added to the research fallback spec's desiredTools; only the ones
+// the active pack scopes survive toolsAvailable().
+const RESEARCH_DRAFT_TOOLS = [
+  'email.draft',
+  'doc.draft',
+] as const satisfies readonly ToolName[];
+
 // Tools that PRODUCE a user-facing artifact (a write/transform/draft), as
 // opposed to read/inspect tools. Mirrors the executor's ARTIFACT_PRODUCING_TOOLS
 // `true` entries; kept local to avoid a planner<->executor import cycle.
@@ -89,6 +98,7 @@ type FallbackSpec = {
   requiredCapabilities: readonly ModelStrength[];
   desiredTools: readonly ToolName[];
   risk?: AgentSubtask['risk'];
+  media?: AgentMediaSubtask;
 };
 
 /**
@@ -178,7 +188,14 @@ export async function createTaskPlan(
     );
     if (parsed) {
       return isolateWebFetchFromPrivateReads(
-        ensureArtifactToolScoped(parsed, input.userText, input.toolScopes),
+        preferResearchAskOverWebFetch(
+          tagImageMediaOperation(
+            ensureArtifactToolScoped(parsed, input.userText, input.toolScopes),
+            input.toolScopes,
+          ),
+          normalizedUserText,
+          input.toolScopes,
+        ),
       );
     }
     // Invalid → loop re-prompts with the correction note; if this was the
@@ -570,6 +587,7 @@ function buildFallbackPlan(
           dependsOn: [],
           producesArtifact: true,
           risk: spec.risk ?? 'medium',
+          ...(spec.media ? { media: spec.media } : {}),
         },
       ],
     }),
@@ -760,6 +778,66 @@ function fallbackSpecForRequest(
     };
   }
 
+  // Image GENERATION/EDIT (produce a new image) is checked BEFORE research.ask
+  // and the read/OCR/transform branch — an explicit "design a logo" /
+  // "make me a poster image" intent must shape a routable image_generate
+  // subtask (image_generation capability + image.generate + media.operation),
+  // not be shadowed by a research keyword or treated as a read of an existing
+  // file. isImageGenerateRequest requires a produce-verb + image-noun, so it
+  // does not fire on research prompts that merely mention "ideas"/"best". Only
+  // fires when the pack scopes image.generate/image.edit (the fail-closed gate
+  // strips those when no image model is routable, so this never produces an
+  // unroutable subtask).
+  if (isImageGenerateRequest(normalized, toolScopes)) {
+    const operation: AgentMediaSubtask['operation'] =
+      isImageEditRequest(normalized) && toolScopes.includes('image.edit')
+        ? 'image_edit'
+        : 'image_generate';
+    return {
+      planTitle: operation === 'image_edit' ? 'Edit image' : 'Generate image',
+      planSummary:
+        'Calypso will produce the requested image inside the TEE, sign its provenance, and save it after your confirmation.',
+      subtaskId: 'st_image',
+      subtaskTitle: operation === 'image_edit' ? 'Edit image' : 'Generate image',
+      kind: 'image',
+      requiredCapabilities: ['image_generation', 'general_reasoning'],
+      desiredTools:
+        operation === 'image_edit'
+          ? [...FOLDER_READ_TOOLS, 'image.edit']
+          : ['image.generate'],
+      media: {
+        operation,
+        expectedArtifactKind: 'image/png',
+        privacyPolicy: 'sanitized_only',
+      },
+      risk: 'low',
+    };
+  }
+
+  // Research-heavy / external-authoritative-source requests route to the GATED
+  // research.ask path (verbatim-query approval) BEFORE the email/event/web.fetch
+  // branches, so "is this insurance renewal normal? draft me a haggle email"
+  // researches via research.ask and still drafts inline (email.draft/doc.draft
+  // are added to desiredTools and survive if scoped). Only fires when the pack
+  // scopes research.ask; otherwise the request falls through to web.fetch.
+  if (isResearchAskRequest(normalized, toolScopes)) {
+    return {
+      planTitle: 'Research public facts and respond',
+      planSummary:
+        'Calypso will ask the air-gapped web researcher for public facts (you approve the exact outbound query), then use them to answer.',
+      subtaskId: 'st_research',
+      subtaskTitle: 'Research public facts',
+      kind: 'research',
+      requiredCapabilities: ['research', 'general_reasoning'],
+      desiredTools: [
+        ...(needsFolderRead(normalized) ? FOLDER_READ_TOOLS : []),
+        'research.ask',
+        ...RESEARCH_DRAFT_TOOLS,
+      ],
+      risk: 'low',
+    };
+  }
+
   if (isEmailDraftRequest(normalized, toolScopes)) {
     return {
       planTitle: 'Draft email',
@@ -786,6 +864,31 @@ function fallbackSpecForRequest(
         ...(needsFolderRead(normalized) ? FOLDER_READ_TOOLS : []),
         'event.draft',
       ],
+    };
+  }
+
+  // PRODUCE a new video (text → video). Must precede isVideoRequest so "make me
+  // a teaser video" shapes a routable video_generate subtask (video_generation
+  // capability + video.generate + media.operation) instead of being treated as
+  // an inspect/transcribe of an existing clip. Only fires when video.generate is
+  // scoped (the fail-closed gate strips it when no video model is routable).
+  if (isVideoGenerateRequest(normalized, toolScopes)) {
+    return {
+      planTitle: 'Generate video',
+      planSummary:
+        'Calypso will produce the requested video inside the TEE, sign its provenance, meter it against your plan, and deliver it after your confirmation.',
+      subtaskId: 'st_video',
+      subtaskTitle: 'Generate video',
+      kind: 'video',
+      requiredCapabilities: ['video_generation', 'general_reasoning'],
+      desiredTools: ['video.generate'],
+      media: {
+        operation: 'video_generate',
+        expectedArtifactKind: 'video/mp4',
+        maxDurationSeconds: 8,
+        privacyPolicy: 'sanitized_only',
+      },
+      risk: 'low',
     };
   }
 
@@ -964,6 +1067,105 @@ function isWebFetchRequest(
   );
 }
 
+// Signals that a request needs PUBLIC authoritative external sources — statutes,
+// regulator/insurer/market norms, entitlements, comparisons against "normal" —
+// rather than a single quick fact lookup against a URL the user already named.
+// These route to the GATED research.ask path (the user approves the exact
+// outbound query — a flagship trust surface) when the active pack scopes it;
+// quick single-source lookups keep web.fetch / provider-native search.
+//
+// Deliberately keyword-driven and conservative: a bare "fetch <url> and
+// summarise it" must NOT match (it is a quick lookup), and a request under a
+// pack WITHOUT research.ask must degrade to web.fetch, never reference an
+// unscoped tool.
+function isResearchHeavyRequest(normalized: string): boolean {
+  // Market / norm checks: "is that normal / typical / fair right now", "is £680
+  // a reasonable renewal", "is that the going rate".
+  if (
+    /\bis\b[^.?!]{0,72}\b(normal|typical|standard|fair|reasonable|excessive|too (?:high|much|expensive)|the going rate|market rate)\b/.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  // Entitlement / compensation / rights — "what am I owed", "am I entitled",
+  // "what are my rights", "consumer rights", "compensation".
+  if (/\bwhat (?:am i|are we|do i)\b[^.?!]{0,30}\b(owed|entitled|due)\b/.test(normalized)) {
+    return true;
+  }
+  if (/\b(?:am i|are we) entitled\b/.test(normalized)) return true;
+  if (
+    /\b(?:my|our|tenant|tenants?'?|consumer|statutory|legal) rights\b/.test(normalized) ||
+    /\bwhat are my rights\b/.test(normalized)
+  ) {
+    return true;
+  }
+  if (/\bcompensation\b/.test(normalized)) return true;
+  // Legal / regulatory references that imply an authoritative public source.
+  if (
+    /\b(statute|regulation|regulations|the law|legally|consumer rights|filing deadline)\b/.test(
+      normalized,
+    )
+  ) {
+    return true;
+  }
+  // Explicit research verbs.
+  if (/\b(research|find out|look into|check the rules)\b/.test(normalized)) {
+    return true;
+  }
+  // Recommendations / ideas needing external sourcing (gift/venue/restaurant
+  // ideas), e.g. the "plan a gift, find ideas with sources" motion.
+  if (/\b(?:gift|present)s?\b[^.?!]{0,24}\b(ideas?|suggestions?|recommendations?)\b/.test(normalized)) {
+    return true;
+  }
+  if (/\b(?:ideas?|recommendations?|suggestions?)\b[^.?!]{0,12}\bfor\b/.test(normalized)) {
+    return true;
+  }
+  if (/\bbest\b[^.?!]{0,24}\b(places?|venues?|restaurants?|gifts?|options?)\b/.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function isResearchAskRequest(
+  normalized: string,
+  toolScopes: readonly ToolName[],
+): boolean {
+  return toolScopes.includes('research.ask') && isResearchHeavyRequest(normalized);
+}
+
+/**
+ * For a research-heavy request, route web research through the GATED research.ask
+ * path instead of the ungated web.fetch / provider-native search: swap web.fetch
+ * for research.ask on each subtask that scopes it. Only ever runs when the pack
+ * scopes research.ask AND the request is research-heavy (so a bare "fetch this
+ * URL" quick lookup, and any pack without research.ask, are untouched — the
+ * quick-lookup / native-search path is unaffected). Runs BEFORE
+ * isolateWebFetchFromPrivateReads: research.ask carries its own outbound
+ * controls (verbatim-query approval + the egress-taint identifier backstop), so
+ * a research.ask subtask does not need the web.fetch private-read split.
+ */
+function preferResearchAskOverWebFetch(
+  plan: AgentTaskPlan,
+  normalized: string,
+  toolScopes: readonly ToolName[],
+): AgentTaskPlan {
+  if (!isResearchAskRequest(normalized, toolScopes)) return plan;
+
+  let changed = false;
+  const subtasks: AgentSubtask[] = plan.subtasks.map((subtask) => {
+    if (!subtask.allowedTools.includes('web.fetch')) return subtask;
+    changed = true;
+    const swapped = subtask.allowedTools.map((tool) =>
+      tool === 'web.fetch' ? ('research.ask' as ToolName) : tool,
+    );
+    return { ...subtask, allowedTools: uniqueToolList(swapped) };
+  });
+
+  if (!changed) return plan;
+  return AgentTaskPlanSchema.parse({ ...plan, subtasks });
+}
+
 // Narrow trigger for the single-subtask override in createTaskPlan: a request
 // whose SOLE intent is a web fetch. Excludes anything that also reads/writes
 // linked folders or declares explicit multi-step structure (numbered steps /
@@ -1036,6 +1238,111 @@ function isImageRequest(
   );
 }
 
+// A request to PRODUCE a NEW image (text → image), as opposed to reading,
+// OCR-ing, or resizing an existing file. Requires a produce verb paired with an
+// image noun so "resize photo.png"/"OCR the receipt" stay on the read/transform
+// branch.
+const IMAGE_NOUN =
+  '(image|picture|poster|logo|illustration|icon|banner|graphic|artwork|drawing|wallpaper|avatar|sticker|mockup|flyer|thumbnail|cover\\s*art)';
+const IMAGE_PRODUCE_VERB =
+  '(make|create|generate|draw|design|paint|illustrate|render|produce|whip up|knock up|mock up)';
+
+function isImageGenerateRequest(
+  normalized: string,
+  toolScopes: readonly ToolName[],
+): boolean {
+  if (!hasAnyTool(toolScopes, ['image.generate', 'image.edit'])) return false;
+  // produce-verb … image-noun  (e.g. "make me a poster image", "design a logo")
+  if (new RegExp(`\\b${IMAGE_PRODUCE_VERB}\\b[^.?!]{0,40}\\b${IMAGE_NOUN}\\b`).test(normalized)) {
+    return true;
+  }
+  // image-noun … "of/for/showing" paired with a produce/want verb anywhere
+  // (e.g. "i need an illustration of a cat")
+  if (
+    new RegExp(`\\b${IMAGE_NOUN}\\b[^.?!]{0,24}\\b(of|for|showing|with|that)\\b`).test(normalized) &&
+    new RegExp(`\\b(${IMAGE_PRODUCE_VERB.slice(1, -1)}|need|want|give me)\\b`).test(normalized)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// An image-PRODUCE request that edits an EXISTING image (vs a fresh generation):
+// "edit/change/add … to this/the image/photo/<file>.png".
+function isImageEditRequest(normalized: string): boolean {
+  return /\b(edit|change|modify|adjust|retouch|add|remove|replace|erase)\b[^.?!]{0,40}\b(image|photo|picture|\.png|\.jpe?g|\.webp)\b/.test(
+    normalized,
+  );
+}
+
+/**
+ * For an LLM-planned subtask that scopes image.generate/image.edit, ensure it is
+ * SHAPED to route to the image-output model and run through the media executor:
+ * `kind: 'image'`, the `image_generation` capability (the router's hard gate),
+ * and `media.operation` (which the media branch requires). The LLM frequently
+ * scopes image.generate but tags the step `kind:'writing'`/`requiredCapabilities:
+ * ['general_reasoning']` with no media block, which would dead-end in
+ * NO_MODEL_FOR_SUBTASK or MEDIA_OPERATION_UNSUPPORTED. Only runs when the pack
+ * scopes an image-generation tool; never widens scope.
+ */
+function tagImageMediaOperation(
+  plan: AgentTaskPlan,
+  toolScopes: readonly ToolName[],
+): AgentTaskPlan {
+  if (!hasAnyTool(toolScopes, ['image.generate', 'image.edit'])) return plan;
+  let changed = false;
+  const subtasks: AgentSubtask[] = plan.subtasks.map((subtask) => {
+    const usesGenerate = subtask.allowedTools.includes('image.generate');
+    const usesEdit = subtask.allowedTools.includes('image.edit');
+    if (!usesGenerate && !usesEdit) return subtask;
+    const operation: AgentMediaSubtask['operation'] =
+      usesEdit && !usesGenerate ? 'image_edit' : 'image_generate';
+    const nextKind: AgentSubtaskKind = 'image';
+    const nextCapabilities = subtask.requiredCapabilities.includes('image_generation')
+      ? subtask.requiredCapabilities
+      : uniqueModelStrengths(['image_generation', ...subtask.requiredCapabilities]);
+    const nextMedia: AgentMediaSubtask =
+      subtask.media ?? {
+        operation,
+        expectedArtifactKind: 'image/png',
+        privacyPolicy: 'sanitized_only',
+      };
+    // Strip LOCAL image tools (inspect/ocr/transform) from a generation
+    // subtask. They satisfy `image_generation` in the router's
+    // LOCAL_MODALITY_TOOL_FAMILIES, so leaving them alongside image.generate
+    // would let the hard image_generation gate be satisfied by a local tool and
+    // route the subtask to a chat model with no image adapter (→
+    // IMAGE_ADAPTER_UNAVAILABLE). A generation subtask drives the provider image
+    // endpoint only; local image work is a separate subtask.
+    const nextAllowedTools = subtask.allowedTools.filter(
+      (tool) =>
+        tool !== 'image.inspect' &&
+        tool !== 'image.ocr' &&
+        tool !== 'image.transform',
+    );
+    const toolsChanged = nextAllowedTools.length !== subtask.allowedTools.length;
+    if (
+      subtask.kind === nextKind &&
+      nextCapabilities === subtask.requiredCapabilities &&
+      subtask.media &&
+      !toolsChanged
+    ) {
+      return subtask;
+    }
+    changed = true;
+    return {
+      ...subtask,
+      kind: nextKind,
+      requiredCapabilities: nextCapabilities,
+      allowedTools: nextAllowedTools,
+      media: nextMedia,
+      producesArtifact: true,
+    };
+  });
+  if (!changed) return plan;
+  return AgentTaskPlanSchema.parse({ ...plan, subtasks });
+}
+
 function isAudioRequest(
   normalized: string,
   toolScopes: readonly ToolName[],
@@ -1064,6 +1371,36 @@ function isVideoRequest(
     ]) &&
     (/\bvideo\b/.test(normalized) || /\.(mp4|mov|webm)\b/.test(normalized))
   );
+}
+
+// A request to PRODUCE a NEW video (text → video), as opposed to inspecting,
+// transcribing, or transforming an existing clip. Requires a produce verb paired
+// with a video noun so "transcribe meeting.mp4" stays on the inspect branch.
+// Only fires when the pack scopes video.generate — the fail-closed gate strips
+// it when no video model is routable, so this never shapes an unroutable subtask.
+const VIDEO_NOUN =
+  '(video|clip|teaser|trailer|animation|reel|montage|promo|short)';
+const VIDEO_PRODUCE_VERB =
+  '(make|create|generate|animate|produce|render|whip up|knock up|put together)';
+
+function isVideoGenerateRequest(
+  normalized: string,
+  toolScopes: readonly ToolName[],
+): boolean {
+  if (!toolScopes.includes('video.generate')) return false;
+  // produce-verb … video-noun (e.g. "make me a teaser video", "animate a clip")
+  if (new RegExp(`\\b${VIDEO_PRODUCE_VERB}\\b[^.?!]{0,40}\\b${VIDEO_NOUN}\\b`).test(normalized)) {
+    return true;
+  }
+  // video-noun … "of/for/showing" paired with a produce/want verb anywhere
+  // (e.g. "i need a clip showing a sunrise")
+  if (
+    new RegExp(`\\b${VIDEO_NOUN}\\b[^.?!]{0,24}\\b(of|for|showing|with|that)\\b`).test(normalized) &&
+    new RegExp(`\\b(${VIDEO_PRODUCE_VERB.slice(1, -1)}|need|want|give me)\\b`).test(normalized)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function isPdfEditRequest(

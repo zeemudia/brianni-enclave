@@ -30,6 +30,7 @@
     "@calypso/vsock-native": "workspace:*"
   },
   "devDependencies": {
+    "@calypso/nitro-verify": "workspace:*",
     "@peculiar/webcrypto": "^1.5.0",
     "@peculiar/x509": "^2.0.0",
     "@types/node": "^25.6.0",

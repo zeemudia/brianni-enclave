@@ -120,4 +120,34 @@ describe('fetchKeysBlobFromBroker', () => {
     await expect(fetchKeysBlobFromBroker()).rejects.toThrow(/oversized payload/);
     expect(sock.destroyed).toBe(true);
   });
+
+  it('exposes an optional mediaRootSecret ciphertext when the blob carries one', async () => {
+    const payload = {
+      kmsKeyArn: 'arn:aws:kms:eu-west-2:123456789012:key/abc',
+      providers: { openai: 'AQIC...' },
+      mediaRootSecret: 'AQICmediaroot...',
+    };
+    queueResponse(JSON.stringify(payload));
+    const blob = await fetchKeysBlobFromBroker();
+    expect(blob.mediaRootSecret).toBe('AQICmediaroot...');
+  });
+
+  it('leaves mediaRootSecret undefined when the blob omits it (back-compat)', async () => {
+    queueResponse(
+      JSON.stringify({ kmsKeyArn: 'arn:abc', providers: { openai: 'AQIC...' } }),
+    );
+    const blob = await fetchKeysBlobFromBroker();
+    expect(blob.mediaRootSecret).toBeUndefined();
+  });
+
+  it('throws KEYS_BROKER_MALFORMED when mediaRootSecret is present but not a non-empty string', async () => {
+    queueResponse(
+      JSON.stringify({
+        kmsKeyArn: 'arn:abc',
+        providers: { openai: 'AQIC...' },
+        mediaRootSecret: 42,
+      }),
+    );
+    await expect(fetchKeysBlobFromBroker()).rejects.toThrow(KEYS_BROKER_MALFORMED);
+  });
 });

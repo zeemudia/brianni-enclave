@@ -191,6 +191,7 @@ export class NsmSidecar {
   async getAttestationDoc(
     nonce: Buffer,
     publicKey: Buffer,
+    userData?: Buffer,
   ): Promise<NSMAttestationResult> {
     if (!this.process || !this.ready) {
       throw new Error('NSM_UNAVAILABLE: sidecar not running');
@@ -227,6 +228,11 @@ export class NsmSidecar {
             JSON.stringify({
               nonce: nonce.toString('base64'),
               public_key: publicKey.toString('base64'),
+              // Attestation user_data carries the media-provenance public key
+              // when present, binding it to the attested PCR0. Omitted when
+              // absent so the request shape is unchanged for callers that pass
+              // no user_data.
+              ...(userData ? { user_data: userData.toString('base64') } : {}),
             }) + '\n';
           // M4: the helper can die between the ready-check and this write —
           // a synchronous throw here used to reject the inner queue
@@ -289,10 +295,12 @@ export function stopNsmSidecar(): void {
  *
  * @param nonce - Client-provided nonce (anti-replay)
  * @param publicKey - Ephemeral ECDH public key to bind into the attestation
+ * @param userData - Optional attested user_data (media-provenance public key)
  */
 export async function getNSMAttestationDoc(
   nonce: Buffer,
   publicKey: Buffer,
+  userData?: Buffer,
 ): Promise<NSMAttestationResult> {
   if (!isNitroEnclave) {
     return getDevPlaceholder();
@@ -302,7 +310,7 @@ export async function getNSMAttestationDoc(
       'NSM_UNAVAILABLE: sidecar not initialised — call initNsmSidecar() at boot',
     );
   }
-  return _sidecar.getAttestationDoc(nonce, publicKey);
+  return _sidecar.getAttestationDoc(nonce, publicKey, userData);
 }
 
 // ---------------------------------------------------------------------------

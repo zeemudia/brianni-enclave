@@ -110,6 +110,7 @@ __metadata:
     "@calypso/chat-types": "workspace:*"
     "@calypso/crypto-core": "workspace:*"
     "@calypso/masking-core": "workspace:*"
+    "@calypso/nitro-verify": "workspace:*"
     "@calypso/vsock-native": "workspace:*"
     "@google/generative-ai": "npm:^0.24.0"
     "@noble/hashes": "npm:^2.2.0"
@@ -140,9 +141,11 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@calypso/nitro-verify@workspace:packages/nitro-verify":
+"@calypso/nitro-verify@workspace:*, @calypso/nitro-verify@workspace:packages/nitro-verify":
   version: 0.0.0-use.local
   resolution: "@calypso/nitro-verify@workspace:packages/nitro-verify"
+  dependencies:
+    "@noble/curves": "npm:^1.9.7"
   languageName: unknown
   linkType: soft
 

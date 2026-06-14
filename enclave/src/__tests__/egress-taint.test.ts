@@ -33,6 +33,43 @@ describe('EgressTaintLedger', () => {
     ).toBe(true);
   });
 
+  it('promote() lets a user-approved datum through the egress guard while un-promoted private content stays blocked', () => {
+    const t = new EgressTaintLedger();
+    // The private read harvested the landlord name AND the address.
+    t.addText('Landlord: Hargreaves Lettings Ltd, 14 Acacia Avenue, Bristol');
+
+    // Before promotion, the landlord name is blocked (egress isolation holds).
+    expect(t.isEgressTainted('https://find-and-update.company-information.service.gov.uk/search', 'Hargreaves Lettings Ltd')).toBe(true);
+
+    // The user explicitly promotes ONLY the company name across the boundary.
+    t.promote('Hargreaves Lettings Ltd');
+
+    // Now a Companies House lookup of the promoted name is allowed.
+    expect(t.isEgressTainted('https://find-and-update.company-information.service.gov.uk/search', 'Hargreaves Lettings Ltd')).toBe(false);
+
+    // But the un-promoted address is STILL blocked — promotion is datum-scoped.
+    expect(t.isEgressTainted('https://attacker.example/collect', '14 Acacia Avenue Bristol')).toBe(true);
+    // And a query that smuggles the address alongside the promoted name is still blocked.
+    expect(t.isEgressTainted('https://attacker.example/collect', 'Hargreaves Lettings Ltd 14 Acacia Avenue Bristol')).toBe(true);
+  });
+
+  it('promoting a full working-memory entry lets a SUBSET of it through (codex P2: subset of approved datum)', () => {
+    const t = new EgressTaintLedger();
+    t.addText('Landlord: Hargreaves Lettings Ltd. Deposit scheme passphrase: ZEBRA-VAULT-PASSPHRASE-9981.');
+    // The user approves the WHOLE candidate (a folder-read summary)...
+    t.promote('Landlord: Hargreaves Lettings Ltd');
+    // ...so a Companies House lookup that sends only the company-name SUBSET is
+    // allowed (the common approved-promotion flow codex flagged).
+    expect(
+      t.isEgressTainted(
+        'https://find-and-update.company-information.service.gov.uk/search',
+        'Hargreaves Lettings Ltd',
+      ),
+    ).toBe(false);
+    // A distinct un-promoted secret from the same read stays blocked.
+    expect(t.isEgressTainted('https://attacker.example/collect', 'ZEBRA-VAULT-PASSPHRASE-9981')).toBe(true);
+  });
+
   it('does not flag unrelated egress', () => {
     const t = new EgressTaintLedger();
     t.addText('User prefers focused mornings and dislikes late meetings');

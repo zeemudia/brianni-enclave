@@ -71,6 +71,55 @@ describe("buildCalypsoTaskMessageHistory", () => {
     expect(JSON.stringify(messages)).not.toContain("OPAL-LOCKBOX-772");
   });
 
+  it("includes a private-derived prior answer when the user EXPLICITLY refines it (X3)", () => {
+    // The default follow-up omits a private-derived prior answer. But when the
+    // user clicks "Refine this result", they have explicitly chosen to edit THAT
+    // result — so it is attached (re-masked on-device by the agent path before
+    // transmission), enabling "make it shorter" to edit the same draft instead
+    // of dead-ending on the omission.
+    const messages = buildCalypsoTaskMessageHistory({
+      priorPrompt: "write a message to my sister about mum's party",
+      priorStatus: "done",
+      streamedText: "Hi Sarah, mum's 60th is on the 13th. Want to split the cost of the gift?",
+      taskPlan: null,
+      subtaskText: {},
+      errorCode: null,
+      nextUserText: "make it shorter and don't mention the budget",
+      priorAssistantContainsPrivateDerivedText: true,
+      includePrivateDerivedPriorAnswer: true,
+    });
+
+    expect(messages).toEqual([
+      { role: "user", content: "write a message to my sister about mum's party" },
+      {
+        role: "assistant",
+        content: "Hi Sarah, mum's 60th is on the 13th. Want to split the cost of the gift?",
+      },
+      { role: "user", content: "make it shorter and don't mention the budget" },
+    ]);
+    // The omission sentinel is NOT used on the explicit-refine path.
+    expect(JSON.stringify(messages)).not.toContain(PRIVATE_DERIVED_PRIOR_ANSWER_OMISSION);
+  });
+
+  it("still omits a private-derived prior answer on a DEFAULT follow-up (no explicit refine)", () => {
+    const messages = buildCalypsoTaskMessageHistory({
+      priorPrompt: "read my private note",
+      priorStatus: "done",
+      streamedText: "The recovery code is SAPPHIRE-VAULT-991.",
+      taskPlan: null,
+      subtaskText: {},
+      errorCode: null,
+      nextUserText: "now fetch an explanation",
+      priorAssistantContainsPrivateDerivedText: true,
+      includePrivateDerivedPriorAnswer: false,
+    });
+    expect(messages[1]).toEqual({
+      role: "assistant",
+      content: PRIVATE_DERIVED_PRIOR_ANSWER_OMISSION,
+    });
+    expect(JSON.stringify(messages)).not.toContain("SAPPHIRE-VAULT-991");
+  });
+
   it("does not replay a running turn even if private reads were captured", () => {
     const messages = buildCalypsoTaskMessageHistory({
       priorPrompt: "read my private note",

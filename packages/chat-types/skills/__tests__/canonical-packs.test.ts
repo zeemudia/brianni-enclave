@@ -25,6 +25,15 @@ describe("canonical packs", () => {
     expect(defaultPack.id).toBe("personal-agent.default");
   });
 
+  it("General base scopes BOTH research.ask (gated) and web.fetch (quick lookups) so the planner can route between them", () => {
+    // research.ask is the gated verbatim-query approval path; web.fetch is the
+    // ungated quick-lookup / native-search path. The General base carries both
+    // so research-heavy requests route to the gated modal while quick lookups
+    // stay on web.fetch. Inherited by the non-restrictive specialist packs.
+    expect(defaultPack.toolScopes).toContain("research.ask");
+    expect(defaultPack.toolScopes).toContain("web.fetch");
+  });
+
   it("career pack parses", () => {
     expect(() => SkillPackSchema.parse(careerPack)).not.toThrow();
     expect(careerPack.id).toBe("personal-agent.career");
@@ -48,14 +57,10 @@ describe("canonical packs", () => {
     expect(healthPack.defaultNamespace).toBe("health");
   });
 
-  it("legal + health system prompts each carry a not-advice disclaimer instruction", () => {
-    expect(legalTenantPack.systemPromptBlock.toLowerCase()).toContain(
-      "not legal advice",
-    );
-    expect(healthPack.systemPromptBlock.toLowerCase()).toContain(
-      "not medical advice",
-    );
-  });
+  // The legal/health not-advice disclaimer guard moved with the prompts into
+  // the signed bundle; asserted in
+  // enclave/src/__tests__/skill-prompts-bundle.test.ts against the verified
+  // bundle. (systemPromptBlock no longer ships in the client-visible pack.)
 
   it("legal + health packs cannot send email, read mailbox, or use Tier C/D tools", () => {
     const forbidden = [
@@ -158,17 +163,22 @@ describe("personal-agent.claims pack", () => {
     expect(pack.toolScopes).not.toContain("web.fetch");
   });
 
-  // Audit 4d — the legal-tenant precedent: the claims prompt must MANDATE a
-  // visible not-legal-advice closing line (exact copy, pinned here), and must
-  // scope it to the assistant's accompanying note so the disclaimer never
-  // lands inside the letter the user mails to a third party.
-  it("claims prompt mandates the exact not-legal-advice closing line, outside the letter body", () => {
-    const pack = getEffectiveSkillPack("personal-agent.claims");
-    expect(pack.systemPromptBlock).toContain(
-      "'This draft is general assistance, not legal advice. For advice on your situation, consult a qualified solicitor or legal professional.'",
-    );
-    expect(pack.systemPromptBlock).toContain("never the letter text itself");
-    expect(pack.systemPromptBlock.toLowerCase()).toContain("not legal advice");
+  // Audit 4d — the not-legal-advice mandate now lives in the signed,
+  // host-served skill-prompts bundle (systemPromptBlock left the
+  // client-visible pack to keep the persona-prompt IP out of client bundles).
+  // The prompt-CONTENT assertion moved to
+  // enclave/src/__tests__/skill-prompts-bundle.test.ts, which reads + verifies
+  // the real bundle. Here we assert only the composition CONTRACT: a resolver
+  // is required to get a prompt, and it layers base + specialist.
+  it("composes systemPromptBlock only with a resolver (enclave path); none for clients", () => {
+    const resolver = (id: string) => `PROMPT<${id}>`;
+    const composed = getEffectiveSkillPack("personal-agent.claims", resolver);
+    expect(composed.systemPromptBlock).toContain("PROMPT<personal-agent.default>");
+    expect(composed.systemPromptBlock).toContain("PROMPT<personal-agent.claims>");
+    // Client path (no resolver) carries no prompt text — the IP-protection win.
+    expect(
+      getEffectiveSkillPack("personal-agent.claims").systemPromptBlock,
+    ).toBeUndefined();
   });
 });
 
@@ -220,11 +230,14 @@ describe("canonical registry", () => {
   });
 
   it("effective specialist packs inherit the General base capabilities", () => {
-    const career = getEffectiveSkillPack("personal-agent.career");
+    // Prompt composition needs a resolver (enclave path); use a synthetic one
+    // so this asserts STRUCTURE, not the real (host-served) prompt text.
+    const resolver = (id: string) => `PROMPT<${id}>`;
+    const career = getEffectiveSkillPack("personal-agent.career", resolver);
     expect(career.id).toBe("personal-agent.career");
     expect(career.defaultNamespace).toBe("work");
-    expect(career.systemPromptBlock).toContain(defaultPack.systemPromptBlock);
-    expect(career.systemPromptBlock).toContain(careerPack.systemPromptBlock);
+    expect(career.systemPromptBlock).toContain("PROMPT<personal-agent.default>");
+    expect(career.systemPromptBlock).toContain("PROMPT<personal-agent.career>");
     expect(career.toolScopes).toEqual(
       expect.arrayContaining([
         "web.fetch",
@@ -260,5 +273,22 @@ describe("canonical registry", () => {
     expect(isRegisteredSkillPackId("personal-agent.health")).toBe(true);
     expect(isRegisteredSkillPackId("personal-agent.claims")).toBe(true);
     expect(isRegisteredSkillPackId("personal-agent.does-not-exist")).toBe(false);
+  });
+});
+
+describe("prompt-IP invariant (Tier-2)", () => {
+  it("no canonical pack carries systemPromptBlock — prompts are host-served only", () => {
+    // systemPromptBlock lives ONLY in the signed skill-prompts bundle
+    // (enclave/src/skills/skill-prompts.json), fetched + verified by the enclave
+    // at request time. It must never be in a client-distributed pack, or the
+    // prompt IP re-enters the web/mobile bundles. The app-local copies are kept
+    // byte-identical to these by canonical-parity.test.ts, so this one assertion
+    // protects every client surface.
+    for (const pack of ALL_SKILL_PACKS) {
+      expect(
+        pack.systemPromptBlock,
+        `${pack.id} must not carry a prompt block`,
+      ).toBeUndefined();
+    }
   });
 });
