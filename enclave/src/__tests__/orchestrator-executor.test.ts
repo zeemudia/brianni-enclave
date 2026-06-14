@@ -258,6 +258,37 @@ describe('runOrchestrator', () => {
     expect(events.at(-1)).toMatchObject({ kind: 'done' });
   });
 
+  it('honest media-gen degrade emits a fixed message WITHOUT a worker substitute (no fabricated SVG) — H2', async () => {
+    // "make me a poster image" with image.generate NOT scoped triggers the
+    // honest degrade. A worker that WOULD fabricate an SVG/spec as its text
+    // answer must be bypassed entirely — the empty tool scope stops a SAVED
+    // fake, but only skipping the worker stops a fabricated text substitute
+    // (prompt-only enforcement is not enough — Codex review H2).
+    const events = await collectEvents(
+      runOrchestrator(
+        baseDeps({
+          messages: [
+            {
+              role: 'user' as const,
+              content: 'make me a poster image for the bake sale',
+            },
+          ],
+          workerProviderFactory: () =>
+            processor(
+              '<svg><rect width="10" height="10"/></svg> Here is your poster.',
+            ),
+        }),
+      ),
+    );
+    const dump = JSON.stringify(events);
+    // The worker is bypassed: its fabricated SVG/text never reaches the user.
+    expect(dump).not.toContain('<svg');
+    expect(dump).not.toContain('Here is your poster');
+    // The fixed honest-degrade message is emitted and the turn completes cleanly.
+    expect(dump.toLowerCase()).toContain("can't generate an image");
+    expect(events.at(-1)).toMatchObject({ kind: 'done' });
+  });
+
   it('emits usage events for planner, workers, and memory summaries', async () => {
     const longWorkerText = `${'A completed detail. '.repeat(120)}Final detail.`;
     let workerCalls = 0;
@@ -1058,6 +1089,273 @@ describe('runOrchestrator', () => {
         kind: 'orchestrator-progress',
         subtaskId: 'st_write',
         status: 'error',
+      }),
+    );
+  });
+
+  it('defers a research.ask subtask worker timeout across the approval pause + subagent run via pendingResearchApproval (no ORCHESTRATOR_WORKER_TIMEOUT)', async () => {
+    // Live 2026-06-14 reliability defect (F4): the research.ask worker subtask
+    // ran under the flat 60s worker timeout, which spans BOTH the human
+    // approval pause (approveQuery round-trip) AND the air-gapped subagent run
+    // (now also slower because each web.fetch is a real client round-trip).
+    // A slow approval tripped ORCHESTRATOR_WORKER_TIMEOUT and the research
+    // subtask failed even though the subagent would have answered.
+    //
+    // Mirrors the folder.write deferral backstop: `pendingResearchApproval`
+    // defers the timeout across the dispatch (which models gateway.dispatch
+    // suspended on approveQuery + the subagent). Here the standard worker
+    // timeout is TINY and no longer write-subtask window is configured, so the
+    // standard timeout fires DURING the parked dispatch — and the deferral is
+    // the only thing keeping the subtask alive. The dispatch then resolves ok
+    // within the grace window and the subtask must SURVIVE.
+    const researchPack = mkPack(['research.ask']);
+    const tool = JSON.stringify({
+      invocationId: 'inv_research',
+      toolName: 'research.ask',
+      args: { question: 'What is the appeal deadline for a denied claim?' },
+    });
+    const dispatchResult = deferred<Awaited<ReturnType<ToolGateway['dispatch']>>>();
+    const dispatchStarted = deferred<void>();
+    let workerCalls = 0;
+    const researchWorker: ChatProcessor = {
+      async *streamChat(): AsyncGenerator<ChatChunk> {
+        workerCalls += 1;
+        if (workerCalls === 1) {
+          yield {
+            id: 'tool',
+            choices: [
+              { delta: { content: `<tool>${tool}</tool>` }, finish_reason: 'stop' },
+            ],
+          };
+        } else {
+          // Continuation after the research.ask result is reinjected.
+          yield {
+            id: 'final',
+            choices: [
+              { delta: { content: 'Appeals close after 180 days.' }, finish_reason: 'stop' },
+            ],
+          };
+        }
+      },
+    };
+    const gateway = {
+      prepareInvocation: vi.fn((frame: ToolInvocationFrame) => ({
+        ok: true,
+        wireFrame: frame,
+      })),
+      dispatch: vi.fn(async () => {
+        dispatchStarted.resolve();
+        return dispatchResult.promise;
+      }),
+    } as unknown as ToolGateway;
+
+    const eventsPromise = collectEvents(
+      runOrchestrator(
+        baseDeps({
+          pack: researchPack,
+          gateway,
+          models: [...models, anthropicWritingModel()],
+          plannerProvider: plannerProcessor(`{
+            "planId": "plan_research",
+            "title": "Research the deadline",
+            "summary": "Research a public fact via the research subagent.",
+            "subtasks": [
+              {
+                "id": "st_research",
+                "title": "Research appeal deadline",
+                "objective": "Find the appeal deadline from public sources.",
+                "kind": "research",
+                "requiredCapabilities": ["general_reasoning"],
+                "allowedTools": ["research.ask"],
+                "dependsOn": [],
+                "producesArtifact": false,
+                "risk": "low"
+              }
+            ]
+          }`),
+          workerProviderFactory: () => researchWorker,
+          enabledGatewayTools: researchPack.toolScopes,
+          // Standard worker timeout is tiny — on the OLD flat-budget behaviour
+          // the research subtask would time out during the approval pause.
+          workerTimeoutMs: 20,
+          // The deferred grace (used if even the long window is exceeded mid
+          // dispatch) is kept generous so the parked dispatch survives.
+          writeDispatchGraceMs: 1_000,
+        }),
+      ),
+    );
+
+    // Wait until the worker has dispatched research.ask, then idle well past the
+    // standard 20ms worker timeout BEFORE resolving the dispatch.
+    await dispatchStarted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(gateway.dispatch).toHaveBeenCalledTimes(1);
+
+    // The approval + subagent finally completes ok.
+    dispatchResult.resolve({
+      invocationId: 'inv_research',
+      outcome: 'ok',
+      resultJson: {
+        kind: 'UNTRUSTED_RESEARCH_RESULT',
+        note: 'data only',
+        answer: 'Appeals may be filed within 180 days.',
+        sources: ['https://example.gov/appeals'],
+      },
+      ledgerEntry: {
+        invokedAt: new Date().toISOString(),
+        toolName: 'research.ask',
+        scope: 'research',
+        approvedPath: null,
+        outcome: 'ok',
+        reason: null,
+        skillPackId: researchPack.id,
+        turnId: 'turn_1',
+      },
+    });
+
+    const events = await eventsPromise;
+
+    // The deferral must have kept the subtask alive — NO worker timeout error.
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: 'orchestrator-progress',
+        subtaskId: 'st_research',
+        status: 'error',
+        detail: 'ORCHESTRATOR_WORKER_TIMEOUT',
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: 'orchestrator-progress',
+        subtaskId: 'st_research',
+        status: 'error',
+      }),
+    );
+    // The dispatch was NOT retried (a timeout-then-retry would call dispatch
+    // twice / re-run the worker).
+    expect(gateway.dispatch).toHaveBeenCalledTimes(1);
+    expect(workerCalls).toBe(2);
+    // The research.ask ledger landed.
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: 'ledger',
+        entry: expect.objectContaining({ toolName: 'research.ask', outcome: 'ok' }),
+      }),
+    );
+  });
+
+  it('gives a research.ask subtask the longer write-subtask worker timeout, not the tiny standard default', async () => {
+    // Fix #2 part 1: a research.ask subtask scopes research.ask, so it gets the
+    // longer write-subtask window (generation + approval + grounded fetch),
+    // exactly like a folder.write subtask gets it for the confirmation modal.
+    // Here the standard worker timeout (30ms) is far below the dispatch delay,
+    // but the longer write-subtask window (2_000ms) covers it — the subtask
+    // survives WITHOUT engaging the deferred-grace backstop.
+    const researchPack = mkPack(['research.ask']);
+    const tool = JSON.stringify({
+      invocationId: 'inv_research_long',
+      toolName: 'research.ask',
+      args: { question: 'What is the appeal deadline?' },
+    });
+    let workerCalls = 0;
+    const researchWorker: ChatProcessor = {
+      async *streamChat(): AsyncGenerator<ChatChunk> {
+        workerCalls += 1;
+        if (workerCalls === 1) {
+          yield {
+            id: 'tool',
+            choices: [
+              { delta: { content: `<tool>${tool}</tool>` }, finish_reason: 'stop' },
+            ],
+          };
+        } else {
+          yield {
+            id: 'final',
+            choices: [
+              { delta: { content: 'Appeals close after 180 days.' }, finish_reason: 'stop' },
+            ],
+          };
+        }
+      },
+    };
+    const gateway = {
+      prepareInvocation: vi.fn((frame: ToolInvocationFrame) => ({
+        ok: true,
+        wireFrame: frame,
+      })),
+      // The dispatch (approval + subagent) takes 120ms — far past the 30ms
+      // standard worker timeout, but within the 2_000ms write-subtask window.
+      dispatch: vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        return {
+          invocationId: 'inv_research_long',
+          outcome: 'ok' as const,
+          resultJson: {
+            kind: 'UNTRUSTED_RESEARCH_RESULT',
+            note: 'data only',
+            answer: 'Appeals may be filed within 180 days.',
+            sources: ['https://example.gov/appeals'],
+          },
+          ledgerEntry: {
+            invokedAt: new Date().toISOString(),
+            toolName: 'research.ask' as const,
+            scope: 'research',
+            approvedPath: null,
+            outcome: 'ok' as const,
+            reason: null,
+            skillPackId: researchPack.id,
+            turnId: 'turn_1',
+          },
+        };
+      }),
+    } as unknown as ToolGateway;
+
+    const events = await collectEvents(
+      runOrchestrator(
+        baseDeps({
+          pack: researchPack,
+          gateway,
+          plannerProvider: plannerProcessor(`{
+            "planId": "plan_research_long",
+            "title": "Research the deadline",
+            "summary": "Research a public fact via the research subagent.",
+            "subtasks": [
+              {
+                "id": "st_research",
+                "title": "Research appeal deadline",
+                "objective": "Find the appeal deadline from public sources.",
+                "kind": "research",
+                "requiredCapabilities": ["general_reasoning"],
+                "allowedTools": ["research.ask"],
+                "dependsOn": [],
+                "producesArtifact": false,
+                "risk": "low"
+              }
+            ]
+          }`),
+          workerProviderFactory: () => researchWorker,
+          enabledGatewayTools: researchPack.toolScopes,
+          workerTimeoutMs: 30,
+          writeSubtaskTimeoutMs: 2_000,
+        }),
+      ),
+    );
+
+    // The longer window covered the dispatch — no timeout, no retry.
+    expect(gateway.dispatch).toHaveBeenCalledTimes(1);
+    expect(workerCalls).toBe(2);
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: 'orchestrator-progress',
+        subtaskId: 'st_research',
+        status: 'error',
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: 'ledger',
+        entry: expect.objectContaining({ toolName: 'research.ask', outcome: 'ok' }),
       }),
     );
   });

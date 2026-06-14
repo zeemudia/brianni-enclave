@@ -1,5 +1,9 @@
-import { describe, it, expect } from "vitest";
-import type { AgentLinkedFolderContext } from "@calypso/chat-types";
+import { describe, it, expect, vi } from "vitest";
+import type {
+  AgentLinkedFolderContext,
+  ToolInvocationFrame,
+  ToolResultFrame,
+} from "@calypso/chat-types";
 import { ToolGateway, type ClientBridge, type ToolGatewayDeps } from "../index";
 
 // Minimal ClientBridge stub — the sibling-gateway tests never dispatch a real
@@ -117,5 +121,71 @@ describe("createSiblingGateway", () => {
 
     // invokeClient must still be callable (web.fetch needs it).
     expect(typeof sdeps.clientBridge.invokeClient).toBe("function");
+  });
+
+  // ── Grounding fix (research.ask "no web access") ────────────────────────────
+  //
+  // Root cause: the sibling's clientBridge.invokeClient was the PLAIN parent
+  // variant, which only awaits the resolver — it never EMITS the
+  // TOOL_INVOCATION wire frame. The main orchestrator pump emits the frame for
+  // the parent's tool calls, but the air-gapped sibling's events are consumed
+  // privately by runResearchSubagent and never reach the pump (which is parked
+  // inside gateway.dispatch(research.ask) awaiting approveQuery). So the
+  // sibling's web.fetch resolver was created but never resolved → 30s timeout →
+  // zero sources → "no web access".
+  //
+  // Fix: createSiblingGateway prefers the parent's `invokeClientFromSibling`
+  // (a SELF-EMITTING variant, mirroring approveQuery) when present, falling
+  // back to the plain `invokeClient` for back-compat.
+  describe("grounding: sibling prefers the self-emitting invokeClientFromSibling", () => {
+    const okResult = (frame: ToolInvocationFrame): ToolResultFrame => ({
+      invocationId: frame.invocationId,
+      outcome: "ok",
+      resultJson: {},
+    });
+    const sampleFrame = (): ToolInvocationFrame => ({
+      invocationId: "inv-sib-1",
+      agentTurnId: "turn-sib-1",
+      toolName: "web.fetch",
+      args: { url: "https://example.com", query: "q" },
+    });
+
+    it("routes the sibling's invokeClient to the SELF-EMITTING variant when the parent provides it", async () => {
+      const fromSibling = vi.fn(async (f: ToolInvocationFrame) => okResult(f));
+      const plain = vi.fn(async (f: ToolInvocationFrame) => okResult(f));
+
+      const bridge: ClientBridge = {
+        invokeClient: plain,
+        invokeClientFromSibling: fromSibling,
+      };
+      const parent = new ToolGateway(makeDeps({ clientBridge: bridge }));
+      const sibling = parent.createSiblingGateway({ linkedFolders: [] });
+
+      const sdeps = (sibling as unknown as {
+        deps: { clientBridge: { invokeClient: ClientBridge["invokeClient"] } };
+      }).deps;
+
+      // Invoking the sibling's invokeClient must reach the self-emitting
+      // variant, NOT the plain (non-emitting) one — otherwise web.fetch hangs.
+      await sdeps.clientBridge.invokeClient(sampleFrame());
+      expect(fromSibling).toHaveBeenCalledTimes(1);
+      expect(plain).not.toHaveBeenCalled();
+    });
+
+    it("falls back to plain invokeClient when the parent has no invokeClientFromSibling (back-compat)", async () => {
+      const plain = vi.fn(async (f: ToolInvocationFrame) => okResult(f));
+      const bridge: ClientBridge = { invokeClient: plain };
+      const parent = new ToolGateway(makeDeps({ clientBridge: bridge }));
+
+      // Must not throw when the optional self-emitting variant is absent.
+      const sibling = parent.createSiblingGateway({ linkedFolders: [] });
+
+      const sdeps = (sibling as unknown as {
+        deps: { clientBridge: { invokeClient: ClientBridge["invokeClient"] } };
+      }).deps;
+
+      await sdeps.clientBridge.invokeClient(sampleFrame());
+      expect(plain).toHaveBeenCalledTimes(1);
+    });
   });
 });

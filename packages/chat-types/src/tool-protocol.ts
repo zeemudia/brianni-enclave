@@ -70,6 +70,16 @@ export type BinaryWorkItemDirection = z.infer<
 >;
 
 /**
+ * Frame-safe size the enclave chunks every binary OUTPUT into (image/video/
+ * audio bytes delivered over `binary_work_item.chunk` frames). SINGLE SOURCE OF
+ * TRUTH: the enclave (`FRAME_SAFE_OUTPUT_CHUNK_BYTES`) and BOTH clients
+ * (`BINARY_WORK_ITEM_MAX_CHUNK_BYTES`, which drives MAX_CHUNKS) import this so
+ * the value can never drift. A prior 256 KB/128 KB drift halved the client chunk
+ * budget and rejected legitimately-large outputs as `BINARY_WRITE_TOO_LARGE`.
+ */
+export const BINARY_OUTPUT_CHUNK_BYTES = 128 * 1024;
+
+/**
  * Client-only binary chunk frame. These frames are encrypted under the
  * session key and are never converted into model-visible tool results.
  */

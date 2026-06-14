@@ -448,7 +448,7 @@ describe('EnclaveRouter orchestrator wire mode', () => {
     expect(streamSpy).not.toHaveBeenCalled();
   });
 
-  it('does not widen the canonical skill pack to generated media tools when media deps are wired', async () => {
+  it('routes a video-generation subtask through the deterministic shaper when the pack scopes video.generate and media is wired (finding 18)', async () => {
     const router = new EnclaveRouter({
       agentLoopProcessorFactory: makeVideoPlanner,
       media: mediaDeps,
@@ -502,24 +502,41 @@ describe('EnclaveRouter orchestrator wire mode', () => {
         ),
     );
 
+    // Finding 18: the General pack now scopes video.generate, so a "make me a
+    // video" GENERATION request — with a routable video model + wired media — is
+    // shaped by createTaskPlan's DETERMINISTIC media-gen shaper into a real
+    // kind:'video' subtask using video.generate. The short-circuit runs BEFORE
+    // the LLM planner, so the injected planner's 'clip-1' plan is never consulted
+    // (the determinism that prevents the R5 fake-SVG/storyboard substitute).
     expect(decodedChunks).toContainEqual(
       expect.objectContaining({
         _type: 'orchestrator_plan',
         plan: expect.objectContaining({
-          title: 'Inspect video',
-          subtasks: [
+          title: 'Generate video',
+          subtasks: expect.arrayContaining([
             expect.objectContaining({
-              id: 'st_single',
-              allowedTools: expect.arrayContaining(['video.inspect']),
+              id: 'st_video',
+              kind: 'video',
+              allowedTools: expect.arrayContaining(['video.generate']),
+              media: expect.objectContaining({ operation: 'video_generate' }),
             }),
-          ],
+          ]),
         }),
       }),
     );
-    expect(JSON.stringify(decodedChunks)).not.toContain('video.generate');
+    // The deterministic shaper is authoritative: the injected LLM planner's plan
+    // ('clip-1' / "Launch video") is bypassed entirely.
     expect(JSON.stringify(decodedChunks)).not.toContain('clip-1');
-    expect(decodedChunks).not.toContainEqual(
-      expect.objectContaining({ _type: 'orchestrator_artifact' }),
+    expect(JSON.stringify(decodedChunks)).not.toContain('Launch video');
+    // Coverage net: binary delivery is UNWIRED here (mediaDeps has no
+    // awaitBinaryWriteAck/binaryWorkItems), so the routed video subtask reaches
+    // the media executor and stops cleanly at the delivery step — no
+    // binary_work_item.write_request is emitted (no bytes leak to the client).
+    expect(JSON.stringify(decodedChunks)).toContain(
+      'VIDEO_GENERATE_DELIVERY_UNAVAILABLE',
+    );
+    expect(JSON.stringify(decodedChunks)).not.toContain(
+      'binary_work_item.write_request',
     );
   });
 });

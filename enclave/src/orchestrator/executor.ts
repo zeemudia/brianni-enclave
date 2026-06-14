@@ -37,7 +37,12 @@ import type {
   OrchestratorScopedAgentLoopEvent,
 } from './events';
 import { runMediaSubtask, type RunMediaSubtaskDeps } from './media-executor';
-import { createFallbackTaskPlan, createTaskPlan } from './planner';
+import {
+  HONEST_MEDIA_GEN_DEGRADE_SUBTASK_ID,
+  createFallbackTaskPlan,
+  createTaskPlan,
+  honestMediaGenDegradeMessage,
+} from './planner';
 import { ProviderHealth, buildAttemptModelIds } from './provider-health';
 import { selectModelForSubtask } from './router';
 
@@ -684,14 +689,18 @@ export async function* runOrchestrator(
 
     const requiresReadResultTool = subtaskRequiresReadResultTool(subtask);
     const requiresFolderWriteTool = subtaskRequiresFolderWriteTool(subtask);
+    const scopesResearchAskTool = subtaskScopesResearchAskTool(subtask);
     // A folder.write subtask must generate the artifact AND wait on the human
-    // confirmation modal, so it gets the longer write-subtask window; every
-    // other subtask keeps the short worker timeout (a quiet worker is stuck).
-    const subtaskWorkerTimeoutMs = requiresFolderWriteTool
-      ? deps.writeSubtaskTimeoutMs ??
-        deps.workerTimeoutMs ??
-        DEFAULT_WRITE_SUBTASK_TIMEOUT_MS
-      : deps.workerTimeoutMs ?? 60_000;
+    // confirmation modal; a research.ask subtask must wait on the approval
+    // round-trip AND the air-gapped subagent's real-client web.fetch round
+    // trips. Both get the longer write-subtask window; every other subtask
+    // keeps the short worker timeout (a quiet worker is stuck).
+    const subtaskWorkerTimeoutMs =
+      requiresFolderWriteTool || scopesResearchAskTool
+        ? deps.writeSubtaskTimeoutMs ??
+          deps.workerTimeoutMs ??
+          DEFAULT_WRITE_SUBTASK_TIMEOUT_MS
+        : deps.workerTimeoutMs ?? 60_000;
     const workerPrompt = [
       `Subtask: ${subtask.title}`,
       `Objective: ${subtask.objective}`,
@@ -713,6 +722,12 @@ export async function* runOrchestrator(
     let invokedAnyTool = false;
     let invokedFolderWriteTool = false;
     let pendingFolderWriteDispatch = false;
+    // True between a research.ask tool-invocation and its matching tool-result:
+    // the worker is parked inside gateway.dispatch(research.ask) on the human
+    // approval round-trip + the air-gapped subagent run. Defers the worker
+    // timeout across that pause, exactly as pendingFolderWriteDispatch defers
+    // across the confirmation modal.
+    let pendingResearchApproval = false;
     let timedOutDuringFolderWriteDispatch = false;
     let folderWriteDispatchGraceExpired = false;
     let confirmedTerminalFolderWrite = false;
@@ -724,6 +739,30 @@ export async function* runOrchestrator(
       let attemptsUsed = 0;
       let workerCompleted = false;
       let lastWorkerError: unknown;
+
+      // H2 (Codex review): the honest media-gen degrade subtask must NEVER run an
+      // LLM worker. Its empty tool scope already prevents SAVING a fabricated
+      // artifact, but a worker could still emit fabricated SVG / "design spec"
+      // markup as its TEXT answer (prompt-only enforcement). Emit the FIXED
+      // "generation unavailable" message and mark the worker complete so no model
+      // output can stand in for the unavailable artifact. The subtask has no
+      // dependents and no required tools, so the existing success path records
+      // the message to memory and emits `done` WITHOUT consulting any model.
+      if (subtask.id === HONEST_MEDIA_GEN_DEGRADE_SUBTASK_ID) {
+        const message = honestMediaGenDegradeMessage(subtask);
+        finalText = message;
+        emittedWorkerText = true;
+        for (const text of splitTextForOrchestrator(message)) {
+          yield {
+            kind: 'orchestrator-text',
+            planId: plan.planId,
+            subtaskId: subtask.id,
+            role: subtask.producesArtifact ? 'final_artifact' : 'working',
+            text,
+          };
+        }
+        workerCompleted = true;
+      }
 
       // ── Consent-gated private-read → web egress bridge ──────────────────────
       // A web.fetch subtask is denied private-derived working memory by default
@@ -871,7 +910,8 @@ export async function* runOrchestrator(
             subtaskWorkerTimeoutMs,
             deps.abortSignal,
             {
-              shouldDeferTimeout: () => pendingFolderWriteDispatch,
+              shouldDeferTimeout: () =>
+                pendingFolderWriteDispatch || pendingResearchApproval,
               onTimeoutDeferred: () => {
                 timedOutDuringFolderWriteDispatch = true;
               },
@@ -891,6 +931,11 @@ export async function* runOrchestrator(
             throwIfAborted(deps.abortSignal);
             if (event.kind === 'done') break;
             if (event.kind === 'tool-result') {
+              // The research.ask round-trip (approval + air-gapped subagent)
+              // has completed — stop deferring the worker timeout for it.
+              if (event.toolName === 'research.ask') {
+                pendingResearchApproval = false;
+              }
               // Internal-only: never forwarded to the wire. Capture a bounded,
               // structured digest of read-result tools (e.g. web.fetch
               // {status, bodyText}) so a dependent subtask's working memory
@@ -920,6 +965,12 @@ export async function* runOrchestrator(
             emittedAnyWorkerEvent = true;
             if (event.kind === 'tool-invocation') {
               invokedAnyTool = true;
+              if (event.frame.toolName === 'research.ask') {
+                // The worker is about to park inside gateway.dispatch on the
+                // approval round-trip + subagent run — defer the timeout until
+                // the matching tool-result arrives.
+                pendingResearchApproval = true;
+              }
               if (event.frame.toolName === 'folder.write') {
                 invokedFolderWriteTool = true;
                 pendingFolderWriteDispatch = true;
@@ -1050,6 +1101,7 @@ export async function* runOrchestrator(
             invokedAnyTool = false;
             invokedFolderWriteTool = false;
             pendingFolderWriteDispatch = false;
+            pendingResearchApproval = false;
             timedOutDuringFolderWriteDispatch = false;
             folderWriteDispatchGraceExpired = false;
             continue;
@@ -1951,6 +2003,19 @@ function subtaskRequiresFolderWriteTool(subtask: AgentSubtask): boolean {
     subtask.allowedTools.includes('folder.write') &&
     !subtask.allowedTools.some(isAlternativeArtifactTool)
   );
+}
+
+/**
+ * A research.ask subtask whose worker timeout must span the human approval
+ * pause (approveQuery round-trip) AND the air-gapped subagent run (each
+ * web.fetch is a real client round-trip). Under the flat 60s worker timeout a
+ * slow approval / grounded fetch trips ORCHESTRATOR_WORKER_TIMEOUT and the
+ * research step fails even though the subagent would have answered — exactly
+ * the folder.write confirmation-modal problem. Mirrors
+ * {@link subtaskRequiresFolderWriteTool}: scope on research.ask presence.
+ */
+function subtaskScopesResearchAskTool(subtask: AgentSubtask): boolean {
+  return subtask.allowedTools.includes('research.ask');
 }
 
 function isAlternativeArtifactTool(tool: ToolName): boolean {

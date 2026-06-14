@@ -239,6 +239,88 @@ describe('runResearchSubagent', () => {
     // Sanity: a clean run (the happy-path test above) reports failed=false.
   });
 
+  it('grounding: a SELF-EMITTING parent bridge emits a web.fetch frame and resolves via a delivered TOOL_RESULT → non-empty sources/answer, failed=false', async () => {
+    // Reproduces the live "no web access" bug end-to-end through the air gap.
+    //
+    // In production the sibling's web.fetch resolver was created but never
+    // resolved because no TOOL_INVOCATION frame was ever emitted to the client
+    // (the main pump is parked inside gateway.dispatch(research.ask)). This test
+    // models the FIXED reverse-channel: the parent bridge exposes a SELF-EMITTING
+    // `invokeClientFromSibling` that (a) pushes the frame onto an emit sink, and
+    // (b) returns a promise that resolves only when a matching TOOL_RESULT is
+    // delivered out-of-band. A run that hung would time out and return
+    // failed=true with empty sources; this asserts the opposite.
+    const fetchUrl = 'https://example.gov/grounded-source-2026';
+    const webFetchTool = JSON.stringify({
+      invocationId: 'inv-fetch-grounded',
+      toolName: 'web.fetch',
+      args: { url: fetchUrl, query: 'grounded fact' },
+    });
+
+    const provider = mkProvider([
+      [`<tool>${webFetchTool}</tool>`],
+      ['Grounded answer: the appeal window is 180 days.'],
+    ]);
+
+    // Emit sink + pending resolvers keyed by invocationId (the same routing the
+    // real EnclaveRouter uses via outstandingInvocations). The self-emitting
+    // bridge pushes the frame, then awaits a delivered TOOL_RESULT.
+    const emitted: ToolInvocationFrame[] = [];
+    const pending = new Map<string, (r: ToolResultFrame) => void>();
+
+    const bridge: ClientBridge = {
+      // Plain variant should NOT be used by the sibling when the self-emitting
+      // one is present; wire it to a throw so any accidental use is caught.
+      invokeClient: () => {
+        throw new Error('plain invokeClient must not be used by a sibling');
+      },
+      invokeClientFromSibling: (frame) => {
+        // (a) EMIT the frame — this is the step the plain bridge skipped.
+        emitted.push(frame);
+        // (b) Register a resolver, then deliver the matching TOOL_RESULT on a
+        //     later tick (models the client POSTing /tool-result).
+        return new Promise<ToolResultFrame>((resolve) => {
+          pending.set(frame.invocationId, resolve);
+          setTimeout(() => {
+            const r = pending.get(frame.invocationId);
+            if (r) {
+              pending.delete(frame.invocationId);
+              r({
+                invocationId: frame.invocationId,
+                outcome: 'ok',
+                resultJson: {
+                  status: 200,
+                  bodyText: 'Appeals may be filed within 180 days.',
+                },
+              });
+            }
+          }, 0);
+        });
+      },
+    };
+
+    const parent = makeParentGateway(bridge);
+
+    const result = await runResearchSubagent({
+      parentGateway: parent,
+      query: SAMPLE_QUERY,
+      queryString: 'grounded appeal deadline 2026',
+      provider,
+      turnId: 't-grounded',
+    });
+
+    // (a) A TOOL_INVOCATION frame for the sibling's web.fetch was emitted.
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].toolName).toBe('web.fetch');
+    expect((emitted[0].args as { url?: string }).url).toBe(fetchUrl);
+
+    // (b) The resolver resolved on the delivered TOOL_RESULT, so the run did NOT
+    //     time out: it grounded a real source and produced an answer.
+    expect(result.failed).toBe(false);
+    expect(result.sources).toContain(fetchUrl);
+    expect(result.answer).toContain('180 days');
+  });
+
   it('web-only scope: memory.read attempt is rejected OUT_OF_SCOPE, no private data accessed', async () => {
     // The research worker pack only has "web.fetch" in toolScopes.
     // A model that tries "memory.read" must get an OUT_OF_SCOPE gateway rejection.

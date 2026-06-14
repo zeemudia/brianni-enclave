@@ -422,6 +422,7 @@ export {
 } from "./deletion-manifest";
 
 export {
+  BINARY_OUTPUT_CHUNK_BYTES,
   ToolInvocationFrameSchema,
   ToolResultFrameSchema,
   BinaryWorkItemChunkFrameSchema,

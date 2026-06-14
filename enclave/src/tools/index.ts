@@ -36,6 +36,28 @@ import type {
 export interface ClientBridge {
   invokeClient(frame: ToolInvocationFrame): Promise<ToolResultFrame>;
   /**
+   * SELF-EMITTING variant of {@link invokeClient} for an air-gapped research
+   * subagent's sibling gateway.
+   *
+   * The main `invokeClient` only awaits the resolver — it relies on the main
+   * orchestrator pump's `tool-invocation` case to actually emit the
+   * TOOL_INVOCATION wire frame to the client. A research subagent runs its OWN
+   * agent loop on a sibling gateway whose `tool-invocation` events are consumed
+   * privately by runResearchSubagent (the air gap); they NEVER reach the main
+   * pump, AND the main pump is parked inside gateway.dispatch(research.ask)
+   * awaiting approveQuery. So a sibling web.fetch's plain `invokeClient` creates
+   * a resolver that is never delivered a frame and times out → "no web access".
+   *
+   * This variant solves the suspended-pump problem the same way `approveQuery`
+   * does: it registers the resolver then SELF-EMITs the TOOL_INVOCATION frame
+   * onto the reverse-channel output queue. Optional so existing test bridges and
+   * any non-pump caller keep working; createSiblingGateway falls back to the
+   * plain `invokeClient` when this is absent.
+   */
+  invokeClientFromSibling?(
+    frame: ToolInvocationFrame,
+  ): Promise<ToolResultFrame>;
+  /**
    * Surface the EXACT `query` string to the user for approval before an
    * outbound research question is dispatched. The host/client UI must show
    * the unmodified query string (Phase 3 builds the UI; Phase 2 tests stub
@@ -447,18 +469,26 @@ export class ToolGateway {
   createSiblingGateway(overrides: {
     linkedFolders?: readonly AgentLinkedFolderContext[];
   }): ToolGateway {
+    // Grounding: a sibling's web.fetch has no orchestrator pump to emit its
+    // TOOL_INVOCATION frame (its loop events are consumed privately by
+    // runResearchSubagent — the air gap), so prefer the SELF-EMITTING
+    // invokeClientFromSibling that pushes the frame itself. Fall back to the
+    // plain invokeClient when the parent bridge does not provide it (existing
+    // test bridges / back-compat). approveQuery is still stripped — a sibling
+    // has no user-approval channel.
+    const siblingInvokeClient = this.deps.clientBridge.invokeClientFromSibling
+      ? this.deps.clientBridge.invokeClientFromSibling.bind(
+          this.deps.clientBridge,
+        )
+      : this.deps.clientBridge.invokeClient.bind(this.deps.clientBridge);
     return new ToolGateway({
       ...this.deps,
       linkedFolders: overrides.linkedFolders ?? [],
       strictEgressLock: false,
       crossPackGrant: undefined, // never grant the research worker private access
       researchProviderFactory: undefined, // no transitive delegation — research.ask → RESEARCH_UNAVAILABLE
-      // Strip approveQuery so a sibling has no user-approval channel;
-      // invokeClient is preserved so web.fetch can still dispatch.
       clientBridge: {
-        invokeClient: this.deps.clientBridge.invokeClient.bind(
-          this.deps.clientBridge,
-        ),
+        invokeClient: siblingInvokeClient,
       },
     });
   }

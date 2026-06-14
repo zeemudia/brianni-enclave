@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 
-import type {
-  BinaryWorkItemToolName,
-  BinaryWorkItemWriteAckFrame,
-  BinaryWorkItemWriteRequestFrame,
+import {
+  BINARY_OUTPUT_CHUNK_BYTES,
+  type BinaryWorkItemToolName,
+  type BinaryWorkItemWriteAckFrame,
+  type BinaryWorkItemWriteRequestFrame,
 } from '@calypso/chat-types';
 
 import { zeroBuffer } from '../crypto';
@@ -23,11 +24,13 @@ export const DEFAULT_BINARY_WORK_ITEM_TOTAL_CAP = 5 * 1024 * 1024;
 // "padded response chunk exceeds maximum frame (262140 bytes)" — live Defect D3
 // (A13 10s WAV ≈ 860 KB failed; it surfaced as ORCHESTRATOR_WORKER_ERROR_RETRY
 // because the worker loop caught the deterministic frame error and retried).
-// 128 KB raw → ~175 KB framed, ~85 KB under the cap. The RECEIVER caps
-// (DEFAULT_BINARY_WORK_ITEM_PER_CHUNK_CAP here, BINARY_WORK_ITEM_MAX_CHUNK_BYTES
-// in the web/mobile fulfillers) stay at 256 KB, so this only shrinks what the
-// enclave EMITS — large source uploads (client→enclave) are unaffected.
-export const FRAME_SAFE_OUTPUT_CHUNK_BYTES = 128 * 1024;
+// 128 KB raw → ~175 KB framed, ~85 KB under the cap. SINGLE SOURCE OF TRUTH:
+// the web/mobile fulfillers derive their MAX_CHUNKS budget from the SAME
+// `BINARY_OUTPUT_CHUNK_BYTES` (a 256 KB divisor there under-counted the chunk
+// budget by 2x and rejected legit large outputs as BINARY_WRITE_TOO_LARGE).
+// Only the OUTPUT emit size is shared; the SOURCE-upload receiver cap
+// (DEFAULT_BINARY_WORK_ITEM_PER_CHUNK_CAP, client→enclave) stays at 256 KB.
+export const FRAME_SAFE_OUTPUT_CHUNK_BYTES = BINARY_OUTPUT_CHUNK_BYTES;
 
 // Split a binary-write payload into ordered WIRE FRAMES: one write_request
 // (metadata only — folderId/displayName/request, NO chunks) followed by one

@@ -1578,6 +1578,13 @@ describe('createTaskPlan — image generation routing', () => {
   });
 
   it('tags media.operation + image_generation on an LLM-planned image.generate subtask that omitted them', async () => {
+    // The LLM-plan tagging safety net (tagImageMediaOperation): when the LLM
+    // scopes image.generate but omits the media block / image_generation
+    // capability, they are injected so the subtask routes to the image-output
+    // model. The userText here lacks an explicit "make me an image" phrasing, so
+    // the deterministic image-gen short-circuit does NOT fire and the LLM plan is
+    // consulted and post-processed (the short-circuit path is covered separately
+    // by "deterministic media-gen routing").
     const provider = processorWithText(`
 <plan id="planner_img">
 {
@@ -1604,7 +1611,7 @@ describe('createTaskPlan — image generation routing', () => {
       provider,
       model: 'gpt-5.5',
       plannerTag: 'planner_img',
-      userText: 'make me a poster image for the bake sale',
+      userText: 'help me get ready for the bake sale',
       toolScopes: [...IMAGE_SCOPES],
       linkedFolderCount: 0,
     });
@@ -1626,6 +1633,26 @@ describe('createTaskPlan — image generation routing', () => {
     const allTools = plan.subtasks.flatMap((s) => s.allowedTools);
     expect(allTools).not.toContain('image.generate');
     expect(plan.subtasks.every((s) => s.media?.operation !== 'image_generate')).toBe(true);
+  });
+
+  it('does NOT short-circuit a produce-verb EDIT of an EXISTING image to image_generate even when image.generate is scoped (Codex P1b)', async () => {
+    // "make this image brighter" is a transform of an existing image, not a
+    // fresh generation. Even with image.generate scoped, the deterministic
+    // gen short-circuit must NOT fire (it would drop the source-file read +
+    // local transform tools and route to the wrong media generator); it defers
+    // to the normal pipeline.
+    const plan = await createTaskPlan({
+      provider: processorWithText('not json'), // deterministic fallback
+      model: 'gpt-5.5',
+      userText: 'make this image brighter and crop the edges',
+      toolScopes: [...IMAGE_SCOPES],
+      linkedFolderCount: 1,
+    });
+    const allTools = plan.subtasks.flatMap((s) => s.allowedTools);
+    expect(allTools).not.toContain('image.generate');
+    expect(
+      plan.subtasks.every((s) => s.media?.operation !== 'image_generate'),
+    ).toBe(true);
   });
 
   it('strips LOCAL image tools from an LLM-planned image_generate subtask (router hard-cap bypass guard)', async () => {
@@ -1655,11 +1682,14 @@ describe('createTaskPlan — image generation routing', () => {
   ]
 }
 </plan>`);
+    // Non-explicit phrasing so the LLM plan (not the deterministic short-circuit)
+    // is post-processed — this exercises the tagImageMediaOperation local-tool
+    // stripping on an LLM-supplied generation subtask.
     const plan = await createTaskPlan({
       provider,
       model: 'gpt-5.5',
       plannerTag: 'planner_img2',
-      userText: 'make me a poster image',
+      userText: 'help me get ready for the bake sale',
       toolScopes: [...IMAGE_SCOPES],
       linkedFolderCount: 0,
     });
@@ -1869,5 +1899,379 @@ describe('createTaskPlan — video generation routing', () => {
     const allTools = plan.subtasks.flatMap((s) => s.allowedTools);
     expect(allTools).not.toContain('video.generate');
     expect(plan.subtasks.every((s) => s.media?.operation !== 'video_generate')).toBe(true);
+  });
+});
+
+// Deterministic media-GENERATION routing (R4 image / R5 video, live 2026-06-14):
+// when the media tool IS scoped, the LLM sometimes returns a generic WORKER
+// decomposition (Draft → Compose → "Generate image"/folder.write → Check → Save)
+// whose "generate" step never calls the media tool, so the worker hand-writes a
+// fake SVG + a design-spec .md and falsely reports DONE. The deterministic
+// media-gen shaper must therefore be AUTHORITATIVE (short-circuit before the LLM
+// planner) when the media tool is scoped — and, when generation INTENT is present
+// but the tool was stripped by the fail-closed gate, the plan must HONESTLY
+// degrade rather than let the worker-decomposition fabricate a substitute.
+describe('createTaskPlan — deterministic media-gen routing', () => {
+  const IMAGE_GEN_SCOPES: ToolName[] = [
+    'memory.list',
+    'memory.read',
+    'folder.read',
+    'file.read',
+    'folder.write',
+    'image.generate',
+    'image.inspect',
+    'image.ocr',
+    'image.transform',
+  ];
+  const VIDEO_GEN_SCOPES: ToolName[] = [
+    'memory.list',
+    'memory.read',
+    'folder.read',
+    'file.read',
+    'folder.write',
+    'video.generate',
+    'video.inspect',
+    'video.transcribe',
+    'video.transform',
+  ];
+  // Scopes that retain the generation INTENT surface (folder.write so a worker
+  // COULD hand-write a fake substitute) but NOT the media-gen tool — the
+  // fail-closed routability gate stripped image.generate / video.generate.
+  const IMAGE_INTENT_NO_GEN_SCOPES: ToolName[] = [
+    'memory.list',
+    'memory.read',
+    'folder.read',
+    'file.read',
+    'folder.write',
+  ];
+
+  const WORKER_DECOMPOSITION_IMAGE = `
+<plan id="planner_worker_img">
+{
+  "planId": "plan_worker_img",
+  "title": "Design a bake-sale poster",
+  "summary": "Draft a brief, compose a prompt, generate the poster, check legibility, and save.",
+  "subtasks": [
+    {
+      "id": "st_brief",
+      "title": "Draft poster brief",
+      "objective": "Draft a brief for the bake-sale poster.",
+      "kind": "writing",
+      "requiredCapabilities": ["writing"],
+      "allowedTools": [],
+      "dependsOn": [],
+      "producesArtifact": false,
+      "risk": "low"
+    },
+    {
+      "id": "st_compose",
+      "title": "Compose image prompt",
+      "objective": "Compose a detailed image-generation prompt.",
+      "kind": "writing",
+      "requiredCapabilities": ["writing"],
+      "allowedTools": [],
+      "dependsOn": ["st_brief"],
+      "producesArtifact": false,
+      "risk": "low"
+    },
+    {
+      "id": "st_generate",
+      "title": "Generate poster image",
+      "objective": "Generate the poster image from the composed prompt.",
+      "kind": "writing",
+      "requiredCapabilities": ["general_reasoning"],
+      "allowedTools": ["folder.write"],
+      "dependsOn": ["st_compose"],
+      "producesArtifact": true,
+      "risk": "low"
+    },
+    {
+      "id": "st_save",
+      "title": "Save poster",
+      "objective": "Save the poster to the linked folder.",
+      "kind": "writing",
+      "requiredCapabilities": ["writing"],
+      "allowedTools": ["folder.write"],
+      "dependsOn": ["st_generate"],
+      "producesArtifact": true,
+      "risk": "low"
+    }
+  ]
+}
+</plan>`;
+
+  const WORKER_DECOMPOSITION_VIDEO = `
+<plan id="planner_worker_vid">
+{
+  "planId": "plan_worker_vid",
+  "title": "Make a teaser video",
+  "summary": "Draft a storyboard, compose a prompt, generate the clip, review, and save.",
+  "subtasks": [
+    {
+      "id": "st_storyboard",
+      "title": "Draft storyboard",
+      "objective": "Draft a storyboard for the teaser.",
+      "kind": "writing",
+      "requiredCapabilities": ["writing"],
+      "allowedTools": [],
+      "dependsOn": [],
+      "producesArtifact": false,
+      "risk": "low"
+    },
+    {
+      "id": "st_generate",
+      "title": "Generate teaser clip",
+      "objective": "Generate the teaser clip from the storyboard.",
+      "kind": "writing",
+      "requiredCapabilities": ["general_reasoning"],
+      "allowedTools": ["folder.write"],
+      "dependsOn": ["st_storyboard"],
+      "producesArtifact": true,
+      "risk": "low"
+    }
+  ]
+}
+</plan>`;
+
+  it('shapes a single routable image_generate subtask for an image-gen request even when the LLM returns a worker decomposition (the deterministic shaper is authoritative)', async () => {
+    const { provider, prompts } = capturingProcessor(WORKER_DECOMPOSITION_IMAGE);
+
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_worker_img',
+      userText: 'make me a poster image for the school bake sale',
+      toolScopes: [...IMAGE_GEN_SCOPES],
+      linkedFolderCount: 1,
+    });
+
+    // Authoritative deterministic shape: the LLM provider is never consulted.
+    expect(prompts).toHaveLength(0);
+    expect(plan.subtasks).toHaveLength(1);
+    const imageStep = plan.subtasks[0];
+    expect(imageStep.kind).toBe('image');
+    expect(imageStep.allowedTools).toContain('image.generate');
+    expect(imageStep.media?.operation).toBe('image_generate');
+    expect(imageStep.requiredCapabilities).toContain('image_generation');
+    // It must NOT be a multi-step worker plan and must NOT scope folder.write
+    // (the fake-SVG hand-write path).
+    expect(imageStep.allowedTools).not.toContain('folder.write');
+  });
+
+  it('shapes a single routable video_generate subtask for a video-gen request even when the LLM returns a worker decomposition', async () => {
+    const { provider, prompts } = capturingProcessor(WORKER_DECOMPOSITION_VIDEO);
+
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_worker_vid',
+      userText: 'make me a short teaser video of a sunrise over snowy mountains',
+      toolScopes: [...VIDEO_GEN_SCOPES],
+      linkedFolderCount: 1,
+    });
+
+    expect(prompts).toHaveLength(0);
+    expect(plan.subtasks).toHaveLength(1);
+    const videoStep = plan.subtasks[0];
+    expect(videoStep.kind).toBe('video');
+    expect(videoStep.allowedTools).toContain('video.generate');
+    expect(videoStep.media?.operation).toBe('video_generate');
+    expect(videoStep.requiredCapabilities).toContain('video_generation');
+    expect(videoStep.allowedTools).not.toContain('folder.write');
+  });
+
+  it('honestly degrades an image-gen INTENT when image.generate is NOT scoped (no worker decomposition, no fabricated substitute)', async () => {
+    const { provider, prompts } = capturingProcessor(WORKER_DECOMPOSITION_IMAGE);
+
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_worker_img',
+      userText: 'make me a poster image for the school bake sale',
+      toolScopes: [...IMAGE_INTENT_NO_GEN_SCOPES],
+      linkedFolderCount: 1,
+    });
+
+    // Deterministic honest-degrade: the LLM is not consulted, and the plan is a
+    // single non-media subtask with NO media tool and NO folder.write (so the
+    // worker cannot hand-write a fake SVG / design-spec .md as the deliverable).
+    expect(prompts).toHaveLength(0);
+    expect(plan.subtasks).toHaveLength(1);
+    const step = plan.subtasks[0];
+    const allTools = plan.subtasks.flatMap((s) => s.allowedTools);
+    expect(allTools).not.toContain('image.generate');
+    expect(allTools).not.toContain('folder.write');
+    expect(step.media?.operation).toBeUndefined();
+    expect(['reasoning', 'synthesis']).toContain(step.kind);
+    // The objective tells the user generation is unavailable and not to fabricate.
+    expect(`${step.title} ${step.objective}`.toLowerCase()).toMatch(
+      /not available|unavailable|can'?t generate|cannot generate/,
+    );
+    expect(`${step.objective}`.toLowerCase()).toMatch(
+      /not fabricat|do not fabricat|without fabricat|not hand-?writ|do not.*substitut|not.*svg/,
+    );
+  });
+
+  it('honestly degrades a video-gen INTENT when video.generate is NOT scoped', async () => {
+    const { provider, prompts } = capturingProcessor(WORKER_DECOMPOSITION_VIDEO);
+
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_worker_vid',
+      userText: 'make me a short teaser video of a sunrise over snowy mountains',
+      toolScopes: [...IMAGE_INTENT_NO_GEN_SCOPES],
+      linkedFolderCount: 1,
+    });
+
+    expect(prompts).toHaveLength(0);
+    expect(plan.subtasks).toHaveLength(1);
+    const step = plan.subtasks[0];
+    const allTools = plan.subtasks.flatMap((s) => s.allowedTools);
+    expect(allTools).not.toContain('video.generate');
+    expect(allTools).not.toContain('folder.write');
+    expect(step.media?.operation).toBeUndefined();
+    expect(['reasoning', 'synthesis']).toContain(step.kind);
+    expect(`${step.title} ${step.objective}`.toLowerCase()).toMatch(
+      /not available|unavailable|can'?t generate|cannot generate/,
+    );
+  });
+
+  it('does NOT hijack a read/inspect media request (no false-positive intent)', async () => {
+    // "read this image" / "what's in this photo" / "transcribe this video" must
+    // NOT trip the generation intent short-circuit — they keep the normal LLM
+    // path and never honest-degrade.
+    for (const userText of [
+      'read what is in this photo and describe it',
+      "what's in this image",
+      'transcribe the audio in this video',
+    ]) {
+      const { provider, prompts } = capturingProcessor(MINIMAL_PLAN);
+      const plan = await createTaskPlan({
+        provider,
+        model: 'gpt-5.5',
+        plannerTag: 'planner_deltaless',
+        userText,
+        // No media-gen tool scoped: if intent falsely fired, it would degrade.
+        toolScopes: [...IMAGE_INTENT_NO_GEN_SCOPES],
+        linkedFolderCount: 1,
+      });
+      // The LLM planner WAS consulted (not short-circuited by a false intent).
+      expect(prompts.length, userText).toBe(1);
+      // And the returned plan is the LLM's, not an honest-degrade single step
+      // (st_safe comes from MINIMAL_PLAN).
+      expect(plan.subtasks.map((s) => s.id), userText).toEqual(['st_safe']);
+    }
+  });
+
+  it('does NOT honest-degrade a produce-verb EDIT of an EXISTING media file referenced by phrase, no extension (M4)', async () => {
+    // A DEMONSTRATIVE reference ("this image", "this video", "this logo") names
+    // an EXISTING file the user wants edited/transformed, not a fresh generation.
+    // With the gen tool stripped these must DEFER to the LLM (which can route to
+    // image.transform/video.transform), NOT honest-degrade as if the user asked
+    // to create something new. The old extension-only referencesExistingMediaFile
+    // missed these phrase references and over-degraded.
+    for (const userText of [
+      'make this image brighter and crop it',
+      'make this video shorter and add a fade',
+      'render this logo in dark mode',
+    ]) {
+      const { provider, prompts } = capturingProcessor(MINIMAL_PLAN);
+      const plan = await createTaskPlan({
+        provider,
+        model: 'gpt-5.5',
+        plannerTag: 'planner_ref_media',
+        userText,
+        toolScopes: [...IMAGE_INTENT_NO_GEN_SCOPES],
+        linkedFolderCount: 1,
+      });
+      // The LLM planner WAS consulted (not short-circuited into honest-degrade);
+      // a retry is fine — the canned MINIMAL_PLAN lacks the image step an
+      // image-intent request expects, which is a fixture artifact, not a loop.
+      expect(prompts.length, userText).toBeGreaterThanOrEqual(1);
+      expect(plan.title.toLowerCase(), userText).not.toContain('not available');
+      expect(
+        plan.subtasks.map((s) => s.id),
+        userText,
+      ).not.toContain('st_media_unavailable');
+    }
+  });
+
+  it('STILL honest-degrades a FRESH generation request whose incidental phrase looks like an existing-media reference (M4b false-positive guard)', async () => {
+    // "the logo"/"for my video" are fresh-generation CONTEXT, not an edit of an
+    // existing file (indefinite-leaning "the" + possessive source references).
+    // With the gen tool stripped these must STILL honest-degrade (no worker), NOT
+    // defer to the LLM where a worker could fabricate an SVG/spec — the H2
+    // residual the over-broad EXISTING_MEDIA_REFERENCE_RE briefly re-opened.
+    for (const userText of [
+      'design the logo for our launch',
+      'make me a custom thumbnail for my video',
+    ]) {
+      const { provider, prompts } = capturingProcessor(WORKER_DECOMPOSITION_IMAGE);
+      const plan = await createTaskPlan({
+        provider,
+        model: 'gpt-5.5',
+        plannerTag: 'planner_fresh_media',
+        userText,
+        toolScopes: [...IMAGE_INTENT_NO_GEN_SCOPES],
+        linkedFolderCount: 1,
+      });
+      // Honest-degrade fired: the LLM was NOT consulted and the plan is the
+      // single non-media unavailable subtask.
+      expect(prompts.length, userText).toBe(0);
+      expect(
+        plan.subtasks.map((s) => s.id),
+        userText,
+      ).toContain('st_media_unavailable');
+    }
+  });
+
+  it('regression: a non-media read+summarise request still goes through the normal LLM path (short-circuits do not hijack it)', async () => {
+    const { provider, prompts } = capturingProcessor(`
+<plan id="planner_nonmedia">
+{
+  "planId": "plan_nonmedia",
+  "title": "Read and summarise files",
+  "summary": "Read two files and summarise.",
+  "subtasks": [
+    {
+      "id": "st_read",
+      "title": "Read files",
+      "objective": "Read the two named files.",
+      "kind": "file_inspection",
+      "requiredCapabilities": ["filesystem_read"],
+      "allowedTools": ["folder.read", "file.read"],
+      "dependsOn": [],
+      "producesArtifact": false,
+      "risk": "low"
+    },
+    {
+      "id": "st_summary",
+      "title": "Summarise",
+      "objective": "Summarise the two files in prose.",
+      "kind": "writing",
+      "requiredCapabilities": ["writing"],
+      "allowedTools": [],
+      "dependsOn": ["st_read"],
+      "producesArtifact": true,
+      "risk": "low"
+    }
+  ]
+}
+</plan>`);
+
+    const plan = await createTaskPlan({
+      provider,
+      model: 'gpt-5.5',
+      plannerTag: 'planner_nonmedia',
+      userText:
+        'read agent-proof-notes.md and meeting-notes.txt from my linked folder and summarise them',
+      toolScopes: [...IMAGE_GEN_SCOPES],
+      linkedFolderCount: 1,
+    });
+
+    // The LLM path ran and its multi-step plan survived.
+    expect(prompts).toHaveLength(1);
+    expect(plan.subtasks.map((s) => s.id)).toEqual(['st_read', 'st_summary']);
   });
 });

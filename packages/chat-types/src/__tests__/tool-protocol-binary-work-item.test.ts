@@ -1,10 +1,21 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  BINARY_OUTPUT_CHUNK_BYTES,
   BinaryWorkItemChunkFrameSchema,
   BinaryWorkItemWriteAckFrameSchema,
   BinaryWorkItemWriteRequestFrameSchema,
 } from "../tool-protocol";
+
+describe("binary work item chunk size (single source of truth)", () => {
+  it("is the 128 KiB frame-safe size the enclave emits and the clients must accept", () => {
+    // The enclave chunks every binary output at this size; the client MAX_CHUNKS
+    // budget is derived from it. Exported here so the enclave and BOTH clients
+    // import the SAME number — a 256 KB/128 KB drift previously halved the
+    // effective image/video size cap (BINARY_WRITE_TOO_LARGE). Keep them coupled.
+    expect(BINARY_OUTPUT_CHUNK_BYTES).toBe(128 * 1024);
+  });
+});
 
 describe("binary work item protocol", () => {
   it("validates client-only binary source chunks with invocation binding", () => {

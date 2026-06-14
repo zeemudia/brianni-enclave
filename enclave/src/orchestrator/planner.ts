@@ -157,6 +157,48 @@ export async function createTaskPlan(
   if (isFetchOnlyRequest(normalizedUserText, input.toolScopes)) {
     return fallbackPlan(input.userText, input.toolScopes);
   }
+  // Media GENERATION (text → image/video) is forced onto the deterministic
+  // single-subtask shaper when the media-gen tool IS scoped. Left to the LLM,
+  // the planner sometimes decomposes "make me a poster image" into a generic
+  // worker plan (Draft → Compose → "Generate image" → Check → Save) whose
+  // generate step never calls image.generate/video.generate; the worker then
+  // hand-writes a fake SVG + a design-spec .md and falsely reports DONE (R4/R5,
+  // live 2026-06-14). The fallback spec already shapes the correct routable
+  // kind:'image'/'video' subtask (image_generation/video_generation capability +
+  // the media-gen tool + media.operation), so make it AUTHORITATIVE here. The
+  // intent predicates require the tool in scope (the fail-closed gate strips it
+  // when no media model is routable), so this never shapes an unroutable subtask.
+  if (isImageGenerateRequest(normalizedUserText, input.toolScopes)) {
+    return fallbackPlan(input.userText, input.toolScopes);
+  }
+  if (isVideoGenerateRequest(normalizedUserText, input.toolScopes)) {
+    return fallbackPlan(input.userText, input.toolScopes);
+  }
+  // Generation INTENT present but the media-gen tool was stripped (no routable
+  // media model). Degrade HONESTLY rather than let the LLM worker-decomposition
+  // produce a fake SVG / "design spec as the deliverable" substitute: a single
+  // non-media subtask with no media/folder.write tool whose objective tells the
+  // user generation isn't available and forbids fabricating a stand-in.
+  //
+  // Gated on NOT referencing an existing media file: a true text→media
+  // generation request never names a source media file, whereas a transform of
+  // an existing file ("create a 10-second WAV clip from proof-audio.m4a") matches
+  // the produce-verb + media-noun intent (e.g. "clip") but must stay on the
+  // audio/image/video read/transform branch — handled by the normal pipeline.
+  if (
+    hasImageGenerateIntent(normalizedUserText) &&
+    !hasAnyTool(input.toolScopes, ['image.generate', 'image.edit']) &&
+    !referencesExistingMediaFile(normalizedUserText)
+  ) {
+    return honestMediaGenDegradePlan(input.userText, 'image');
+  }
+  if (
+    hasVideoGenerateIntent(normalizedUserText) &&
+    !input.toolScopes.includes('video.generate') &&
+    !referencesExistingMediaFile(normalizedUserText)
+  ) {
+    return honestMediaGenDegradePlan(input.userText, 'video');
+  }
 
   for (let attempt = 0; attempt < MAX_PLANNER_ATTEMPTS; attempt += 1) {
     if (input.abortSignal?.aborted) throw new Error('ORCHESTRATOR_CANCELLED');
@@ -592,6 +634,66 @@ function buildFallbackPlan(
       ],
     }),
   );
+}
+
+export const HONEST_MEDIA_GEN_DEGRADE_SUBTASK_ID = 'st_media_unavailable';
+
+/**
+ * The FIXED user-facing message the EXECUTOR emits for the honest media-gen
+ * degrade subtask, bypassing the LLM worker entirely (Codex review H2). The
+ * empty tool scope already stops a worker from SAVING a fabricated artifact, but
+ * it can't stop a worker from emitting fabricated SVG / "design spec" markup as
+ * its TEXT answer (prompt-only enforcement). Skipping the worker and emitting
+ * this fixed string removes that residual: no model output can stand in for the
+ * unavailable artifact. Modality is derived from the planner-set title.
+ */
+export function honestMediaGenDegradeMessage(subtask: AgentSubtask): string {
+  const isVideo = subtask.title.toLowerCase().includes('video');
+  return isVideo
+    ? "I can't generate a video right now, so I haven't produced one — and I won't hand-write a stand-in (no storyboard, SVG, or ASCII art presented as the clip). Please try again later, or tell me how else I can help."
+    : "I can't generate an image right now, so I haven't produced one — and I won't hand-write a stand-in (no SVG, ASCII art, or \"design spec\" presented as the image). Please try again later, or tell me how else I can help.";
+}
+
+/**
+ * Honest degrade for a media-GENERATION request whose media-gen tool was
+ * stripped by the fail-closed routability gate (no routable image/video model).
+ * Returns a single non-media subtask with NO media or folder.write tool so the
+ * worker cannot fabricate a stand-in. The executor SHORT-CIRCUITS this subtask
+ * by id (HONEST_MEDIA_GEN_DEGRADE_SUBTASK_ID) and emits honestMediaGenDegradeMessage
+ * WITHOUT running a worker — the objective below is the fallback contract if that
+ * short-circuit is ever bypassed. R4/R5 fake-SVG failure (live 2026-06-14).
+ */
+function honestMediaGenDegradePlan(
+  userText: string,
+  modality: 'image' | 'video',
+): AgentTaskPlan {
+  return AgentTaskPlanSchema.parse({
+    planId: `plan_${randomUUID()}`,
+    title:
+      modality === 'image'
+        ? 'Image generation not available'
+        : 'Video generation not available',
+    summary: `Calypso cannot generate ${modality === 'image' ? 'an image' : 'a video'} this turn and will say so without fabricating a substitute.`,
+    subtasks: [
+      {
+        id: HONEST_MEDIA_GEN_DEGRADE_SUBTASK_ID,
+        title:
+          modality === 'image'
+            ? 'Explain image generation is unavailable'
+            : 'Explain video generation is unavailable',
+        objective:
+          modality === 'image'
+            ? "Tell the user that image generation is not available right now, and answer the rest of the request in text. Do NOT fabricate or hand-write a substitute image (no SVG, no ASCII art, no \"design spec\" presented as the deliverable)."
+            : "Tell the user that video generation is not available right now, and answer the rest of the request in text. Do NOT fabricate or hand-write a substitute video or storyboard presented as the deliverable.",
+        kind: 'reasoning',
+        requiredCapabilities: ['general_reasoning'],
+        allowedTools: [],
+        dependsOn: [],
+        producesArtifact: true,
+        risk: 'low',
+      },
+    ],
+  });
 }
 
 function isolateWebFetchFromPrivateReads(plan: AgentTaskPlan): AgentTaskPlan {
@@ -1247,11 +1349,13 @@ const IMAGE_NOUN =
 const IMAGE_PRODUCE_VERB =
   '(make|create|generate|draw|design|paint|illustrate|render|produce|whip up|knock up|mock up)';
 
-function isImageGenerateRequest(
-  normalized: string,
-  toolScopes: readonly ToolName[],
-): boolean {
-  if (!hasAnyTool(toolScopes, ['image.generate', 'image.edit'])) return false;
+// The produce-verb + image-noun part of an image-GENERATION request, WITHOUT the
+// tool-scope gate. Used both by isImageGenerateRequest (tool present → route to
+// the image-gen shaper) and by the honest-degrade short-circuit (intent present
+// but the tool was stripped → tell the user generation is unavailable). Mirrors
+// the read-vs-produce discipline so "read this image"/"OCR the receipt" do NOT
+// match (no produce verb).
+function hasImageGenerateIntent(normalized: string): boolean {
   // produce-verb … image-noun  (e.g. "make me a poster image", "design a logo")
   if (new RegExp(`\\b${IMAGE_PRODUCE_VERB}\\b[^.?!]{0,40}\\b${IMAGE_NOUN}\\b`).test(normalized)) {
     return true;
@@ -1265,6 +1369,18 @@ function isImageGenerateRequest(
     return true;
   }
   return false;
+}
+
+function isImageGenerateRequest(
+  normalized: string,
+  toolScopes: readonly ToolName[],
+): boolean {
+  if (!hasAnyTool(toolScopes, ['image.generate', 'image.edit'])) return false;
+  // An edit/transform of an EXISTING image ("make this image brighter", "resize
+  // photo.png") is NOT a fresh generation — defer to the normal read/transform
+  // pipeline rather than short-circuiting to image_generate (Codex review P1b).
+  if (referencesExistingMediaFile(normalized)) return false;
+  return hasImageGenerateIntent(normalized);
 }
 
 // An image-PRODUCE request that edits an EXISTING image (vs a fresh generation):
@@ -1383,11 +1499,10 @@ const VIDEO_NOUN =
 const VIDEO_PRODUCE_VERB =
   '(make|create|generate|animate|produce|render|whip up|knock up|put together)';
 
-function isVideoGenerateRequest(
-  normalized: string,
-  toolScopes: readonly ToolName[],
-): boolean {
-  if (!toolScopes.includes('video.generate')) return false;
+// The produce-verb + video-noun part of a video-GENERATION request, WITHOUT the
+// tool-scope gate (see hasImageGenerateIntent). Requires a produce verb paired
+// with a video noun so "transcribe meeting.mp4" stays on the inspect branch.
+function hasVideoGenerateIntent(normalized: string): boolean {
   // produce-verb … video-noun (e.g. "make me a teaser video", "animate a clip")
   if (new RegExp(`\\b${VIDEO_PRODUCE_VERB}\\b[^.?!]{0,40}\\b${VIDEO_NOUN}\\b`).test(normalized)) {
     return true;
@@ -1401,6 +1516,48 @@ function isVideoGenerateRequest(
     return true;
   }
   return false;
+}
+
+function isVideoGenerateRequest(
+  normalized: string,
+  toolScopes: readonly ToolName[],
+): boolean {
+  if (!toolScopes.includes('video.generate')) return false;
+  // A transform of an EXISTING clip ("create a 10-second WAV clip from
+  // proof-audio.m4a") is NOT a fresh generation — defer to the normal
+  // read/transform pipeline rather than the video generator (Codex review P1b).
+  if (referencesExistingMediaFile(normalized)) return false;
+  return hasVideoGenerateIntent(normalized);
+}
+
+// True iff the request names an existing media file by extension (image/audio/
+// video). A text→media GENERATION request never references a source media file;
+// a transform/inspect of an existing one does (e.g. "create a 10-second WAV clip
+// from proof-audio.m4a"). Used to keep the honest-degrade short-circuit from
+// hijacking an existing-file transform whose produce-verb + media-noun phrasing
+// ("create … clip") happens to match generation intent.
+const EXISTING_MEDIA_FILE_RE =
+  /\.(png|jpe?g|webp|gif|bmp|svg|m4a|mp3|wav|ogg|flac|aac|mp4|mov|webm|mkv|avi)\b/;
+
+// A DEMONSTRATIVE (or explicit "attached/uploaded/existing") reference to an
+// EXISTING piece of media WITHOUT a file extension — e.g. "this image",
+// "that screenshot", "edit these clips", "the attached photo". Such a request is
+// an EDIT/transform of existing media, not a fresh generation, so the
+// honest-degrade short-circuit must DEFER to the normal (image.transform /
+// video.transform) routing instead of reporting "generation unavailable".
+// Determiners are restricted to demonstratives + explicit existence markers ON
+// PURPOSE: "the"/"my"/"your"/"our" are too indefinite/contextual — "design the
+// logo", "a thumbnail for my video" are FRESH generation, not edits, and would
+// wrongly skip honest-degrade and let a worker fabricate a substitute (Codex
+// review M4b). The indefinite "a/an" never matches (it reads as "make a NEW X").
+const EXISTING_MEDIA_REFERENCE_RE =
+  /\b(this|that|these|those|attached|uploaded|existing)\s+(image|picture|photo|pic|screenshot|graphic|logo|banner|illustration|drawing|artwork|wallpaper|avatar|sticker|thumbnail|video|clip|reel|montage|footage|recording|audio|track|sound|file)\b/;
+
+function referencesExistingMediaFile(normalized: string): boolean {
+  return (
+    EXISTING_MEDIA_FILE_RE.test(normalized) ||
+    EXISTING_MEDIA_REFERENCE_RE.test(normalized)
+  );
 }
 
 function isPdfEditRequest(

@@ -22,6 +22,7 @@
     "video.inspect",
     "video.transcribe",
     "video.transform",
+    "video.generate",
     "document.edit",
     "pdf.edit",
     "web.fetch",

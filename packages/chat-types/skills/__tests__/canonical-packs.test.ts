@@ -11,6 +11,7 @@ import {
   getActivePackOrDefault,
   getSkillPack,
   isKnownSkillPackId,
+  scopePackToPlan,
 } from "../index";
 import {
   BANNED_PACK_IDS,
@@ -32,6 +33,26 @@ describe("canonical packs", () => {
     // stay on web.fetch. Inherited by the non-restrictive specialist packs.
     expect(defaultPack.toolScopes).toContain("research.ask");
     expect(defaultPack.toolScopes).toContain("web.fetch");
+  });
+
+  it("General base scopes video.generate so text→video generation is routable (finding 18)", () => {
+    // The video pipeline (PR #99: veo enabled in the signed registry + the Veo
+    // adapter + the 8105 checkpoint broker) is wired, but the fail-closed
+    // videoGenerateRoutable gate only opens when the ACTIVE pack scopes
+    // video.generate. Without it here, veo is filtered out of routing and the
+    // planner's deterministic video shaper never fires — video generation is
+    // dead regardless of the registry. Mirrors image.generate, which IS scoped.
+    expect(defaultPack.toolScopes).toContain("video.generate");
+    // video.render stays UNSCOPED on purpose: no render backend is wired, so the
+    // fail-closed gate must keep it off (an unrenderable composition subtask).
+    expect(defaultPack.toolScopes).not.toContain("video.render");
+  });
+
+  it("video.generate is a PAID media tool: kept for PRO/MAX, narrowed away on FREE", () => {
+    const pro = scopePackToPlan(getEffectiveSkillPack(DEFAULT_PACK_ID), "PRO");
+    expect(pro.toolScopes).toContain("video.generate");
+    const free = scopePackToPlan(getEffectiveSkillPack(DEFAULT_PACK_ID), "FREE");
+    expect(free.toolScopes).not.toContain("video.generate");
   });
 
   it("career pack parses", () => {

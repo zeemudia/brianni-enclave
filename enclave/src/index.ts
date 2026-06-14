@@ -2136,6 +2136,65 @@ export class EnclaveRouter {
                 }),
               );
             },
+            // SELF-EMITTING invokeClient for an air-gapped research subagent's
+            // sibling gateway. The plain `invokeClient` above relies on the main
+            // orchestrator pump's `tool-invocation` case to EMIT the
+            // TOOL_INVOCATION wire frame; it only awaits the (pre-registered)
+            // resolver. But a sibling's web.fetch never reaches that pump — its
+            // loop events are consumed privately by runResearchSubagent (the air
+            // gap), and the pump is parked inside gateway.dispatch(research.ask)
+            // awaiting approveQuery. So the plain path created a resolver no
+            // frame ever satisfied → INVOCATION_TIMEOUT → zero sources → "no web
+            // access". This variant fixes the suspended-pump problem the same
+            // way approveQuery does: build + register the resolver, then push
+            // the TOOL_INVOCATION frame onto outQueue itself. The client/server
+            // reverse-channel routes the TOOL_RESULT back by (sessionId,
+            // agentTurnId, invocationId) into outstandingInvocations exactly as
+            // for a pump-emitted frame — no client/server change needed.
+            invokeClientFromSibling: (frame: ToolInvocationFrame) => {
+              // R11 Finding A (race-safety): register the resolver BEFORE the
+              // wire frame goes out so a fast client cannot POST the
+              // TOOL_RESULT before outstandingInvocations.set runs.
+              // buildResolverPromise self-registers into outstandingInvocations
+              // + invocationTimeoutRefreshers, so we do NOT double-register.
+              const key = invocationKey(
+                sessionId!,
+                frame.agentTurnId,
+                frame.invocationId,
+              );
+              // Air-gap defense-in-depth (Codex review M2): the sibling research
+              // subagent dispatches each web.fetch under a FRESH invocationId, so
+              // a key already in flight means a duplicate self-emit. Pushing a
+              // second TOOL_INVOCATION would run the (non-idempotent) web.fetch
+              // twice on the client while only the first TOOL_RESULT resolves —
+              // a wasted/possibly-leaky egress. There is no path that does this
+              // today; fail FAST + OBSERVABLY if a future caller ever forwards a
+              // sibling event through both the pump and this self-emit.
+              if (
+                this.outstandingInvocations.has(key) ||
+                this.preRegisteredResolverPromises.has(key)
+              ) {
+                throw new Error(
+                  `SIBLING_INVOCATION_ALREADY_IN_FLIGHT:${frame.invocationId}`,
+                );
+              }
+              const promise = buildResolverPromise(
+                key,
+                frame.invocationId,
+                clientInvocationTimeoutMs(frame.toolName, {
+                  invocationTimeoutMs: this.invocationTimeoutMs,
+                  confirmationGatedWriteTimeoutMs:
+                    DEFAULT_BINARY_WRITE_ACK_TIMEOUT_MS,
+                }),
+              );
+              return encryptChunk(
+                sessionKey,
+                Buffer.from(JSON.stringify(frame)),
+              ).then((encrypted) => {
+                outQueue.push(encodeFrame(MSG.TOOL_INVOCATION, encrypted));
+                return promise;
+              });
+            },
             // Layer 3: surface the EXACT compiled outbound query to the client
             // for mid-turn approval. Called from tier-research.run, which runs
             // inside gateway.dispatch(research.ask) while the orchestrator is

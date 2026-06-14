@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ModelCapability } from '@calypso/chat-types';
+import { DEFAULT_PACK_ID, getEffectiveSkillPack } from '@calypso/chat-types/skills';
 import {
   isVideoGenerationRoutable,
   computeMediaToolStripSet,
@@ -43,6 +44,18 @@ describe('isVideoGenerationRoutable', () => {
         ['video.generate'],
       ),
     ).toBe(false);
+  });
+
+  // Regression guard for finding 18 — tests the gate THROUGH the real canonical
+  // pack, not injected scopes. The other cases pass `['video.generate']` directly,
+  // which is exactly why a pack that never scoped video.generate slipped past CI
+  // while video was dead live. The control (stripping the scope) proves this is
+  // not a tautology: with the real pack veo routes; remove the scope and it doesn't.
+  it('veo routes through the REAL General pack toolScopes — and NOT without the scope (finding 18)', () => {
+    const realScopes = getEffectiveSkillPack(DEFAULT_PACK_ID).toolScopes;
+    expect(isVideoGenerationRoutable([veo], realScopes)).toBe(true);
+    const withoutVideoGen = realScopes.filter((tool) => tool !== 'video.generate');
+    expect(isVideoGenerationRoutable([veo], withoutVideoGen)).toBe(false);
   });
 });
 
