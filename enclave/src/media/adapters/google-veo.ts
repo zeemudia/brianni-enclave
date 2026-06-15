@@ -25,7 +25,14 @@ interface VeoVideoSample {
 interface VeoOperationResponse {
   videos?: VeoVideoSample[];
   generatedVideos?: Array<{ video?: VeoVideoSample }>;
-  generateVideoResponse?: { generatedSamples?: Array<{ video?: VeoVideoSample }> };
+  generateVideoResponse?: {
+    generatedSamples?: Array<{ video?: VeoVideoSample }>;
+    // Present when Veo's responsible-AI filter dropped samples — the ONLY
+    // billing-adjacent/usage-adjacent fields the response carries are these RAI
+    // counters; there is no quota/usage/cost field anywhere in the operation.
+    raiMediaFilteredCount?: number;
+    raiMediaFilteredReasons?: string[];
+  };
 }
 
 // Pull the first generated clip from any known Veo response shape, or null when
@@ -128,6 +135,17 @@ export class GoogleVeoVideoAdapter implements VideoProviderAdapter {
     // as a Files API URI that must be downloaded with the API key (large clips).
     const sample = extractVideoSample(body.response);
     if (!sample) {
+      // Veo's responsible-AI filter can drop every sample and explain why in
+      // `raiMediaFilteredReasons` (a common Veo 3.1 false-positive). Surface that
+      // as an honest, specific failure rather than a generic missing-video so the
+      // user sees WHY the clip was blocked and the turn degrades cleanly.
+      const raiReasons = body.response?.generateVideoResponse?.raiMediaFilteredReasons;
+      if (Array.isArray(raiReasons) && raiReasons.length > 0) {
+        return {
+          status: "failed",
+          reason: `PROVIDER_VIDEO_SAFETY_FILTERED:${raiReasons.join("; ").slice(0, 200)}`,
+        };
+      }
       // Surface the observed top-level keys (NOT any bytes/uri) in the reason so a
       // live shape-miss is debuggable from the orchestrator media-job detail
       // without enclave logs — the prior bare code hid which shape arrived.
@@ -145,17 +163,35 @@ export class GoogleVeoVideoAdapter implements VideoProviderAdapter {
       return { status: "failed", reason: `PROVIDER_RESULT_MISSING_VIDEO:${observed}` };
     }
 
-    const actualQuotaUnits = body.metadata?.billing?.quotaUnits;
-    if (typeof actualQuotaUnits !== "number" || !Number.isInteger(actualQuotaUnits) || actualQuotaUnits <= 0) {
-      return { status: "billing_pending", reason: "PROVIDER_BILLING_METADATA_MISSING" };
+    // The Google Veo operation response carries NO billing/quota field — billing
+    // is metered separately on Google's side, never echoed in the operation.
+    // (Confirmed against the live API + the google-genai GenerateVideosResponse
+    // type.) So we DELIVER the generated clip unconditionally and only attach a
+    // provider quota figure on the off chance a future provider revision ever
+    // returns one; otherwise the enclave bills its own duration estimate, exactly
+    // as image generation bills a fixed estimate. The clip is NEVER withheld
+    // waiting for a field that does not exist.
+    const mimeType = sample.mimeType === "video/webm" ? "video/webm" : "video/mp4";
+    const providerQuotaUnits = body.metadata?.billing?.quotaUnits;
+    if (
+      typeof providerQuotaUnits === "number" &&
+      Number.isInteger(providerQuotaUnits) &&
+      providerQuotaUnits > 0
+    ) {
+      return {
+        status: "done",
+        videoBytes,
+        mimeType,
+        actualQuotaUnits: providerQuotaUnits,
+        billingReceiptId: body.metadata?.billing?.receiptId,
+        billingSource: "provider_operation_metadata",
+      };
     }
     return {
       status: "done",
       videoBytes,
-      mimeType: sample.mimeType === "video/webm" ? "video/webm" : "video/mp4",
-      actualQuotaUnits,
-      billingReceiptId: body.metadata?.billing?.receiptId,
-      billingSource: "provider_operation_metadata",
+      mimeType,
+      billingSource: "enclave_duration_estimate",
     };
   }
 

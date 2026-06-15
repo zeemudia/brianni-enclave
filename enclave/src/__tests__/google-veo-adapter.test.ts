@@ -139,6 +139,91 @@ describe("GoogleVeoVideoAdapter", () => {
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
+  it("delivers the clip even when the done operation carries NO billing metadata (the real Veo shape)", async () => {
+    // Google's Veo predictLongRunning operation returns the video at
+    // response.generateVideoResponse.generatedSamples[].video.uri and carries
+    // NO billing/quota/usage field anywhere (confirmed against the live API and
+    // the google-genai GenerateVideosResponse type). The adapter must still
+    // deliver the clip and let the enclave bill the duration estimate — it must
+    // NOT withhold a generated clip waiting for a field that never arrives.
+    const videoBytes = Buffer.from("real-veo-clip");
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            done: true,
+            response: {
+              generateVideoResponse: {
+                generatedSamples: [
+                  {
+                    video: {
+                      uri: "https://generativelanguage.googleapis.com/v1beta/files/xyz:download?alt=media",
+                      mimeType: "video/mp4",
+                    },
+                  },
+                ],
+              },
+            },
+            // NO `metadata` at all — exactly what the real API returns.
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(videoBytes, { status: 200, headers: { "content-type": "video/mp4" } }),
+      );
+    const adapter = new GoogleVeoVideoAdapter({
+      baseUrl: "https://generativelanguage.googleapis.com",
+      apiKey: "test-key",
+      fetchFn,
+    });
+
+    const completed = await adapter.poll({ providerJobId: "operations/op-12", abortSignal: undefined });
+    expect(completed.status).toBe("done");
+    if (completed.status === "done") {
+      expect(Buffer.from(completed.videoBytes).toString()).toBe("real-veo-clip");
+      expect(completed.mimeType).toBe("video/mp4");
+      // No provider billing field → the adapter reports no provider quota and
+      // flags that the enclave must bill its own duration estimate.
+      expect(completed.actualQuotaUnits).toBeUndefined();
+      expect(completed.billingSource).toBe("enclave_duration_estimate");
+    }
+  });
+
+  it("surfaces an RAI safety-filter block as an honest failure (not a generic missing-video)", async () => {
+    // When Veo's responsible-AI filter drops every sample, the done operation
+    // has no generatedSamples and explains why in raiMediaFilteredReasons. This
+    // is a common Veo 3.1 false-positive and must degrade honestly.
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          done: true,
+          response: {
+            generateVideoResponse: {
+              raiMediaFilteredCount: 1,
+              raiMediaFilteredReasons: [
+                "Video generation blocked by safety filters (audio).",
+              ],
+            },
+          },
+        }),
+        { status: 200 },
+      ),
+    );
+    const adapter = new GoogleVeoVideoAdapter({
+      baseUrl: "https://generativelanguage.googleapis.com",
+      apiKey: "test-key",
+      fetchFn,
+    });
+    const completed = await adapter.poll({ providerJobId: "operations/op-13", abortSignal: undefined });
+    expect(completed.status).toBe("failed");
+    if (completed.status === "failed") {
+      expect(completed.reason).toContain("PROVIDER_VIDEO_SAFETY_FILTERED");
+      expect(completed.reason).toContain("safety filters");
+    }
+  });
+
   it("surfaces the actual response key set when no known video shape matches", async () => {
     const fetchFn = vi.fn().mockResolvedValueOnce(
       new Response(

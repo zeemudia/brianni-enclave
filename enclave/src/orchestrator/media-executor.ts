@@ -255,9 +255,11 @@ export const PENDING_START_UNRECOVERABLE_SENTINEL = "unknown:pending_start_unrec
 // without trying to poll an adapter that does not exist.
 export const PROVIDER_STARTED_UNREACHABLE_SENTINEL_PREFIX = "unreachable:provider_started:";
 
-// Fixed quota estimate per generated image (no per-request billing metadata
-// like video operations expose). The adapter returns the actual units for the
-// reconcile; this is the up-front hold.
+// Fixed quota estimate per generated image. Neither image NOR video provider
+// responses carry per-request billing metadata — Google meters usage on its own
+// side and never echoes a quota figure in the response/operation. So images bill
+// this fixed estimate and videos bill a duration-based estimate; in both cases
+// the up-front reserve and the debit use the enclave's own estimate.
 const IMAGE_GENERATE_QUOTA_UNITS = 4;
 // Output artifacts (generated images) live in the same short-lived custody
 // window as other generated media.
@@ -535,17 +537,23 @@ export async function* runMediaSubtask(
   // only re-polls the provider job and re-delivers the already-paid asset. In
   // that case `holdId` stays null and every hold settle below is a no-op.
   const alreadyBilled = existingCheckpoint?.state === "delivery_pending";
+  // Duration-based quota estimate, computed up front because it drives BOTH the
+  // up-front reserve AND the debit fallback below. Google's Veo operation
+  // response carries no billing/quota figure, so a generated clip is billed
+  // against this estimate — the same way image generation bills a fixed
+  // estimate (a clip is never withheld waiting for a provider field that the
+  // real API never returns).
+  const estimate = estimateVideoQuotaUnits({
+    providerId: effectiveProviderId,
+    modelId: effectiveModelId,
+    durationSeconds: deps.subtask.media.maxDurationSeconds ?? 8,
+    width: 1080,
+    height: 1920,
+    audio: true,
+    safetyMarginPercent: 30,
+  });
   let holdId: string | null = null;
   if (!alreadyBilled) {
-    const estimate = estimateVideoQuotaUnits({
-      providerId: effectiveProviderId,
-      modelId: effectiveModelId,
-      durationSeconds: deps.subtask.media.maxDurationSeconds ?? 8,
-      width: 1080,
-      height: 1920,
-      audio: true,
-      safetyMarginPercent: 30,
-    });
     const hold = await reserveVideoBudget({
       mediaJobId: ids.mediaJobId,
       estimate,
@@ -904,17 +912,6 @@ export async function* runMediaSubtask(
       await delay(deps.providerPollDelayMs ?? 5_000, deps.abortSignal);
     }
     if (!result || result.status !== "done") {
-      if (result?.status === "billing_pending" && holdId) {
-        await deps.budgetClient.reconcile({
-          holdId,
-          status: "billing_pending_provider",
-        });
-        await deps.checkpointClient.markBillingPending({
-          mediaJobId: ids.mediaJobId,
-          providerJobId,
-          observedAt: (deps.now ?? new Date()).toISOString(),
-        });
-      }
       yield {
         kind: "orchestrator-media-job-progress",
         planId: deps.planId,
@@ -923,7 +920,7 @@ export async function* runMediaSubtask(
         status: result?.status === "failed" ? "error" : "running",
         label: deps.subtask.title,
         detail:
-          result?.status === "failed" || result?.status === "billing_pending"
+          result?.status === "failed"
             ? result.reason
             : "PROVIDER_STILL_RUNNING_RESUME_SCHEDULED",
         progressPercent: result?.status === "running" ? result.progressPercent : undefined,
@@ -1058,7 +1055,10 @@ export async function* runMediaSubtask(
       await deps.budgetClient.reconcile({
         holdId: holdId!,
         status: "debited",
-        actualQuotaUnits: result.actualQuotaUnits,
+        // The provider rarely (here: never) echoes a usage figure, so fall back
+        // to the duration estimate's billable units — billing the generation we
+        // produced, not a non-existent provider field.
+        actualQuotaUnits: result.actualQuotaUnits ?? estimate.estimatedBillableQuotaUnits,
         billingReceiptId: result.billingReceiptId,
       });
       debited = true;
@@ -1693,8 +1693,6 @@ export async function reconcileCancelledProviderCompletions(deps: {
     ...cancelledJobs.map((job) => ({ ...job, kind: "cancelled" as const })),
     ...billingPendingJobs.map((job) => ({ ...job, kind: "billing_pending" as const })),
   ];
-  const now = deps.now ?? new Date();
-  const billingMetadataSlaMs = deps.billingMetadataSlaMs ?? 60 * 60 * 1000;
   // Helper: alert emission must never throw out of the per-job try/catch.
   // A degraded alert sink would otherwise tear down the sweep on the same
   // iteration it was meant to protect. Returns `true` only when the alert
@@ -1822,36 +1820,18 @@ export async function reconcileCancelledProviderCompletions(deps: {
       continue;
     }
     try {
-      if (result.status === "running" || result.status === "billing_pending") {
-        if (
-          job.kind === "billing_pending" &&
-          !job.slaAlertedAt &&
-          now.getTime() - new Date(job.firstBillingPendingAt).getTime() >= billingMetadataSlaMs
-        ) {
-          await safeAlert({
-            code: "VIDEO_BILLING_METADATA_SLA_EXCEEDED",
-            mediaJobId: job.mediaJobId,
-            providerId: job.providerId,
-            providerJobId: job.providerJobId,
-            firstBillingPendingAt: job.firstBillingPendingAt,
-            billingPendingPollCount: job.billingPendingPollCount,
-          });
-          await deps.disableProviderModel?.({
-            providerId: job.providerId,
-            reason: "VIDEO_BILLING_METADATA_SLA_EXCEEDED",
-          });
-          await deps.checkpointClient.markBillingSlaEscalated({
-            mediaJobId: job.mediaJobId,
-            alertedAt: now.toISOString(),
-            providerDisabledAt: now.toISOString(),
-          });
-        }
+      if (result.status === "running") {
+        // Still generating upstream — settle on a later tick.
         continue;
       }
       if (result.status === "done") {
         await deps.budgetClient.reconcile({
           holdId: job.holdId,
           status: "debited",
+          // The Veo operation echoes no usage figure, so an orphaned/cancelled
+          // job the provider actually completed is billed against its reserved
+          // hold (actualQuotaUnits omitted → the broker settles the reserved
+          // units). The provider value is forwarded only if one is ever present.
           actualQuotaUnits: result.actualQuotaUnits,
           billingReceiptId: result.billingReceiptId,
         });

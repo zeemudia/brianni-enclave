@@ -241,41 +241,4 @@ describe('runVideoReconcilerOnce', () => {
     ).resolves.toBeUndefined();
     expect(logs.some((l) => l.msg.includes('stale-delivery'))).toBe(true);
   });
-
-  it('forwards an SLA-breach alert to the injected alert sink', async () => {
-    const forwarded: Array<{ code: string }> = [];
-    const longAgo = new Date('2026-06-13T00:00:00.000Z').toISOString();
-    await runVideoReconcilerOnce({
-      videoAdapters: {
-        google: {
-          start: async () => ({ providerJobId: 'op_1' }),
-          poll: async () => ({
-            status: 'billing_pending' as const,
-            reason: 'PROVIDER_BILLING_METADATA_MISSING' as const,
-          }),
-        },
-      },
-      disabledVideoProviders: new Set(),
-      billingMetadataSlaMs: 1, // any positive age trips the SLA
-      now: new Date('2026-06-13T12:00:00.000Z'),
-      checkpointClient: {
-        ...noopCheckpoint,
-        listBillingPending: async () => [
-          {
-            mediaJobId: 'mj_1',
-            providerId: 'google',
-            providerJobId: 'op_1',
-            holdId: 'hold_1',
-            firstBillingPendingAt: longAgo,
-            billingPendingPollCount: 5,
-          },
-        ],
-      },
-      budgetClient: noopBudget,
-      alertSink: async (alert) => {
-        forwarded.push(alert);
-      },
-    });
-    expect(forwarded.some((a) => a.code === 'VIDEO_BILLING_METADATA_SLA_EXCEEDED')).toBe(true);
-  });
 });

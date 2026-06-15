@@ -9,6 +9,7 @@ import {
   runMediaSubtask,
 } from "../orchestrator/media-executor";
 import { BinaryWorkItemManager } from "../tools/binary-work-items";
+import { estimateVideoQuotaUnits } from "../media/budget";
 
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -267,6 +268,80 @@ describe("orchestrator media executor", () => {
     // Terminal hygiene so a resume cannot re-deliver.
     expect(terminals.some((t) => t.terminalState === "debited")).toBe(true);
     expect(events.some((e) => e.status === "done")).toBe(true);
+  });
+
+  it("delivers and bills the duration estimate when the provider returns NO usage figure (the real Veo case)", async () => {
+    // The real Google Veo operation carries no billing/quota field, so the
+    // adapter returns `done` with NO actualQuotaUnits. The executor must still
+    // deliver the clip and bill the duration-based estimate — never withhold the
+    // generated asset and never debit `undefined`.
+    const expectedUnits = estimateVideoQuotaUnits({
+      providerId: "google",
+      modelId: baseRoute.modelId,
+      durationSeconds: baseGenerateMedia.maxDurationSeconds ?? 8,
+      width: 1080,
+      height: 1920,
+      audio: true,
+      safetyMarginPercent: 30,
+    }).estimatedBillableQuotaUnits;
+    expect(expectedUnits).toBeGreaterThan(0);
+
+    const events: any[] = [];
+    const reconciles: any[] = [];
+    const ack = fakeBinaryWriteAck("ok");
+    for await (const event of runMediaSubtask({
+      agentTurnId: "turn_1",
+      planId: "plan_1",
+      subtask: { ...baseSubtask, media: baseGenerateMedia },
+      route: baseRoute,
+      videoAdapters: {
+        google: {
+          start: async () => ({ providerJobId: "op-1" }),
+          poll: async () => ({
+            status: "done",
+            videoBytes: new TextEncoder().encode("mp4"),
+            mimeType: "video/mp4",
+            // No actualQuotaUnits — exactly what the real Veo adapter returns.
+            billingSource: "enclave_duration_estimate",
+          }),
+        },
+      },
+      providerInput: baseProviderInput,
+      recordsByHandleId: makeRecords(),
+      handleStore,
+      provenanceSigner,
+      consentVerifier,
+      budgetClient: {
+        reserve: async () => ({ ok: true, holdId: "hold_1" }) as const,
+        reconcile: async (input) => {
+          reconciles.push(input);
+        },
+      },
+      checkpointClient,
+      binaryWorkItems: new BinaryWorkItemManager({ sweepIntervalMs: null }),
+      awaitBinaryWriteAck: ack.fn,
+      linkedFolders: [],
+      sessionId: "sess_1",
+      now: FIXED_NOW,
+      maxProviderPolls: 1,
+      providerPollDelayMs: 0,
+      encryptArtifact: async () => ({
+        artifactId: "artifact_1",
+        ciphertextRef: "",
+        sha256: sha256(new TextEncoder().encode("mp4")),
+        byteSize: 3,
+      }),
+    })) {
+      events.push(event);
+    }
+
+    // The clip was delivered (binary write happened) and the turn completed.
+    expect(events.some((e) => e.kind === "binary-write-request")).toBe(true);
+    expect(events.some((e) => e.status === "done")).toBe(true);
+    // Billed the duration estimate — a real positive figure, never undefined.
+    const debit = reconciles.find((r) => r.status === "debited");
+    expect(debit).toBeDefined();
+    expect(debit.actualQuotaUnits).toBe(expectedUnits);
   });
 
   it("bills the generation even when the user declines the folder save (delivered + viewed asset, no refund)", async () => {
@@ -1051,16 +1126,28 @@ describe("orchestrator media executor", () => {
     expect(terminals).toEqual([{ mediaJobId: "mj_1", terminalState: "debited" }]);
   });
 
-  it("keeps cancelled provider jobs open while billing metadata is pending", async () => {
+  it("settles a cancelled-then-done Veo job against its held quota when the provider reports no usage figure", async () => {
+    // Real Veo returns `done` with NO actualQuotaUnits. A cancelled/orphaned job
+    // the provider nonetheless completed must still settle on a reconciler tick:
+    // DEBIT (bill-on-generation — the provider cost was spent), never release
+    // (that would be a free asset) and never crash on the undefined. The primary
+    // done-path can true-up to the duration estimate because it still holds it in
+    // scope; the reconciler cannot (the checkpoint row carries no duration), so it
+    // intentionally bills the amount already HELD for the job — forwarding
+    // actualQuotaUnits:undefined makes the broker settle the reserved units.
     const reconciles: any[] = [];
     const terminals: any[] = [];
-    const alerts: any[] = [];
-    const overrides: any[] = [];
     await reconcileCancelledProviderCompletions({
       videoAdapters: {
         google: {
           start: async () => ({ providerJobId: "unused" }),
-          poll: async () => ({ status: "billing_pending", reason: "PROVIDER_BILLING_METADATA_MISSING" }),
+          poll: async () => ({
+            status: "done",
+            videoBytes: new TextEncoder().encode("mp4"),
+            mimeType: "video/mp4",
+            // No actualQuotaUnits — exactly what the fixed Veo adapter returns.
+            billingSource: "enclave_duration_estimate",
+          }),
         },
       },
       budgetClient: {
@@ -1078,102 +1165,13 @@ describe("orchestrator media executor", () => {
           terminals.push(input);
         },
       },
-      emitOperatorAlert: async (input) => {
-        alerts.push(input);
-      },
-      disableProviderModel: async (input) => {
-        overrides.push(input);
-      },
-      now: new Date("2026-05-19T10:00:00.000Z"),
-      billingMetadataSlaMs: 60 * 60 * 1000,
     });
 
-    expect(reconciles).toEqual([]);
-    expect(terminals).toEqual([]);
-    expect(alerts).toEqual([]);
-    expect(overrides).toEqual([]);
-  });
-
-  it("alerts and disables a provider model when billing-pending jobs exceed the SLA", async () => {
-    const alerts: any[] = [];
-    const overrides: any[] = [];
-    const escalations: any[] = [];
-    await reconcileCancelledProviderCompletions({
-      videoAdapters: {
-        google: {
-          start: async () => ({ providerJobId: "unused" }),
-          poll: async () => ({ status: "billing_pending", reason: "PROVIDER_BILLING_METADATA_MISSING" }),
-        },
-      },
-      budgetClient,
-      checkpointClient: {
-        ...checkpointClient,
-        listBillingPending: async () => [
-          {
-            mediaJobId: "mj_1",
-            providerId: "google",
-            providerJobId: "op_1",
-            holdId: "hold_1",
-            firstBillingPendingAt: "2026-05-19T08:00:00.000Z",
-            billingPendingPollCount: 12,
-          },
-        ],
-        markBillingSlaEscalated: async (input) => {
-          escalations.push(input);
-        },
-      },
-      emitOperatorAlert: async (input) => {
-        alerts.push(input);
-      },
-      disableProviderModel: async (input) => {
-        overrides.push(input);
-      },
-      now: new Date("2026-05-19T10:00:00.000Z"),
-      billingMetadataSlaMs: 60 * 60 * 1000,
-    });
-
-    expect(alerts.some((a) => a.code === "VIDEO_BILLING_METADATA_SLA_EXCEEDED" && a.mediaJobId === "mj_1")).toBe(true);
-    expect(overrides.some((o) => o.providerId === "google" && o.reason === "VIDEO_BILLING_METADATA_SLA_EXCEEDED")).toBe(true);
-    expect(escalations.some((e) => e.mediaJobId === "mj_1" && e.alertedAt === "2026-05-19T10:00:00.000Z")).toBe(true);
-  });
-
-  it("does not emit duplicate billing SLA alerts for already-escalated jobs", async () => {
-    const alerts: any[] = [];
-    const overrides: any[] = [];
-    await reconcileCancelledProviderCompletions({
-      videoAdapters: {
-        google: {
-          start: async () => ({ providerJobId: "unused" }),
-          poll: async () => ({ status: "billing_pending", reason: "PROVIDER_BILLING_METADATA_MISSING" }),
-        },
-      },
-      budgetClient,
-      checkpointClient: {
-        ...checkpointClient,
-        listBillingPending: async () => [
-          {
-            mediaJobId: "mj_1",
-            providerId: "google",
-            providerJobId: "op_1",
-            holdId: "hold_1",
-            firstBillingPendingAt: "2026-05-19T08:00:00.000Z",
-            billingPendingPollCount: 25,
-            slaAlertedAt: "2026-05-19T09:05:00.000Z",
-          },
-        ],
-      },
-      emitOperatorAlert: async (input) => {
-        alerts.push(input);
-      },
-      disableProviderModel: async (input) => {
-        overrides.push(input);
-      },
-      now: new Date("2026-05-19T10:00:00.000Z"),
-      billingMetadataSlaMs: 60 * 60 * 1000,
-    });
-
-    expect(alerts).toEqual([]);
-    expect(overrides).toEqual([]);
+    expect(reconciles).toHaveLength(1);
+    // Debited (billed), NOT released — no free asset, no stranded hold.
+    expect(reconciles[0]).toMatchObject({ holdId: "hold_1", status: "debited" });
+    expect(reconciles[0].actualQuotaUnits).toBeUndefined();
+    expect(terminals).toEqual([{ mediaJobId: "mj_1", terminalState: "debited" }]);
   });
 
   it("releases budget holds when pending_start is not durable before provider start", async () => {

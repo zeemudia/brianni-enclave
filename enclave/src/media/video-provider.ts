@@ -26,14 +26,23 @@ export interface StartedVideoJob {
 
 export type PolledVideoJob =
   | { status: "running"; progressPercent?: number }
-  | { status: "billing_pending"; reason: "PROVIDER_BILLING_METADATA_MISSING" }
   | {
       status: "done";
       videoBytes: Uint8Array;
       mimeType: "video/mp4" | "video/webm";
-      actualQuotaUnits: number;
+      // The Google Veo `predictLongRunning` operation response carries NO
+      // billing/quota/usage field (confirmed against the live API and the
+      // google-genai GenerateVideosResponse type). So `actualQuotaUnits` is
+      // OPTIONAL: present only if a provider ever echoes a usage figure;
+      // otherwise the enclave bills its own duration estimate (the same way
+      // image generation bills a fixed estimate). A generated clip must NEVER be
+      // withheld waiting for a provider billing field that does not exist.
+      actualQuotaUnits?: number;
       billingReceiptId?: string;
-      billingSource: "provider_final" | "provider_operation_metadata";
+      billingSource:
+        | "provider_final"
+        | "provider_operation_metadata"
+        | "enclave_duration_estimate";
     }
   | { status: "failed"; reason: string };
 
