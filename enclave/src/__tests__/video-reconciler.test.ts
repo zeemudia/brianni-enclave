@@ -149,6 +149,99 @@ describe('runVideoReconcilerOnce', () => {
     expect(terminals.some((t) => t.terminalState === 'debited')).toBe(true);
   });
 
+  it('emits a VIDEO_DELIVERY_PENDING_STALE alert when stuck delivery_pending rows exceed the threshold', async () => {
+    const forwarded: Array<{ code: string; count?: number; sample?: unknown[] }> = [];
+    await runVideoReconcilerOnce({
+      videoAdapters: {},
+      disabledVideoProviders: new Set(),
+      checkpointClient: {
+        ...noopCheckpoint,
+        listStuckDeliveryPending: async () => ({
+          count: 30,
+          sample: [
+            { mediaJobId: 'mj_1', providerId: 'google', deliveredPendingAt: '2026-06-14T10:00:00.000Z' },
+          ],
+        }),
+      },
+      budgetClient: noopBudget,
+      staleDeliveryAlertThreshold: 20,
+      alertSink: async (alert) => {
+        forwarded.push(alert as { code: string; count?: number });
+      },
+    });
+    const stale = forwarded.find((a) => a.code === 'VIDEO_DELIVERY_PENDING_STALE');
+    expect(stale).toBeTruthy();
+    expect(stale?.count).toBe(30);
+    expect(stale?.sample).toHaveLength(1);
+  });
+
+  it('suppresses repeat VIDEO_DELIVERY_PENDING_STALE alerts within the window, re-alerts after it (cross-tick dedup)', async () => {
+    const forwarded: Array<{ code: string }> = [];
+    const staleAlertState: { lastStaleAlertAt?: number } = {};
+    const base = {
+      videoAdapters: {},
+      disabledVideoProviders: new Set<string>(),
+      checkpointClient: {
+        ...noopCheckpoint,
+        listStuckDeliveryPending: async () => ({ count: 30, sample: [] }),
+      },
+      budgetClient: noopBudget,
+      staleDeliveryAlertThreshold: 20,
+      staleAlertSuppressionMs: 60 * 60 * 1000,
+      staleAlertState,
+      alertSink: async (alert: { code: string }) => {
+        forwarded.push(alert);
+      },
+    };
+    const staleCount = () =>
+      forwarded.filter((a) => a.code === 'VIDEO_DELIVERY_PENDING_STALE').length;
+
+    // Tick 1 → alert. Tick 2 five minutes later (within window) → suppressed.
+    await runVideoReconcilerOnce({ ...base, now: new Date('2026-06-15T00:00:00.000Z') });
+    await runVideoReconcilerOnce({ ...base, now: new Date('2026-06-15T00:05:00.000Z') });
+    expect(staleCount()).toBe(1);
+    // Tick 3 two hours later (past window) → re-alert.
+    await runVideoReconcilerOnce({ ...base, now: new Date('2026-06-15T02:00:00.000Z') });
+    expect(staleCount()).toBe(2);
+  });
+
+  it('does NOT alert when the stuck delivery_pending count is at or below the threshold', async () => {
+    const forwarded: Array<{ code: string }> = [];
+    await runVideoReconcilerOnce({
+      videoAdapters: {},
+      disabledVideoProviders: new Set(),
+      checkpointClient: {
+        ...noopCheckpoint,
+        listStuckDeliveryPending: async () => ({ count: 20, sample: [] }),
+      },
+      budgetClient: noopBudget,
+      staleDeliveryAlertThreshold: 20,
+      alertSink: async (alert) => {
+        forwarded.push(alert as { code: string });
+      },
+    });
+    expect(forwarded.some((a) => a.code === 'VIDEO_DELIVERY_PENDING_STALE')).toBe(false);
+  });
+
+  it('isolates a stale-delivery list failure (does not throw, does not block the sweep)', async () => {
+    const logs: Array<{ msg: string }> = [];
+    await expect(
+      runVideoReconcilerOnce({
+        videoAdapters: {},
+        disabledVideoProviders: new Set(),
+        checkpointClient: {
+          ...noopCheckpoint,
+          listStuckDeliveryPending: async () => {
+            throw new Error('VIDEO_CHECKPOINT_BROKER_UNREACHABLE');
+          },
+        },
+        budgetClient: noopBudget,
+        log: (msg) => logs.push({ msg }),
+      }),
+    ).resolves.toBeUndefined();
+    expect(logs.some((l) => l.msg.includes('stale-delivery'))).toBe(true);
+  });
+
   it('forwards an SLA-breach alert to the injected alert sink', async () => {
     const forwarded: Array<{ code: string }> = [];
     const longAgo = new Date('2026-06-13T00:00:00.000Z').toISOString();

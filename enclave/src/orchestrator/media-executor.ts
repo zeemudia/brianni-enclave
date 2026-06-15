@@ -137,6 +137,18 @@ export interface RunMediaSubtaskDeps {
           providerJobId: string;
           provenanceSnapshotHash: string;
         }
+      | {
+          // Provider finished + hold ALREADY debited (we bill on the irreversible
+          // generation, not the client's delivery ACK), but the bytes were not
+          // confirmed delivered. Resuming this re-polls the provider job and
+          // re-delivers the already-paid asset WITHOUT reserving or debiting
+          // again.
+          state: "delivery_pending";
+          providerId: string;
+          modelId: string;
+          providerJobId: string;
+          provenanceSnapshotHash: string;
+        }
       | null
     >;
     savePendingStart(input: {
@@ -159,6 +171,28 @@ export interface RunMediaSubtaskDeps {
       providerJobId: string;
       observedAt: string;
     }): Promise<void>;
+    // Transition provider_started → delivery_pending: the provider produced the
+    // asset and the hold is debited, but delivery to the client is unconfirmed.
+    // `deliveredPendingAt` stamps the server-side re-delivery TTL; an expired row
+    // is GC'd with no refund (already billed). Optional so existing fakes/clients
+    // that predate re-delivery still satisfy the type.
+    markDeliveryPending?(input: {
+      mediaJobId: string;
+      providerJobId: string;
+      deliveredPendingAt: string;
+    }): Promise<void>;
+    // User-scoped list of the caller's billed-but-undelivered video jobs, for the
+    // honest-user re-delivery path (see orchestrator/media-redeliver.ts). Optional
+    // so fakes/clients that predate re-delivery still satisfy the type.
+    listUserDeliveryPending?(input: { limit: number }): Promise<
+      Array<{
+        mediaJobId: string;
+        providerId: string;
+        modelId: string;
+        providerJobId: string;
+        provenanceSnapshotHash: string;
+      }>
+    >;
     listCancelledPending(input: { limit: number }): Promise<
       Array<{ mediaJobId: string; providerId: string; providerJobId: string; holdId: string }>
     >;
@@ -173,6 +207,14 @@ export interface RunMediaSubtaskDeps {
         slaAlertedAt?: string;
       }>
     >;
+    // GLOBAL observability list (no userId) for the reconciler's stale-delivery
+    // monitor: the total count of billed-but-undelivered video jobs that have been
+    // delivery_pending longer than `olderThanMs`, plus a bounded exemplar sample.
+    // Optional so fakes/clients that predate the monitor still satisfy the type.
+    listStuckDeliveryPending?(input: { olderThanMs: number; limit: number }): Promise<{
+      count: number;
+      sample: Array<{ mediaJobId: string; providerId: string; deliveredPendingAt: string }>;
+    }>;
     markBillingSlaEscalated(input: {
       mediaJobId: string;
       alertedAt: string;
@@ -276,9 +318,14 @@ export async function* runMediaSubtask(
   const effectiveModelId = existingCheckpoint?.modelId ?? deps.route.modelId;
   if (
     existingCheckpoint &&
+    existingCheckpoint.state !== "delivery_pending" &&
     (existingCheckpoint.providerId !== deps.route.providerId ||
       existingCheckpoint.modelId !== deps.route.modelId)
   ) {
+    // A delivery_pending resume is exempt: there is no in-flight provider job to
+    // clean up (it already finished + was billed), and the re-delivery re-polls
+    // the SAME job via the checkpoint-pinned adapter (effectiveProviderId), so a
+    // changed route is irrelevant.
     // If a provider job is already running upstream we MUST clean it up
     // using the CHECKPOINT'S adapter — the new route's adapter cannot poll
     // or cancel a job that belongs to a different provider. Without this,
@@ -482,33 +529,69 @@ export async function* runMediaSubtask(
     label: deps.subtask.title,
   };
 
-  const estimate = estimateVideoQuotaUnits({
-    providerId: effectiveProviderId,
-    modelId: effectiveModelId,
-    durationSeconds: deps.subtask.media.maxDurationSeconds ?? 8,
-    width: 1080,
-    height: 1920,
-    audio: true,
-    safetyMarginPercent: 30,
-  });
-  const hold = await reserveVideoBudget({
-    mediaJobId: ids.mediaJobId,
-    estimate,
-    client: deps.budgetClient,
-    routeKind: "video_generate",
-  });
-  if (!hold.ok) {
-    yield {
-      kind: "orchestrator-media-job-progress",
-      planId: deps.planId,
-      subtaskId: deps.subtask.id,
+  // Billing follows the irreversible provider GENERATION, not the client's
+  // delivery ACK. A resume whose checkpoint is already `delivery_pending` was
+  // therefore billed on a prior attempt: it must NOT reserve or debit again — it
+  // only re-polls the provider job and re-delivers the already-paid asset. In
+  // that case `holdId` stays null and every hold settle below is a no-op.
+  const alreadyBilled = existingCheckpoint?.state === "delivery_pending";
+  let holdId: string | null = null;
+  if (!alreadyBilled) {
+    const estimate = estimateVideoQuotaUnits({
+      providerId: effectiveProviderId,
+      modelId: effectiveModelId,
+      durationSeconds: deps.subtask.media.maxDurationSeconds ?? 8,
+      width: 1080,
+      height: 1920,
+      audio: true,
+      safetyMarginPercent: 30,
+    });
+    const hold = await reserveVideoBudget({
       mediaJobId: ids.mediaJobId,
-      status: "blocked",
-      label: deps.subtask.title,
-      detail: hold.reason,
-    };
-    return;
+      estimate,
+      client: deps.budgetClient,
+      routeKind: "video_generate",
+    });
+    if (!hold.ok) {
+      yield {
+        kind: "orchestrator-media-job-progress",
+        planId: deps.planId,
+        subtaskId: deps.subtask.id,
+        mediaJobId: ids.mediaJobId,
+        status: "blocked",
+        label: deps.subtask.title,
+        detail: hold.reason,
+      };
+      return;
+    }
+    holdId = hold.holdId;
   }
+  // Release the reserved hold iff one is held — a no-op on an already-billed
+  // delivery_pending resume (nothing to refund; the asset is already paid).
+  const releaseHold = async (): Promise<void> => {
+    if (!holdId) return;
+    await deps.budgetClient.reconcile({ holdId, status: "released" });
+  };
+  // Bill-on-generation state flags. Order is DEBIT FIRST, then markDeliveryPending,
+  // so the invariant holds by construction: a `delivery_pending` row ALWAYS
+  // corresponds to a settled (debited) hold. The retrieve/resume path treats
+  // `delivery_pending` as already-paid and never re-debits, so this ordering is
+  // what guarantees it can never re-deliver an UNPAID asset for free.
+  //  • `debited` — the hold has been settled (debited). Set right after the
+  //    reconcile succeeds. A throw after this point must never release or
+  //    re-reconcile the hold, and never markBillingPending (which would strand
+  //    the paid asset outside the recovery path).
+  //  • `markedDeliveryPending` — the row is committed `delivery_pending`. Implies
+  //    `debited` (it is set only after the debit).
+  //  • `enteredBillingStage` — we entered the section but may not have finished
+  //    the debit. If the DEBIT itself throws, `debited` stays false and NO
+  //    delivery_pending row was created (it is written after the debit), so there
+  //    is nothing to strand and no free-asset path — the catch just releases the
+  //    still-held hold (no bill; the bytes have not shipped). Distinguishes this
+  //    stage from an earlier poll-stage throw.
+  let debited = false;
+  let markedDeliveryPending = false;
+  let enteredBillingStage = false;
 
   if (!deps.providerInput || !deps.handleStore || !deps.provenanceSigner || !deps.consentVerifier) {
     yield {
@@ -520,7 +603,7 @@ export async function* runMediaSubtask(
       label: deps.subtask.title,
       detail: "PROVIDER_VISIBLE_INPUTS_MISSING",
     };
-    await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+    await releaseHold();
     return;
   }
   const providerInput = await prepareProviderVisibleInput({
@@ -541,12 +624,15 @@ export async function* runMediaSubtask(
       label: deps.subtask.title,
       detail: providerInput.reason,
     };
-    await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+    await releaseHold();
     return;
   }
   const existingProviderJobId =
-    existingCheckpoint?.state === "provider_started" ? existingCheckpoint.providerJobId : null;
-  const reservedHoldId = hold.holdId;
+    existingCheckpoint?.state === "provider_started" ||
+    existingCheckpoint?.state === "delivery_pending"
+      ? existingCheckpoint.providerJobId
+      : null;
+  const reservedHoldId = holdId;
   // Helper: when we have to short-circuit AFTER a provider job is already
   // running upstream, we cannot simply release the hold — the provider job
   // is still consuming compute and will eventually be billed. Mark the
@@ -564,6 +650,11 @@ export async function* runMediaSubtask(
     | { result: "cancelled_pending_provider" }
     | { result: "checkpoint_unavailable" };
   async function detachUpstreamAndRelease(): Promise<CleanupResult> {
+    if (!reservedHoldId) {
+      // No hold to settle — an already-billed delivery_pending resume has
+      // nothing to release or cancel (the prior attempt already debited).
+      return { result: "released" };
+    }
     if (!existingProviderJobId) {
       await deps.budgetClient.reconcile({ holdId: reservedHoldId, status: "released" });
       return { result: "released" };
@@ -694,7 +785,13 @@ export async function* runMediaSubtask(
   let providerJobId: string | null = existingProviderJobId;
   let pendingStartSaved = false;
   try {
-    if (existingCheckpoint?.state === "provider_started") {
+    if (
+      existingCheckpoint?.state === "provider_started" ||
+      existingCheckpoint?.state === "delivery_pending"
+    ) {
+      // Resume: the provider job already exists (a delivery_pending resume
+      // re-polls the finished, already-paid job to re-download + re-deliver).
+      // Never start a new job — that would double-generate and orphan the old.
       providerJobId = existingCheckpoint.providerJobId;
     } else {
       await deps.checkpointClient.savePendingStart({
@@ -765,9 +862,9 @@ export async function* runMediaSubtask(
         // the row and the hold would strand forever. With `markCancelled`
         // failed we leave the hold `held` so its TTL bounds the leak and
         // the next retry of this turn can re-attempt the checkpoint write.
-        if (checkpointMarked) {
+        if (checkpointMarked && holdId) {
           await deps.budgetClient.reconcile({
-            holdId: hold.holdId,
+            holdId,
             status: "cancelled_pending_provider",
           });
         }
@@ -807,9 +904,9 @@ export async function* runMediaSubtask(
       await delay(deps.providerPollDelayMs ?? 5_000, deps.abortSignal);
     }
     if (!result || result.status !== "done") {
-      if (result?.status === "billing_pending") {
+      if (result?.status === "billing_pending" && holdId) {
         await deps.budgetClient.reconcile({
-          holdId: hold.holdId,
+          holdId,
           status: "billing_pending_provider",
         });
         await deps.checkpointClient.markBillingPending({
@@ -832,7 +929,7 @@ export async function* runMediaSubtask(
         progressPercent: result?.status === "running" ? result.progressPercent : undefined,
       };
       if (result?.status === "failed") {
-        await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+        await releaseHold();
       }
       return;
     }
@@ -864,7 +961,11 @@ export async function* runMediaSubtask(
     // client writes them straight to disk (no full-video buffer in JS heap).
     const videoSizeCap = videoMaxOutputBytes();
     if (result.videoBytes.byteLength > videoSizeCap) {
-      await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+      // Undeliverable by OUR cap → release (no bill). This is not a bypass: the
+      // client receives nothing. The debit happens only AFTER this guard, so an
+      // oversized asset is never billed; a delivery_pending resume can never
+      // reach here (its asset already passed the cap on the billed attempt).
+      await releaseHold();
       try {
         await deps.checkpointClient.markTerminal({
           mediaJobId: ids.mediaJobId,
@@ -889,7 +990,7 @@ export async function* runMediaSubtask(
     );
     const previewOnly = !targetFolder;
     if (!deps.awaitBinaryWriteAck || !deps.binaryWorkItems) {
-      await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+      await releaseHold();
       try {
         await deps.checkpointClient.markTerminal({
           mediaJobId: ids.mediaJobId,
@@ -937,18 +1038,42 @@ export async function* runMediaSubtask(
           request,
           chunks,
         };
-    yield { kind: "binary-write-request", payload: writePayload };
-    const ack = await deps.awaitBinaryWriteAck(writePayload);
-    if (ack.outcome === "ok") {
+    // ── Bill on GENERATION, not on the client ACK ─────────────────────────────
+    // The provider has produced the asset — the irreversible cost is already
+    // spent and the bytes are about to leave the enclave. DEBIT FIRST, THEN record
+    // the job re-deliverable (`delivery_pending`). This order is the bypass close:
+    //  • A client that receives the bytes (below) then withholds/denies the ACK is
+    //    STILL billed — the debit already happened.
+    //  • A `delivery_pending` row therefore ALWAYS implies a settled debit, so the
+    //    retrieve/resume path (which never re-debits) can never re-deliver an
+    //    UNPAID asset for free — even under a partial-failure in this section.
+    // If the DEBIT throws, no delivery_pending row is created and the catch
+    // releases the still-held hold (no bill; nothing shipped). If the debit
+    // succeeds but markDeliveryPending throws, the catch best-effort re-records the
+    // (already-paid) row so it stays recoverable, and never releases or re-bills.
+    // The optional `?.` lets legacy clients/tests that predate re-delivery keep
+    // working (bill-on-generation, minus the re-deliverable row).
+    if (!alreadyBilled) {
+      enteredBillingStage = true;
       await deps.budgetClient.reconcile({
-        holdId: hold.holdId,
+        holdId: holdId!,
         status: "debited",
         actualQuotaUnits: result.actualQuotaUnits,
         billingReceiptId: result.billingReceiptId,
       });
-      // Mark terminal so a later resume of this turn cannot re-poll + re-deliver
-      // an already-completed + already-debited job. Best-effort: billing is
-      // already settled; if this write fails the row simply expires.
+      debited = true;
+      await deps.checkpointClient.markDeliveryPending?.({
+        mediaJobId: ids.mediaJobId,
+        providerJobId,
+        deliveredPendingAt: (deps.now ?? new Date()).toISOString(),
+      });
+      markedDeliveryPending = true;
+    }
+    yield { kind: "binary-write-request", payload: writePayload };
+    const ack = await deps.awaitBinaryWriteAck(writePayload);
+    if (ack.outcome === "ok") {
+      // Delivered. Already debited above — just finalise terminal so a later
+      // resume cannot re-poll + re-deliver an already-delivered job.
       try {
         await deps.checkpointClient.markTerminal({
           mediaJobId: ids.mediaJobId,
@@ -967,19 +1092,25 @@ export async function* runMediaSubtask(
       };
       return;
     }
-    // Client declined the save, or the write failed / timed out. Nothing landed,
-    // so release the hold and report honestly. A user-declined save is a
-    // `blocked` terminal (an explicit choice); any other outcome is an `error`.
-    await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
-    try {
-      await deps.checkpointClient.markTerminal({
-        mediaJobId: ids.mediaJobId,
-        terminalState: "released",
-      });
-    } catch {
-      /* best-effort */
-    }
+    // Non-ok ACK. The asset is already billed (bill-on-generation), so there is
+    // NO refund. Two cases:
+    //  • denied_by_user — the user saw the preview and explicitly declined the
+    //    FOLDER save. They received + viewed the asset, so finalise terminal
+    //    (no re-delivery owed); they are billed for the generation they used.
+    //  • write failed / timed out — the client may genuinely have missed the
+    //    bytes, so LEAVE the job `delivery_pending` (recorded above) so it can be
+    //    re-delivered to an honest client; never release.
     const denied = ack.outcome === "denied_by_user";
+    if (denied) {
+      try {
+        await deps.checkpointClient.markTerminal({
+          mediaJobId: ids.mediaJobId,
+          terminalState: "debited",
+        });
+      } catch {
+        /* best-effort */
+      }
+    }
     yield {
       kind: "orchestrator-media-job-progress",
       planId: deps.planId,
@@ -987,17 +1118,65 @@ export async function* runMediaSubtask(
       mediaJobId: ids.mediaJobId,
       status: denied ? "blocked" : "error",
       label: deps.subtask.title,
-      detail:
-        ack.reason ??
-        (denied ? "VIDEO_GENERATE_SAVE_DECLINED" : "VIDEO_GENERATE_WRITE_FAILED"),
+      // The recoverable (non-denied) case MUST carry the exact recovery sentinel:
+      // an alive client that reports an error/timeout ACK returns outcome:"error"
+      // WITH a reason (e.g. BINARY_WRITE_ACK_TIMEOUT) — the main recovery case — and
+      // the web/mobile workspaces flip the "Retrieve your video" banner only on
+      // this exact detail. Preferring `ack.reason` here would hide the billed,
+      // re-deliverable job from the user. (Denied is terminal — no recovery owed —
+      // so its more specific reason is fine to surface.)
+      detail: denied
+        ? (ack.reason ?? "VIDEO_GENERATE_SAVE_DECLINED")
+        : "VIDEO_GENERATE_DELIVERY_UNCONFIRMED_BILLED",
     };
     return;
   } catch (error) {
     let detail = error instanceof Error ? error.message : "VIDEO_PROVIDER_EXCEPTION";
-    if (providerJobId) {
+    if (alreadyBilled || debited) {
+      // The hold is settled (a re-delivery of an already-paid job `alreadyBilled`,
+      // or this turn's in-turn `debited`). Never reconcile/release the hold again
+      // and never markBillingPending — that would double-settle the hold and/or
+      // stomp the delivery_pending row to a state outside the recovery path. Leave
+      // the row `delivery_pending` so a resume / user-scoped retrieve re-delivers
+      // the already-paid asset.
+      //
+      // Debit-first means the happy path already marked the row; but if the debit
+      // SUCCEEDED and markDeliveryPending then threw, the paid row was never
+      // recorded re-deliverable. Best-effort record it now so the paid asset stays
+      // recoverable (and a resume still sees `delivery_pending` → never re-debits).
+      // If this also fails the row stays `provider_started` + debited — a rare
+      // paid-but-unrecoverable edge that favours revenue, NOT a free asset.
+      if (debited && !markedDeliveryPending && providerJobId) {
+        try {
+          await deps.checkpointClient.markDeliveryPending?.({
+            mediaJobId: ids.mediaJobId,
+            providerJobId,
+            deliveredPendingAt: (deps.now ?? new Date()).toISOString(),
+          });
+        } catch {
+          detail = `${detail}+DELIVERY_PENDING_RECORD_FAILED`;
+        }
+      }
+      detail = `${detail}+REDELIVERY_PENDING`;
+    } else if (enteredBillingStage) {
+      // We entered the billing section but the DEBIT itself threw (`debited` is
+      // false). markDeliveryPending runs AFTER the debit, so NO delivery_pending
+      // row was created — there is nothing stranded and no free-asset path (the
+      // retrieve path only lists delivery_pending rows). The bytes have not shipped
+      // (the binary-write yield is after the debit), so nothing is owed: release
+      // the still-held hold. Must NOT fall through to the billing_pending_provider
+      // branch (that would bill the user via the reconciler for an asset that was
+      // never delivered). The row stays `provider_started` and simply TTL-expires.
+      try {
+        await releaseHold();
+      } catch {
+        detail = `${detail}+QUOTA_RELEASE_RECONCILIATION_FAILED`;
+      }
+      detail = `${detail}+DELIVERY_BILLING_INCOMPLETE_RELEASED`;
+    } else if (providerJobId) {
       try {
         await deps.budgetClient.reconcile({
-          holdId: hold.holdId,
+          holdId: holdId!,
           status: "billing_pending_provider",
         });
         await deps.checkpointClient.markBillingPending({
@@ -1016,7 +1195,7 @@ export async function* runMediaSubtask(
       // catch — a throw here escaped the generator entirely instead of
       // ending in the error progress event below.
       try {
-        await deps.budgetClient.reconcile({ holdId: hold.holdId, status: "released" });
+        await releaseHold();
       } catch {
         detail = `${detail}+QUOTA_RELEASE_RECONCILIATION_FAILED`;
       }
@@ -1115,7 +1294,7 @@ function deriveVideoOutputFilename(
 // base64-in-JSON), so the practical large-video ceiling is bounded by the
 // provider response shape, not this cap — this guards against pathologically
 // large outputs and is the value the client mirrors (defense in depth).
-function videoMaxOutputBytes(): number {
+export function videoMaxOutputBytes(): number {
   const raw = Number(process.env.MEDIA_VIDEO_MAX_OUTPUT_BYTES);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 100 * 1024 * 1024;
 }

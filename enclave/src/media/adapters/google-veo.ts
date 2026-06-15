@@ -11,6 +11,41 @@ import {
   parseRetryAfterMs,
 } from "../../providers/errors";
 
+// A single generated clip, normalised across the response shapes Veo returns.
+interface VeoVideoSample {
+  bytesBase64Encoded?: string;
+  uri?: string;
+  mimeType?: string;
+}
+
+// The `response` object of a DONE predictLongRunning operation. Veo has shipped
+// at least three shapes across model/API revisions; the adapter reads whichever
+// is present rather than pinning one (the bare `response.videos[0]` assumption
+// returned a clip-less `done` operation as MISSING_VIDEO on the live API).
+interface VeoOperationResponse {
+  videos?: VeoVideoSample[];
+  generatedVideos?: Array<{ video?: VeoVideoSample }>;
+  generateVideoResponse?: { generatedSamples?: Array<{ video?: VeoVideoSample }> };
+}
+
+// Pull the first generated clip from any known Veo response shape, or null when
+// none carries a usable byte source (inline base64 or a downloadable URI).
+function extractVideoSample(response: VeoOperationResponse | undefined): VeoVideoSample | null {
+  if (!response) return null;
+  const candidates: Array<VeoVideoSample | undefined> = [
+    // Shape A: the originally-assumed flat array (kept for back-compat).
+    response.videos?.[0],
+    // Shape B: the REST predictLongRunning shape observed on the live Gemini API.
+    response.generateVideoResponse?.generatedSamples?.[0]?.video,
+    // Shape C: the @google/genai SDK-style wrapper.
+    response.generatedVideos?.[0]?.video,
+  ];
+  for (const c of candidates) {
+    if (c && (c.bytesBase64Encoded || c.uri)) return c;
+  }
+  return null;
+}
+
 export class GoogleVeoVideoAdapter implements VideoProviderAdapter {
   constructor(
     private readonly deps: {
@@ -82,24 +117,77 @@ export class GoogleVeoVideoAdapter implements VideoProviderAdapter {
       done?: boolean;
       error?: { message?: string };
       metadata?: { progressPercent?: number; billing?: { quotaUnits?: number; receiptId?: string } };
-      response?: { videos?: Array<{ bytesBase64Encoded?: string; mimeType?: string }> };
+      response?: VeoOperationResponse;
     };
     if (body.error) return { status: "failed", reason: body.error.message ?? "PROVIDER_FAILED" };
     if (!body.done) return { status: "running", progressPercent: body.metadata?.progressPercent };
-    const encoded = body.response?.videos?.[0]?.bytesBase64Encoded;
-    if (!encoded) return { status: "failed", reason: "PROVIDER_RESULT_MISSING_VIDEO" };
+
+    // The done operation's `response` shape is NOT documented inline and differs
+    // across Veo model/API revisions, so we accept every known shape rather than
+    // a single field. Veo delivers the clip EITHER inline (bytesBase64Encoded) OR
+    // as a Files API URI that must be downloaded with the API key (large clips).
+    const sample = extractVideoSample(body.response);
+    if (!sample) {
+      // Surface the observed top-level keys (NOT any bytes/uri) in the reason so a
+      // live shape-miss is debuggable from the orchestrator media-job detail
+      // without enclave logs — the prior bare code hid which shape arrived.
+      const observed = Object.keys(body.response ?? {}).join(",").slice(0, 80);
+      return { status: "failed", reason: `PROVIDER_RESULT_MISSING_VIDEO:${observed}` };
+    }
+
+    let videoBytes: Uint8Array;
+    if (sample.bytesBase64Encoded) {
+      videoBytes = Buffer.from(sample.bytesBase64Encoded, "base64");
+    } else if (sample.uri) {
+      videoBytes = await this.downloadVideoFile(sample.uri, input.abortSignal);
+    } else {
+      const observed = Object.keys(body.response ?? {}).join(",").slice(0, 80);
+      return { status: "failed", reason: `PROVIDER_RESULT_MISSING_VIDEO:${observed}` };
+    }
+
     const actualQuotaUnits = body.metadata?.billing?.quotaUnits;
     if (typeof actualQuotaUnits !== "number" || !Number.isInteger(actualQuotaUnits) || actualQuotaUnits <= 0) {
       return { status: "billing_pending", reason: "PROVIDER_BILLING_METADATA_MISSING" };
     }
     return {
       status: "done",
-      videoBytes: Buffer.from(encoded, "base64"),
-      mimeType: body.response?.videos?.[0]?.mimeType === "video/webm" ? "video/webm" : "video/mp4",
+      videoBytes,
+      mimeType: sample.mimeType === "video/webm" ? "video/webm" : "video/mp4",
       actualQuotaUnits,
       billingReceiptId: body.metadata?.billing?.receiptId,
       billingSource: "provider_operation_metadata",
     };
+  }
+
+  // Download a Veo clip delivered as a Gemini Files API URI. The download is
+  // authenticated with the API key (appended only when the URI doesn't already
+  // carry one). A non-2xx download is a provider failure, classified like the
+  // poll/start calls so the orchestrator reconciles the hold consistently.
+  private async downloadVideoFile(
+    uri: string,
+    abortSignal: AbortSignal | undefined,
+  ): Promise<Uint8Array> {
+    const fetchFn = this.deps.fetchFn ?? fetch;
+    // Google's Veo REST docs authenticate the generated-clip download with the
+    // `x-goog-api-key` header (not a `?key=` query param). Send the header and
+    // pass the Files-API URI through unchanged — a URI that already carries a
+    // `?key=` still works (the redundant header is harmless), so this tolerates
+    // both delivery conventions without leaking the key into the URL/logs.
+    const response = await fetchFn(uri, {
+      headers: { "x-goog-api-key": this.deps.apiKey },
+      signal: abortSignal,
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      throw classifyProviderHttpError({
+        providerId: "google",
+        providerName: "Google Video",
+        status: response.status,
+        body: errText,
+        retryAfterMs: parseRetryAfterMs(response.headers.get("retry-after")),
+      });
+    }
+    return new Uint8Array(await response.arrayBuffer());
   }
 
   async cancel(input: PollVideoJobInput): Promise<void> {

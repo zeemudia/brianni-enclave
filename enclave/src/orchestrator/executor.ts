@@ -900,7 +900,7 @@ export async function* runOrchestrator(
                 },
                 {
                   messages: buildWorkerMessages(
-                    deps.messages,
+                    originalMessagesForWorker(deps.messages, subtask),
                     workerPrompt,
                     visibleMemory,
                   ),
@@ -1635,6 +1635,59 @@ function visibleWorkingMemoryForSubtask(
   return workingMemory.filter(
     (entry) => !isPrivateDerivedEntry(entry, privateDerivedSubtaskIds),
   );
+}
+
+/**
+ * Tools that can carry a worker's model context to the public internet.
+ * `web.fetch` is the orchestrator's primary egress tool; `research.ask`
+ * delegates to the air-gapped web researcher (its query egresses after a
+ * verbatim user approval + taint check). Both are egress paths, so neither
+ * should receive private-derived CONVERSATION HISTORY it does not need.
+ *
+ * NOTE: this is deliberately a SUPERSET of the WORKING-MEMORY filter
+ * (`visibleWorkingMemoryForSubtask`), which stays `web.fetch`-only on purpose —
+ * a `research.ask` worker is allowed to see private working memory in order to
+ * FORMULATE its user-approved query (that is the research feature). Only its
+ * inbound conversation HISTORY is trimmed here. Add any future network-reaching
+ * tool to this set so the history-leak class cannot silently reappear.
+ */
+export const EGRESS_CAPABLE_TOOLS = new Set<ToolName>([
+  'web.fetch',
+  'research.ask',
+]);
+
+function subtaskCanEgress(subtask: AgentSubtask): boolean {
+  return subtask.allowedTools.some((tool) => EGRESS_CAPABLE_TOOLS.has(tool));
+}
+
+/**
+ * Conversation history a worker may see. The egress isolation drops private-
+ * read-derived WORKING MEMORY from a web.fetch worker (visibleWorkingMemoryFor-
+ * Subtask), but private-derived content can also ride in the conversation
+ * HISTORY itself — most notably the refine flow's includePrivateDerivedPrior-
+ * Answer carry-forward, which threads a prior private-read-derived ASSISTANT
+ * answer back into `messages`. On-device masking is heuristic, not the
+ * structural boundary, so for an egress-capable worker (see EGRESS_CAPABLE_TOOLS)
+ * we pass ONLY the latest user turn — the current public request the worker is
+ * told to act on. Prior assistant/tool turns may be private-read-derived, and
+ * prior USER turns can themselves hold privately pasted text (claim/medical
+ * detail) the worker could copy into an outbound URL/query, so neither is
+ * forwarded. buildWorkerMessages still appends the worker prompt + (filtered)
+ * working memory to this turn, so the worker keeps its instructions and the
+ * legitimate cross-subtask context. Non-egress workers are unaffected and still
+ * see the full history.
+ *
+ * Exported for direct unit coverage that enumerates the egress tools.
+ */
+export function originalMessagesForWorker(
+  originalMessages: ChatMessage[],
+  subtask: AgentSubtask,
+): ChatMessage[] {
+  if (!subtaskCanEgress(subtask)) return originalMessages;
+  const latestUserTurn = [...originalMessages]
+    .reverse()
+    .find((message) => message.role === 'user');
+  return latestUserTurn ? [latestUserTurn] : [];
 }
 
 function buildWorkerMessages(

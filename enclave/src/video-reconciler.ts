@@ -19,6 +19,7 @@
  * Each tick is fully isolated: a thrown list/poll/settle is caught + logged so a
  * degraded broker/provider never crashes the long-lived enclave.
  */
+import type { VideoOperatorAlert } from '@calypso/chat-types';
 import {
   reconcileCancelledProviderCompletions,
   type RunMediaSubtaskDeps,
@@ -30,9 +31,40 @@ import {
 } from './video-checkpoint-store.js';
 
 type ReconcilerDeps = Parameters<typeof reconcileCancelledProviderCompletions>[0];
-type OperatorAlertInput = Parameters<NonNullable<ReconcilerDeps['emitOperatorAlert']>>[0];
+// The full operator-alert union (chat-types) — wider than the per-job subset
+// `reconcileCancelledProviderCompletions` declares, because the stale-delivery
+// monitor below emits the aggregate VIDEO_DELIVERY_PENDING_STALE variant too. A
+// function accepting the wider input is still assignable to the narrower
+// `emitOperatorAlert?` slot (parameter contravariance), so the per-job sweep is
+// unaffected.
+type OperatorAlertInput = VideoOperatorAlert;
 
 export type VideoReconcilerLog = (msg: string, fields: Record<string, unknown>) => void;
+
+/**
+ * Stale-delivery monitor defaults. A healthy system delivers a generated video
+ * immediately, so a row still `delivery_pending` hours later is either a user who
+ * has not returned (benign in isolation) or a systemic delivery regression. We
+ * alert on the COUNT of such rows crossing a threshold, not on any single row —
+ * the reconciler cannot deliver to an absent client, this is observability only.
+ */
+export const STALE_DELIVERY_PENDING_AGE_MS = 6 * 60 * 60 * 1000;
+export const STALE_DELIVERY_PENDING_ALERT_THRESHOLD = 20;
+export const STALE_DELIVERY_PENDING_SAMPLE_LIMIT = 10;
+/**
+ * Cross-tick alert suppression: a sustained backlog would otherwise re-fire the
+ * stale alert every 5-min sweep, flooding the operator channel (a fresh PagerDuty
+ * incident / Slack message per webhook) until the signal is tuned out — the exact
+ * failure the alert exists to prevent. While the breach persists we re-alert at
+ * most once per this window (≤ 24/day). The caller threads a persistent state
+ * holder across ticks; a single-call (test) site that omits it always alerts.
+ */
+export const STALE_DELIVERY_PENDING_ALERT_SUPPRESSION_MS = 60 * 60 * 1000;
+
+/** Persistent (across-tick) state for stale-delivery alert suppression. */
+export interface StaleDeliveryAlertState {
+  lastStaleAlertAt?: number;
+}
 
 /**
  * Off-box alert delivery. The enclave has no egress, so this forwards the alert
@@ -52,7 +84,7 @@ export function createVideoReconcilerHooks(opts: {
   log?: VideoReconcilerLog;
   alertSink?: VideoReconcilerAlertSink;
 }): {
-  emitOperatorAlert: NonNullable<ReconcilerDeps['emitOperatorAlert']>;
+  emitOperatorAlert: (input: OperatorAlertInput) => Promise<void>;
   disableProviderModel: NonNullable<ReconcilerDeps['disableProviderModel']>;
 } {
   const log = opts.log ?? defaultLog;
@@ -82,6 +114,14 @@ export async function runVideoReconcilerOnce(deps: {
   abortSignal?: AbortSignal;
   log?: VideoReconcilerLog;
   alertSink?: VideoReconcilerAlertSink;
+  staleDeliveryAgeMs?: number;
+  staleDeliveryAlertThreshold?: number;
+  staleDeliverySampleLimit?: number;
+  // Persistent across-tick holder for stale-alert suppression (the index.ts timer
+  // creates one and reuses it every tick). Omit it (single-call tests) to alert
+  // unconditionally.
+  staleAlertState?: StaleDeliveryAlertState;
+  staleAlertSuppressionMs?: number;
 }): Promise<void> {
   const log = deps.log ?? defaultLog;
   const hooks = createVideoReconcilerHooks({
@@ -91,10 +131,11 @@ export async function runVideoReconcilerOnce(deps: {
     // tests inject their own sink (or omit it) to stay off the broker.
     alertSink: deps.alertSink ?? createReconcilerAlertSink(),
   });
+  const checkpointClient = deps.checkpointClient ?? createVideoCheckpointClient({});
   try {
     await reconcileCancelledProviderCompletions({
       videoAdapters: deps.videoAdapters,
-      checkpointClient: deps.checkpointClient ?? createVideoCheckpointClient({}),
+      checkpointClient,
       budgetClient: deps.budgetClient ?? createReconcilerBudgetClient(),
       limit: deps.limit,
       now: deps.now,
@@ -106,6 +147,42 @@ export async function runVideoReconcilerOnce(deps: {
     // Tick-level isolation: the recurring sweep must survive a degraded broker
     // (e.g. listCancelledPending throwing UNREACHABLE) — log and retry next tick.
     log('tick-failed', { error: err instanceof Error ? err.message : String(err) });
+  }
+
+  // Stale-delivery monitor (observability only): count billed-but-undelivered
+  // videos stuck `delivery_pending` past the age threshold and alert when the
+  // backlog crosses the count threshold. The reconciler CANNOT deliver to an
+  // absent client — it just signals. Isolated in its own try/catch so a degraded
+  // broker never crashes the long-lived enclave; once-per-tick = deduped to the
+  // sweep interval (no per-row alert spam). Skipped when the client predates the
+  // monitor (optional method).
+  try {
+    if (checkpointClient.listStuckDeliveryPending) {
+      const threshold = deps.staleDeliveryAlertThreshold ?? STALE_DELIVERY_PENDING_ALERT_THRESHOLD;
+      const { count, sample } = await checkpointClient.listStuckDeliveryPending({
+        olderThanMs: deps.staleDeliveryAgeMs ?? STALE_DELIVERY_PENDING_AGE_MS,
+        limit: deps.staleDeliverySampleLimit ?? STALE_DELIVERY_PENDING_SAMPLE_LIMIT,
+      });
+      if (count > threshold) {
+        // Cross-tick suppression: while the backlog persists, re-alert at most
+        // once per the suppression window so the operator channel is not flooded
+        // every sweep. A single-call site (tests) omits staleAlertState → always
+        // alerts.
+        const nowMs = (deps.now ?? new Date()).getTime();
+        const suppressionMs =
+          deps.staleAlertSuppressionMs ?? STALE_DELIVERY_PENDING_ALERT_SUPPRESSION_MS;
+        const lastAlertedAt = deps.staleAlertState?.lastStaleAlertAt;
+        const sinceLast = lastAlertedAt === undefined ? Infinity : nowMs - lastAlertedAt;
+        if (sinceLast >= suppressionMs) {
+          await hooks.emitOperatorAlert({ code: 'VIDEO_DELIVERY_PENDING_STALE', count, sample });
+          if (deps.staleAlertState) deps.staleAlertState.lastStaleAlertAt = nowMs;
+        }
+      }
+    }
+  } catch (err) {
+    log('stale-delivery-tick-failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 

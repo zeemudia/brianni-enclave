@@ -157,6 +157,54 @@ describe('createVideoCheckpointClient — user-scoped ops', () => {
     expect(sent.observedAt).toBe('2026-06-13T10:00:00.000Z');
   });
 
+  it('markDeliveryPending sends the user-scoped op with deliveredPendingAt', async () => {
+    const sock = queueRpc(JSON.stringify({ ok: true }));
+    const client = createVideoCheckpointClient({ userId: 'u1' });
+    await client.markDeliveryPending!({
+      mediaJobId: 'mj_1',
+      providerJobId: 'op_1',
+      deliveredPendingAt: '2026-06-15T10:00:00.000Z',
+    });
+    const sent = lastSent(sock);
+    expect(sent.op).toBe('mark_delivery_pending');
+    expect(sent.userId).toBe('u1');
+    expect(sent.providerJobId).toBe('op_1');
+    expect(sent.deliveredPendingAt).toBe('2026-06-15T10:00:00.000Z');
+  });
+
+  it('listUserDeliveryPending sends the user-scoped op and decodes the jobs', async () => {
+    queueRpc(
+      JSON.stringify({
+        ok: true,
+        jobs: [
+          {
+            mediaJobId: 'mj_1',
+            providerId: 'google',
+            modelId: 'veo-3.1-generate-preview',
+            providerJobId: 'op_1',
+            provenanceSnapshotHash: 'a'.repeat(64),
+          },
+        ],
+      }),
+    );
+    const client = createVideoCheckpointClient({ userId: 'u1' });
+    const jobs = await client.listUserDeliveryPending!({ limit: 5 });
+    expect(jobs).toEqual([
+      {
+        mediaJobId: 'mj_1',
+        providerId: 'google',
+        modelId: 'veo-3.1-generate-preview',
+        providerJobId: 'op_1',
+        provenanceSnapshotHash: 'a'.repeat(64),
+      },
+    ]);
+  });
+
+  it('listUserDeliveryPending fails closed when no userId is bound', async () => {
+    const client = createVideoCheckpointClient({});
+    await expect(client.listUserDeliveryPending!({ limit: 5 })).rejects.toThrow();
+  });
+
   it('user-scoped ops fail closed when no userId is bound', async () => {
     const client = createVideoCheckpointClient({});
     await expect(client.load({ mediaJobId: 'mj_1' })).rejects.toThrow();

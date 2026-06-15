@@ -54,6 +54,112 @@ describe("GoogleVeoVideoAdapter", () => {
     }
   });
 
+  it("parses the real Gemini predictLongRunning shape (generateVideoResponse.generatedSamples[].video.uri) and downloads the file", async () => {
+    const videoBytes = Buffer.from("real-mp4-bytes");
+    const fetchFn = vi
+      .fn()
+      // poll → operation done, video delivered as a Files API URI (not inline)
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            done: true,
+            response: {
+              generateVideoResponse: {
+                generatedSamples: [
+                  {
+                    video: {
+                      uri: "https://generativelanguage.googleapis.com/v1beta/files/abc:download?alt=media",
+                      mimeType: "video/mp4",
+                    },
+                  },
+                ],
+              },
+            },
+            metadata: { billing: { quotaUnits: 180, receiptId: "veo-bill-1" } },
+          }),
+          { status: 200 },
+        ),
+      )
+      // download of the file URI → raw video bytes
+      .mockResolvedValueOnce(
+        new Response(videoBytes, {
+          status: 200,
+          headers: { "content-type": "video/mp4" },
+        }),
+      );
+    const adapter = new GoogleVeoVideoAdapter({
+      baseUrl: "https://generativelanguage.googleapis.com",
+      apiKey: "test-key",
+      fetchFn,
+    });
+
+    const completed = await adapter.poll({ providerJobId: "operations/op-9", abortSignal: undefined });
+    expect(completed.status).toBe("done");
+    if (completed.status === "done") {
+      expect(Buffer.from(completed.videoBytes).toString()).toBe("real-mp4-bytes");
+      expect(completed.actualQuotaUnits).toBe(180);
+    }
+    // The download must target the Files URI (unchanged) and authenticate via
+    // the x-goog-api-key header per Google's Veo REST download docs.
+    const downloadUrl = String(fetchFn.mock.calls[1]?.[0] ?? "");
+    expect(downloadUrl).toContain("files/abc:download");
+    const downloadHeaders = (fetchFn.mock.calls[1]?.[1]?.headers ?? {}) as Record<string, string>;
+    expect(downloadHeaders["x-goog-api-key"]).toBe("test-key");
+  });
+
+  it("parses the Gemini shape when the sample carries inline base64 (no download)", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          done: true,
+          response: {
+            generateVideoResponse: {
+              generatedSamples: [
+                { video: { bytesBase64Encoded: Buffer.from("inline-webm").toString("base64"), mimeType: "video/webm" } },
+              ],
+            },
+          },
+          metadata: { billing: { quotaUnits: 90 } },
+        }),
+        { status: 200 },
+      ),
+    );
+    const adapter = new GoogleVeoVideoAdapter({
+      baseUrl: "https://generativelanguage.googleapis.com",
+      apiKey: "test-key",
+      fetchFn,
+    });
+    const completed = await adapter.poll({ providerJobId: "operations/op-10", abortSignal: undefined });
+    expect(completed.status).toBe("done");
+    if (completed.status === "done") {
+      expect(Buffer.from(completed.videoBytes).toString()).toBe("inline-webm");
+      expect(completed.mimeType).toBe("video/webm");
+    }
+    // No second fetch — inline bytes need no download.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces the actual response key set when no known video shape matches", async () => {
+    const fetchFn = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ done: true, response: { someNewWrapper: { clips: [] } } }),
+        { status: 200 },
+      ),
+    );
+    const adapter = new GoogleVeoVideoAdapter({
+      baseUrl: "https://generativelanguage.googleapis.com",
+      apiKey: "test-key",
+      fetchFn,
+    });
+    const completed = await adapter.poll({ providerJobId: "operations/op-11", abortSignal: undefined });
+    expect(completed.status).toBe("failed");
+    if (completed.status === "failed") {
+      // Reason carries the observed top-level response keys so a live miss is debuggable.
+      expect(completed.reason).toContain("PROVIDER_RESULT_MISSING_VIDEO");
+      expect(completed.reason).toContain("someNewWrapper");
+    }
+  });
+
   it("classifies start 429 failures as Google Video ProviderError", async () => {
     const fetchFn = vi.fn().mockResolvedValue(
       new Response(

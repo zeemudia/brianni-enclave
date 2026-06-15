@@ -1,15 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
 import type {
+  AgentSubtask,
   ChatChunk,
   ChatMessage,
   ChatProcessor,
   ModelCapability,
   SkillPack,
   ToolInvocationFrame,
+  ToolName,
   ToolResultFrame,
 } from '@calypso/chat-types';
 
 import {
+  EGRESS_CAPABLE_TOOLS,
+  originalMessagesForWorker,
   runOrchestrator,
   type RunOrchestratorDeps,
 } from '../orchestrator/executor';
@@ -93,6 +97,40 @@ const READ_FETCH_REPORT_PLAN = `{
       "requiredCapabilities": ["writing"],
       "allowedTools": [],
       "dependsOn": ["st_read"],
+      "producesArtifact": true,
+      "risk": "low"
+    }
+  ]
+}`;
+
+// A fetch -> report plan with NO private-read subtask. Used to prove the egress
+// isolation also covers private-derived content that rides in the conversation
+// HISTORY (originalMessages) rather than in orchestrator working memory — e.g.
+// the refine flow's includePrivateDerivedPriorAnswer carry-forward.
+const FETCH_REPORT_PLAN = `{
+  "planId": "plan_refine_iso",
+  "title": "Fetch then report",
+  "summary": "Fetch a public page, then write a short report.",
+  "subtasks": [
+    {
+      "id": "st_fetch",
+      "title": "Fetch public page",
+      "objective": "Fetch the public URL and report the HTTP status.",
+      "kind": "research",
+      "requiredCapabilities": ["research"],
+      "allowedTools": ["web.fetch"],
+      "dependsOn": [],
+      "producesArtifact": false,
+      "risk": "low"
+    },
+    {
+      "id": "st_report",
+      "title": "Report",
+      "objective": "Write a short report of the run.",
+      "kind": "writing",
+      "requiredCapabilities": ["writing"],
+      "allowedTools": [],
+      "dependsOn": [],
       "producesArtifact": true,
       "risk": "low"
     }
@@ -449,6 +487,230 @@ describe('orchestrator egress memory isolation', () => {
       expect(inbound).not.toContain(CANARY);
     }
   });
+
+  it('keeps a private-derived prior ASSISTANT message (refine carry-forward) out of a web.fetch worker', async () => {
+    // The refine flow deliberately carries a prior private-read-derived assistant
+    // answer forward in the message history (includePrivateDerivedPriorAnswer).
+    // That content rides in originalMessages, NOT working memory, so the
+    // working-memory filter alone does not stop it reaching an egress worker.
+    const fetchWorkerInbound: string[] = [];
+    const reportWorkerInbound: string[] = [];
+
+    const invokeClient = vi.fn(
+      async (frame: ToolInvocationFrame): Promise<ToolResultFrame> => ({
+        invocationId: frame.invocationId,
+        outcome: 'ok',
+        resultJson: { status: 200, bodyText: 'Example Domain.' },
+      }),
+    );
+    const gw = new ToolGateway({ clientBridge: { invokeClient } });
+
+    const workerFactory = (): ChatProcessor => ({
+      async *streamChat(messages: ChatMessage[]): AsyncGenerator<ChatChunk> {
+        const text = lastUserContent(messages);
+
+        if (/Subtask: Fetch public page/.test(text)) {
+          const sawToolResult = messages.some(
+            (m) => m.role === 'user' && /Tool result — web\.fetch/.test(m.content),
+          );
+          if (!sawToolResult) {
+            fetchWorkerInbound.push(messages.map((m) => m.content).join('\n'));
+            yield {
+              id: 'c',
+              choices: [
+                {
+                  delta: {
+                    content:
+                      '<tool>{"toolName":"web.fetch","args":{"url":"https://example.com/","query":"status"}}</tool>',
+                  },
+                  finish_reason: null,
+                },
+              ],
+            };
+            return;
+          }
+          yield {
+            id: 'c',
+            choices: [
+              { delta: { content: 'The page returned 200.' }, finish_reason: null },
+            ],
+          };
+          return;
+        }
+
+        if (/Subtask: Report/.test(text)) {
+          reportWorkerInbound.push(messages.map((m) => m.content).join('\n'));
+          yield {
+            id: 'c',
+            choices: [
+              { delta: { content: 'Report written.' }, finish_reason: null },
+            ],
+          };
+          return;
+        }
+
+        yield { id: 'c', choices: [{ delta: { content: 'ok' }, finish_reason: null }] };
+      },
+    });
+
+    const deps: RunOrchestratorDeps = {
+      agentTurnId: 'turn_refine_iso',
+      gateway: gw,
+      pack,
+      plannerProvider: planner(FETCH_REPORT_PLAN),
+      workerProviderFactory: workerFactory,
+      plannerModel: 'gpt-5.5',
+      summaryModel: 'gpt-5.5',
+      models,
+      enabledGatewayTools: pack.toolScopes,
+      enabledEndpointFamilies: ['chat'],
+      messages: [
+        { role: 'user' as const, content: 'Earlier: summarise my private medical note.' },
+        { role: 'assistant' as const, content: `Summary of your note: ${CANARY}` },
+        {
+          role: 'user' as const,
+          // "synthesise" keeps this off the deterministic fetch-only single-subtask
+          // override so the genuine fetch -> report split drives the run.
+          content: 'Now fetch https://example.com and synthesise a short report.',
+        },
+      ],
+      requestContext: {
+        linkedFolders: [],
+        writePermissionMode: 'always_ask' as const,
+      },
+      workerTimeoutMs: 5_000,
+      summaryTimeoutMs: 5_000,
+    };
+
+    await collect(runOrchestrator(deps));
+
+    expect(fetchWorkerInbound.length).toBeGreaterThan(0);
+    expect(reportWorkerInbound.length).toBeGreaterThan(0);
+
+    // CORE ASSERTION: the egress (web.fetch) worker NEVER received the
+    // private-derived prior assistant answer that rode in originalMessages.
+    for (const inbound of fetchWorkerInbound) {
+      expect(inbound).not.toContain(CANARY);
+    }
+
+    // POSITIVE CONTROL: a non-egress worker (st_report) DID still receive the
+    // conversation history, proving the canary genuinely propagated and the
+    // filter specifically excludes it from the egress worker.
+    expect(reportWorkerInbound.join('\n')).toContain(CANARY);
+  });
+
+  it('keeps a private datum from a PRIOR user turn out of a web.fetch worker', async () => {
+    // A prior user turn can itself contain privately pasted text (claim/medical
+    // detail). Forwarding every user turn would still leak it to the egress
+    // worker; only the latest user turn (the current public request) should
+    // reach it. A non-egress dependent still sees the full history.
+    const fetchWorkerInbound: string[] = [];
+    const reportWorkerInbound: string[] = [];
+
+    const invokeClient = vi.fn(
+      async (frame: ToolInvocationFrame): Promise<ToolResultFrame> => ({
+        invocationId: frame.invocationId,
+        outcome: 'ok',
+        resultJson: { status: 200, bodyText: 'Example Domain.' },
+      }),
+    );
+    const gw = new ToolGateway({ clientBridge: { invokeClient } });
+
+    const workerFactory = (): ChatProcessor => ({
+      async *streamChat(messages: ChatMessage[]): AsyncGenerator<ChatChunk> {
+        const text = lastUserContent(messages);
+
+        if (/Subtask: Fetch public page/.test(text)) {
+          const sawToolResult = messages.some(
+            (m) => m.role === 'user' && /Tool result — web\.fetch/.test(m.content),
+          );
+          if (!sawToolResult) {
+            fetchWorkerInbound.push(messages.map((m) => m.content).join('\n'));
+            yield {
+              id: 'c',
+              choices: [
+                {
+                  delta: {
+                    content:
+                      '<tool>{"toolName":"web.fetch","args":{"url":"https://example.com/","query":"status"}}</tool>',
+                  },
+                  finish_reason: null,
+                },
+              ],
+            };
+            return;
+          }
+          yield {
+            id: 'c',
+            choices: [
+              { delta: { content: 'The page returned 200.' }, finish_reason: null },
+            ],
+          };
+          return;
+        }
+
+        if (/Subtask: Report/.test(text)) {
+          reportWorkerInbound.push(messages.map((m) => m.content).join('\n'));
+          yield {
+            id: 'c',
+            choices: [
+              { delta: { content: 'Report written.' }, finish_reason: null },
+            ],
+          };
+          return;
+        }
+
+        yield { id: 'c', choices: [{ delta: { content: 'ok' }, finish_reason: null }] };
+      },
+    });
+
+    const deps: RunOrchestratorDeps = {
+      agentTurnId: 'turn_prior_user_iso',
+      gateway: gw,
+      pack,
+      plannerProvider: planner(FETCH_REPORT_PLAN),
+      workerProviderFactory: workerFactory,
+      plannerModel: 'gpt-5.5',
+      summaryModel: 'gpt-5.5',
+      models,
+      enabledGatewayTools: pack.toolScopes,
+      enabledEndpointFamilies: ['chat'],
+      messages: [
+        {
+          role: 'user' as const,
+          content: `Earlier I pasted my private detail: ${CANARY}.`,
+        },
+        { role: 'assistant' as const, content: 'Understood.' },
+        {
+          role: 'user' as const,
+          // "synthesise" keeps this off the deterministic fetch-only single-subtask
+          // override so the genuine fetch -> report split drives the run.
+          content: 'Now fetch https://example.com and synthesise a short report.',
+        },
+      ],
+      requestContext: {
+        linkedFolders: [],
+        writePermissionMode: 'always_ask' as const,
+      },
+      workerTimeoutMs: 5_000,
+      summaryTimeoutMs: 5_000,
+    };
+
+    await collect(runOrchestrator(deps));
+
+    expect(fetchWorkerInbound.length).toBeGreaterThan(0);
+    expect(reportWorkerInbound.length).toBeGreaterThan(0);
+
+    // CORE ASSERTION: the egress (web.fetch) worker NEVER received the private
+    // datum that rode in the PRIOR user turn.
+    for (const inbound of fetchWorkerInbound) {
+      expect(inbound).not.toContain(CANARY);
+    }
+
+    // POSITIVE CONTROL: a non-egress worker (st_report) DID still receive the
+    // full conversation history, proving the datum genuinely propagated.
+    expect(reportWorkerInbound.join('\n')).toContain(CANARY);
+  });
 });
 
 describe('orchestrator egress bridge (consent-gated private-read -> web)', () => {
@@ -557,5 +819,84 @@ describe('orchestrator egress bridge (consent-gated private-read -> web)', () =>
     // No awaitEgressPromotion wired at all.
     await collect(runOrchestrator(bridgeDeps(fetchInbound, undefined)));
     expect(fetchInbound.join('\n')).not.toContain(CANARY);
+  });
+});
+
+describe('originalMessagesForWorker — egress workers never receive prior assistant/tool history', () => {
+  // Trust boundary = "this worker can reach the public internet", keyed on the
+  // production EGRESS_CAPABLE_TOOLS set, NOT the literal string 'web.fetch'.
+  // Drive the sweep from the REAL set (imported, not a parallel copy) so a future
+  // network-reaching tool ADDED to the set is automatically covered here. The
+  // explicit membership assertions below catch the inverse — a tool REMOVED from
+  // the set — so both drift directions re-fail this test.
+  const EGRESS_TOOLS: ToolName[] = Array.from(EGRESS_CAPABLE_TOOLS);
+
+  it('keeps the known egress paths in the set (web.fetch + research.ask)', () => {
+    expect(EGRESS_CAPABLE_TOOLS.has('web.fetch')).toBe(true);
+    expect(EGRESS_CAPABLE_TOOLS.has('research.ask')).toBe(true);
+  });
+
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'Earlier: summarise my private medical note.' },
+    { role: 'assistant', content: `Summary of your note: ${CANARY}` },
+    { role: 'user', content: 'Now look this up.' },
+  ];
+
+  const mkSubtask = (allowedTools: ToolName[]): AgentSubtask => ({
+    id: 'st',
+    title: 'subtask',
+    objective: 'do the thing',
+    kind: 'research',
+    requiredCapabilities: ['research'],
+    allowedTools,
+    dependsOn: [],
+    producesArtifact: false,
+    risk: 'low',
+  });
+
+  it.each(EGRESS_TOOLS)(
+    'strips non-user history (incl. private-derived assistant turns) for egress tool "%s"',
+    (tool) => {
+      const out = originalMessagesForWorker(history, mkSubtask([tool]));
+      expect(out.every((m) => m.role === 'user')).toBe(true);
+      expect(out.map((m) => m.content).join('\n')).not.toContain(CANARY);
+    },
+  );
+
+  // A PRIOR user turn can itself hold privately pasted data (e.g. claim/medical
+  // text the user typed directly into an earlier message). Keeping every user
+  // turn would still forward that to an egress worker, which could copy it into
+  // an outbound URL/query. The structural boundary is the LATEST user turn only —
+  // the current public request the worker is told to act on.
+  const priorUserTurnHistory: ChatMessage[] = [
+    { role: 'user', content: `Earlier I pasted my private detail: ${CANARY}.` },
+    { role: 'assistant', content: 'Understood.' },
+    { role: 'user', content: 'Now fetch the public status page.' },
+  ];
+
+  it.each(EGRESS_TOOLS)(
+    'forwards ONLY the latest user turn for egress tool "%s" (prior user turns can hold pasted private data)',
+    (tool) => {
+      const out = originalMessagesForWorker(
+        priorUserTurnHistory,
+        mkSubtask([tool]),
+      );
+      expect(out).toEqual([
+        { role: 'user', content: 'Now fetch the public status page.' },
+      ]);
+      expect(out.map((m) => m.content).join('\n')).not.toContain(CANARY);
+    },
+  );
+
+  it('preserves the full history for a non-egress (private-read) worker', () => {
+    const out = originalMessagesForWorker(history, mkSubtask(['folder.read', 'file.read']));
+    expect(out).toEqual(history);
+    expect(out.map((m) => m.content).join('\n')).toContain(CANARY);
+  });
+
+  it('strips history when an egress tool is mixed with non-egress tools in one subtask', () => {
+    const out = originalMessagesForWorker(history, mkSubtask(['file.read', 'research.ask']));
+    expect(out.every((m) => m.role === 'user')).toBe(true);
+    expect(out.map((m) => m.content).join('\n')).not.toContain(CANARY);
   });
 });

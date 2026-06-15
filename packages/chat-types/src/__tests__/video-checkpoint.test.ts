@@ -10,6 +10,10 @@ import {
   decodeVideoCheckpointCancelledListResult,
   encodeVideoCheckpointBillingListResult,
   decodeVideoCheckpointBillingListResult,
+  encodeVideoCheckpointUserDeliveryPendingListResult,
+  decodeVideoCheckpointUserDeliveryPendingListResult,
+  encodeVideoCheckpointStuckDeliveryPendingListResult,
+  decodeVideoCheckpointStuckDeliveryPendingListResult,
   MAX_VIDEO_CHECKPOINT_RPC_BYTES,
 } from '../video-checkpoint';
 
@@ -99,6 +103,115 @@ describe('video-checkpoint RPC contract', () => {
     expect(decodeVideoCheckpointRequest(encodeVideoCheckpointRequest(debited))).toEqual(debited);
     const released = { op: 'mark_terminal' as const, mediaJobId: 'mj_1', terminalState: 'released' as const };
     expect(decodeVideoCheckpointRequest(encodeVideoCheckpointRequest(released))).toEqual(released);
+  });
+
+  it('round-trips mark_delivery_pending (provider done + billed, awaiting client receipt)', () => {
+    const req = {
+      op: 'mark_delivery_pending' as const,
+      userId: 'u1',
+      mediaJobId: 'mj_1',
+      providerJobId: 'models/veo/operations/xyz',
+      deliveredPendingAt: '2026-06-15T10:00:00.000Z',
+    };
+    expect(decodeVideoCheckpointRequest(encodeVideoCheckpointRequest(req))).toEqual(req);
+  });
+
+  it('round-trips list_user_delivery_pending (user-scoped re-delivery list)', () => {
+    const req = { op: 'list_user_delivery_pending' as const, userId: 'u1', limit: 5 };
+    expect(decodeVideoCheckpointRequest(encodeVideoCheckpointRequest(req))).toEqual(req);
+  });
+
+  it('round-trips list_stuck_delivery_pending (global reconciler observability op — age threshold)', () => {
+    const req = {
+      op: 'list_stuck_delivery_pending' as const,
+      olderThanMs: 6 * 60 * 60 * 1000,
+      limit: 25,
+    };
+    expect(decodeVideoCheckpointRequest(encodeVideoCheckpointRequest(req))).toEqual(req);
+  });
+
+  it('caps list_stuck_delivery_pending.limit at the sample cap (50) so the result never overflows', () => {
+    // The result `sample` is bounded at 50; the request limit must agree, or a
+    // limit above 50 with that many stuck rows would overflow the result schema
+    // and fail the monitor RPC instead of alerting.
+    expect(() =>
+      encodeVideoCheckpointRequest({
+        op: 'list_stuck_delivery_pending',
+        olderThanMs: 6 * 60 * 60 * 1000,
+        limit: 51,
+      } as never),
+    ).toThrow();
+    const atCap = {
+      op: 'list_stuck_delivery_pending' as const,
+      olderThanMs: 6 * 60 * 60 * 1000,
+      limit: 50,
+    };
+    expect(decodeVideoCheckpointRequest(encodeVideoCheckpointRequest(atCap))).toEqual(atCap);
+  });
+
+  it('round-trips a stuck delivery-pending list result (count + bounded sample)', () => {
+    const result = {
+      ok: true as const,
+      count: 137,
+      sample: [
+        {
+          mediaJobId: 'mj_1',
+          providerId: 'google',
+          deliveredPendingAt: '2026-06-14T10:00:00.000Z',
+        },
+        {
+          mediaJobId: 'mj_2',
+          providerId: 'google',
+          deliveredPendingAt: '2026-06-14T11:00:00.000Z',
+        },
+      ],
+    };
+    expect(
+      decodeVideoCheckpointStuckDeliveryPendingListResult(
+        encodeVideoCheckpointStuckDeliveryPendingListResult(result),
+      ),
+    ).toEqual(result);
+  });
+
+  it('round-trips a stuck delivery-pending list failure result', () => {
+    const result = { ok: false as const, reason: 'BROKER_UNREACHABLE' };
+    expect(
+      decodeVideoCheckpointStuckDeliveryPendingListResult(
+        encodeVideoCheckpointStuckDeliveryPendingListResult(result),
+      ),
+    ).toEqual(result);
+  });
+
+  it('round-trips an operator_alert request (delivery-pending-stale variant — aggregate count + sample)', () => {
+    const req = {
+      op: 'operator_alert' as const,
+      alert: {
+        code: 'VIDEO_DELIVERY_PENDING_STALE' as const,
+        count: 42,
+        sample: [
+          {
+            mediaJobId: 'mj_1',
+            providerId: 'google',
+            deliveredPendingAt: '2026-06-14T10:00:00.000Z',
+          },
+        ],
+      },
+    };
+    expect(decodeVideoCheckpointRequest(encodeVideoCheckpointRequest(req))).toEqual(req);
+  });
+
+  it('rejects a VIDEO_DELIVERY_PENDING_STALE alert that smuggles a prompt key (strict — no plaintext leak)', () => {
+    expect(() =>
+      encodeVideoCheckpointRequest({
+        op: 'operator_alert',
+        alert: {
+          code: 'VIDEO_DELIVERY_PENDING_STALE',
+          count: 1,
+          sample: [],
+          prompt: 'leak me',
+        },
+      } as never),
+    ).toThrow();
   });
 
   it('round-trips reconcile_hold', () => {
@@ -207,6 +320,20 @@ describe('video-checkpoint RPC contract', () => {
     expect(decodeVideoCheckpointLoadResult(encodeVideoCheckpointLoadResult(result))).toEqual(result);
   });
 
+  it('round-trips a load result (delivery_pending state — billed, awaiting/needing re-delivery)', () => {
+    const result = {
+      ok: true as const,
+      checkpoint: {
+        state: 'delivery_pending' as const,
+        providerId: 'google',
+        modelId: 'veo-3.1-generate-preview',
+        providerJobId: 'models/veo/operations/xyz',
+        provenanceSnapshotHash: 'e'.repeat(64),
+      },
+    };
+    expect(decodeVideoCheckpointLoadResult(encodeVideoCheckpointLoadResult(result))).toEqual(result);
+  });
+
   it('round-trips a load result (null checkpoint)', () => {
     const result = { ok: true as const, checkpoint: null };
     expect(decodeVideoCheckpointLoadResult(encodeVideoCheckpointLoadResult(result))).toEqual(result);
@@ -261,6 +388,26 @@ describe('video-checkpoint RPC contract', () => {
     };
     expect(
       decodeVideoCheckpointBillingListResult(encodeVideoCheckpointBillingListResult(result)),
+    ).toEqual(result);
+  });
+
+  it('round-trips a user delivery-pending list result (re-deliverable jobs)', () => {
+    const result = {
+      ok: true as const,
+      jobs: [
+        {
+          mediaJobId: 'mj_1',
+          providerId: 'google',
+          modelId: 'veo-3.1-generate-preview',
+          providerJobId: 'op_1',
+          provenanceSnapshotHash: 'a'.repeat(64),
+        },
+      ],
+    };
+    expect(
+      decodeVideoCheckpointUserDeliveryPendingListResult(
+        encodeVideoCheckpointUserDeliveryPendingListResult(result),
+      ),
     ).toEqual(result);
   });
 

@@ -240,6 +240,18 @@ export const OrchestratorRequestContextSchema = z.object({
     .literal("calypso-orchestrator-v1")
     .default("calypso-orchestrator-v1"),
   preferredModelId: z.string().min(1).max(128).default("auto"),
+  // This turn does NOT plan or call a model: the enclave handles the user's
+  // billed-but-undelivered video(s) (delivery_pending checkpoints). The
+  // honest-user recovery trigger for bill-on-generation.
+  //   true   → deliver: re-poll + re-deliver the already-paid asset(s) (the
+  //            client sends it after the user taps "Retrieve your video").
+  //   'list' → list-only probe (#1b): the enclave only reports HOW MANY pending
+  //            jobs exist (no poll/deliver) so the client can quietly surface the
+  //            recovery banner on mount even if the user never saw the live
+  //            VIDEO_GENERATE_DELIVERY_UNCONFIRMED_BILLED event. The enclave only
+  //            understands 'list' once rotated — pre-rotation it fails closed
+  //            (the probe is gated off by default; see the client probe flag).
+  retrievePendingMedia: z.union([z.boolean(), z.literal("list")]).default(false),
   clientCapabilities: z
     .object({
       supportsPlanEvents: z.boolean().default(false),
@@ -300,9 +312,69 @@ export const OrchestratorProgressEventSchema = z.discriminatedUnion("_type", [
     title: z.string().min(1).max(160),
     byteSize: z.number().int().nonnegative().max(2_147_483_647),
     sha256: z.string().regex(/^[a-f0-9]{64}$/),
-    ciphertextRef: z.string().min(1).max(512),
+    // Empty string is VALID and expected for generated media (image/video):
+    // the bytes are delivered over the binary_work_item write-ACK path, not a
+    // server-stored ciphertext, so the enclave emits ciphertextRef:"" by design
+    // (enclave/src/index.ts, orchestrator/media-executor.ts). Requiring a
+    // non-empty value here made the web+mobile client schema reject the live
+    // artifact event → the SSE read loop threw before processing any binary
+    // frame → R4 image/video never delivered. Keep the 512-char upper bound.
+    ciphertextRef: z.string().max(512),
   }),
 ]);
 export type OrchestratorProgressEvent = z.infer<
   typeof OrchestratorProgressEventSchema
 >;
+
+/**
+ * Salvage a subtask-FAILURE signal from an orchestrator progress / media-job
+ * frame that failed `OrchestratorProgressEventSchema` validation.
+ *
+ * Clients drop malformed best-effort metadata frames (plan / text / artifact /
+ * non-error progress) fail-soft so one bad frame can't abort the whole turn.
+ * But a `status: "error"` progress/media frame is NOT decorative — it is the
+ * signal the workspace uses to mark a subtask failed. Silently dropping it
+ * would let the terminal-state computation report a FALSE SUCCESS even though a
+ * required subtask errored (Codex review, PR #106).
+ *
+ * Returns a minimal, schema-valid `orchestrator_progress` error event for the
+ * subtask (over-long fields clamped, the offending `detail` truncated) so the
+ * failure is still recorded — or `null` when the frame isn't a recoverable
+ * subtask-error signal (not an error frame, or no identifiable subtask).
+ */
+export function recoverFailedSubtaskProgress(
+  obj: unknown,
+): Extract<OrchestratorProgressEvent, { _type: "orchestrator_progress" }> | null {
+  if (!obj || typeof obj !== "object") return null;
+  const raw = obj as Record<string, unknown>;
+  if (
+    raw._type !== "orchestrator_progress" &&
+    raw._type !== "orchestrator_media_job_progress"
+  ) {
+    return null;
+  }
+  if (raw.status !== "error") return null;
+  const planId = typeof raw.planId === "string" ? raw.planId.slice(0, 64) : "";
+  const subtaskId =
+    typeof raw.subtaskId === "string" ? raw.subtaskId.slice(0, 64) : "";
+  if (planId.length === 0 || subtaskId.length === 0) return null;
+  const label =
+    typeof raw.label === "string" && raw.label.length > 0
+      ? raw.label.slice(0, 160)
+      : "Step failed";
+  const detail =
+    typeof raw.detail === "string" ? raw.detail.slice(0, 500) : undefined;
+  const candidate = {
+    _type: "orchestrator_progress" as const,
+    planId,
+    subtaskId,
+    status: "error" as const,
+    label,
+    ...(detail !== undefined ? { detail } : {}),
+  };
+  // Re-validate so a clamping miss yields null (drop) rather than a bad event.
+  const parsed = OrchestratorProgressEventSchema.safeParse(candidate);
+  return parsed.success && parsed.data._type === "orchestrator_progress"
+    ? parsed.data
+    : null;
+}

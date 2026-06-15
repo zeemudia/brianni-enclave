@@ -21,6 +21,8 @@ import {
   decodeVideoCheckpointWriteResult,
   decodeVideoCheckpointCancelledListResult,
   decodeVideoCheckpointBillingListResult,
+  decodeVideoCheckpointUserDeliveryPendingListResult,
+  decodeVideoCheckpointStuckDeliveryPendingListResult,
   type VideoCheckpointRequest,
   type VideoOperatorAlert,
 } from '@calypso/chat-types';
@@ -117,6 +119,28 @@ export function createVideoCheckpointClient(ctx: VideoCheckpointUserContext): Ch
       );
     },
 
+    markDeliveryPending: async ({ mediaJobId, providerJobId, deliveredPendingAt }) => {
+      const userId = requireUser(ctx);
+      // Fail-closed (writeOrThrow): a durable-store miss throws, so the media
+      // executor leaves the job `provider_started` + undebited rather than
+      // debiting an asset it cannot mark re-deliverable — a clean resume then
+      // bills exactly once.
+      await writeOrThrow(
+        { op: 'mark_delivery_pending', userId, mediaJobId, providerJobId, deliveredPendingAt },
+        'MARK_DELIVERY_PENDING',
+      );
+    },
+
+    listUserDeliveryPending: async ({ limit }) => {
+      const userId = requireUser(ctx);
+      const bytes = await sendVideoCheckpointRpc({ op: 'list_user_delivery_pending', userId, limit });
+      const result = decodeVideoCheckpointUserDeliveryPendingListResult(bytes);
+      if (!result.ok) {
+        throw new Error(`VIDEO_CHECKPOINT_LIST_USER_DELIVERY_PENDING_FAILED:${result.reason}`);
+      }
+      return result.jobs;
+    },
+
     listCancelledPending: async ({ limit }) => {
       const bytes = await sendVideoCheckpointRpc({ op: 'list_cancelled_pending', limit });
       const result = decodeVideoCheckpointCancelledListResult(bytes);
@@ -129,6 +153,19 @@ export function createVideoCheckpointClient(ctx: VideoCheckpointUserContext): Ch
       const result = decodeVideoCheckpointBillingListResult(bytes);
       if (!result.ok) throw new Error(`VIDEO_CHECKPOINT_LIST_BILLING_FAILED:${result.reason}`);
       return result.jobs;
+    },
+
+    listStuckDeliveryPending: async ({ olderThanMs, limit }) => {
+      const bytes = await sendVideoCheckpointRpc({
+        op: 'list_stuck_delivery_pending',
+        olderThanMs,
+        limit,
+      });
+      const result = decodeVideoCheckpointStuckDeliveryPendingListResult(bytes);
+      if (!result.ok) {
+        throw new Error(`VIDEO_CHECKPOINT_LIST_STUCK_DELIVERY_PENDING_FAILED:${result.reason}`);
+      }
+      return { count: result.count, sample: result.sample };
     },
 
     markBillingSlaEscalated: async ({ mediaJobId, alertedAt, providerDisabledAt }) => {

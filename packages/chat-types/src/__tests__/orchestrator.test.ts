@@ -11,6 +11,7 @@ import {
   OrchestratorProgressEventSchema,
   OrchestratorRequestContextSchema,
   OrchestratorWorkingMemoryEntrySchema,
+  recoverFailedSubtaskProgress,
 } from "../orchestrator";
 
 describe("orchestrator contracts", () => {
@@ -169,6 +170,25 @@ describe("orchestrator contracts", () => {
     expect(parsed.preferredModelId).toBe("auto");
   });
 
+  it("defaults retrievePendingMedia to false and accepts true / 'list'", () => {
+    expect(OrchestratorRequestContextSchema.parse({}).retrievePendingMedia).toBe(false);
+    // true = deliver the user's pending video(s); 'list' = list-only probe (#1b).
+    expect(
+      OrchestratorRequestContextSchema.parse({ retrievePendingMedia: true })
+        .retrievePendingMedia,
+    ).toBe(true);
+    expect(
+      OrchestratorRequestContextSchema.parse({ retrievePendingMedia: "list" })
+        .retrievePendingMedia,
+    ).toBe("list");
+  });
+
+  it("rejects an unknown retrievePendingMedia mode string", () => {
+    expect(() =>
+      OrchestratorRequestContextSchema.parse({ retrievePendingMedia: "deliver" }),
+    ).toThrow();
+  });
+
   it("accepts plan and progress events", () => {
     expect(
       OrchestratorProgressEventSchema.parse({
@@ -189,6 +209,50 @@ describe("orchestrator contracts", () => {
         text: "Draft complete.",
       }),
     ).toMatchObject({ role: "final_artifact" });
+  });
+
+  it("accepts a media orchestrator_artifact with an empty ciphertextRef (binary write-ACK delivery)", () => {
+    // R4 root cause (2026-06-14): the enclave emits orchestrator_artifact for a
+    // generated image/video with ciphertextRef:"" on purpose — the bytes are
+    // delivered over the binary_work_item write-ACK path, not a server-stored
+    // ciphertext (enclave/src/index.ts:3820, media-executor.ts:845). The client
+    // schema required ciphertextRef non-empty, so OrchestratorProgressEventSchema
+    // .parse() THREW in transport.handleChatChunk (web + mobile), killing the
+    // turn's SSE read loop before any binary frame was processed → image never
+    // rendered, enclave hung on the write-ACK → "couldn't finish".
+    const parsed = OrchestratorProgressEventSchema.parse({
+      _type: "orchestrator_artifact",
+      planId: "plan_d571d616",
+      subtaskId: "st_image",
+      artifactId: "019e118e-7f89-4445-a1b9-b1ad721ce88b",
+      kind: "image/png",
+      title: "Generate image",
+      byteSize: 1838418,
+      sha256:
+        "1031ad2b21e7ac09afedefdd7c488abb0eb03edfdf11c0fe0b89f4adf6a144e8",
+      ciphertextRef: "",
+    });
+    expect(parsed).toMatchObject({
+      _type: "orchestrator_artifact",
+      kind: "image/png",
+      ciphertextRef: "",
+    });
+  });
+
+  it("still accepts a media orchestrator_artifact with a server-stored ciphertextRef", () => {
+    const parsed = OrchestratorProgressEventSchema.parse({
+      _type: "orchestrator_artifact",
+      planId: "plan_123",
+      subtaskId: "st_image",
+      artifactId: "art_1",
+      kind: "image/png",
+      title: "Generate image",
+      byteSize: 1024,
+      sha256:
+        "1031ad2b21e7ac09afedefdd7c488abb0eb03edfdf11c0fe0b89f4adf6a144e8",
+      ciphertextRef: "blob_opaque_1",
+    });
+    expect(parsed).toMatchObject({ ciphertextRef: "blob_opaque_1" });
   });
 
   it("accepts durable local ledger entries", () => {
@@ -212,5 +276,90 @@ describe("orchestrator contracts", () => {
         ordinal: 7,
       }).ordinal,
     ).toBe(7);
+  });
+});
+
+describe("recoverFailedSubtaskProgress", () => {
+  // Codex review (PR #106): when a progress/media frame that signals a subtask
+  // FAILURE fails schema validation (e.g. an over-long `detail`), the consumer
+  // must NOT silently drop it — doing so loses the only signal the workspace
+  // uses to mark the subtask failed, so the turn computes a false success.
+  // This salvages a minimal, schema-valid orchestrator_progress(error).
+
+  it("recovers a subtask error from a progress frame with an over-long detail", () => {
+    const recovered = recoverFailedSubtaskProgress({
+      _type: "orchestrator_progress",
+      planId: "plan_e",
+      subtaskId: "st_write",
+      status: "error",
+      label: "Save the file",
+      detail: "x".repeat(5000), // exceeds the 500-char bound → original fails
+    });
+    expect(recovered).toMatchObject({
+      _type: "orchestrator_progress",
+      planId: "plan_e",
+      subtaskId: "st_write",
+      status: "error",
+    });
+    // The recovered event is itself schema-valid (clamped detail).
+    expect(() =>
+      OrchestratorProgressEventSchema.parse(recovered),
+    ).not.toThrow();
+    expect((recovered?.detail ?? "").length).toBeLessThanOrEqual(500);
+  });
+
+  it("recovers a subtask error from a media_job_progress error frame", () => {
+    const recovered = recoverFailedSubtaskProgress({
+      _type: "orchestrator_media_job_progress",
+      planId: "plan_v",
+      subtaskId: "st_video",
+      mediaJobId: "mj_1",
+      status: "error",
+      label: "x".repeat(9000), // over-long label → original fails
+    });
+    expect(recovered).toMatchObject({
+      _type: "orchestrator_progress",
+      subtaskId: "st_video",
+      status: "error",
+    });
+  });
+
+  it("returns null for a non-error frame (safe to drop fail-soft)", () => {
+    expect(
+      recoverFailedSubtaskProgress({
+        _type: "orchestrator_progress",
+        planId: "plan_e",
+        subtaskId: "st_x",
+        status: "running",
+        label: "x".repeat(5000),
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null for an artifact frame (metadata, not a failure signal)", () => {
+    expect(
+      recoverFailedSubtaskProgress({
+        _type: "orchestrator_artifact",
+        planId: "plan_e",
+        subtaskId: "st_image",
+        artifactId: "art_1",
+        kind: "application/zip",
+        title: "t",
+        byteSize: 1,
+        sha256: "a".repeat(64),
+        ciphertextRef: "",
+      }),
+    ).toBeNull();
+  });
+
+  it("returns null when the subtask cannot be identified", () => {
+    expect(
+      recoverFailedSubtaskProgress({
+        _type: "orchestrator_progress",
+        planId: "plan_e",
+        status: "error", // no subtaskId → cannot target a subtask
+        label: "boom",
+      }),
+    ).toBeNull();
   });
 });

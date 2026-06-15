@@ -118,6 +118,84 @@ function makeRecords(record: MediaProvenanceRecord = promptRecord) {
 // the real wall clock advances past 08:15:00 UTC on 2026-05-19.
 const FIXED_NOW = new Date("2026-05-19T08:00:30.000Z");
 
+// Drives a single video.generate run with recording fakes for the billing +
+// checkpoint surface, so the bill-on-generation / resumable-re-delivery tests
+// stay readable. `load` lets a test resume from an existing checkpoint; `poll`
+// defaults to an immediate `done`.
+async function runVideoGen(opts: {
+  ackOutcome?: "ok" | "denied_by_user" | "error";
+  ackReason?: string;
+  load?: any;
+  linkedFolders?: any[];
+  videoBytes?: Uint8Array;
+}) {
+  const events: any[] = [];
+  const reserves: any[] = [];
+  const reconciles: any[] = [];
+  const terminals: any[] = [];
+  const deliveryPendings: any[] = [];
+  const bytes = opts.videoBytes ?? new TextEncoder().encode("mp4");
+  const ack = fakeBinaryWriteAck(opts.ackOutcome ?? "ok", opts.ackReason);
+  for await (const event of runMediaSubtask({
+    agentTurnId: "turn_1",
+    planId: "plan_1",
+    subtask: { ...baseSubtask, media: baseGenerateMedia },
+    route: baseRoute,
+    videoAdapters: {
+      google: {
+        start: async () => ({ providerJobId: "op-1" }),
+        poll: async () => ({
+          status: "done",
+          videoBytes: bytes,
+          mimeType: "video/mp4",
+          actualQuotaUnits: 200,
+          billingSource: "provider_operation_metadata",
+        }),
+      },
+    },
+    providerInput: baseProviderInput,
+    recordsByHandleId: makeRecords(),
+    handleStore,
+    provenanceSigner,
+    consentVerifier,
+    budgetClient: {
+      reserve: async () => {
+        reserves.push(true);
+        return { ok: true, holdId: "hold_1" } as const;
+      },
+      reconcile: async (input) => {
+        reconciles.push(input);
+      },
+    },
+    checkpointClient: {
+      ...checkpointClient,
+      load: opts.load ?? (async () => null),
+      markTerminal: async (input) => {
+        terminals.push(input);
+      },
+      markDeliveryPending: async (input: any) => {
+        deliveryPendings.push(input);
+      },
+    },
+    binaryWorkItems: new BinaryWorkItemManager({ sweepIntervalMs: null }),
+    awaitBinaryWriteAck: ack.fn,
+    linkedFolders: opts.linkedFolders ?? [],
+    sessionId: "sess_1",
+    now: FIXED_NOW,
+    maxProviderPolls: 1,
+    providerPollDelayMs: 0,
+    encryptArtifact: async () => ({
+      artifactId: "artifact_1",
+      ciphertextRef: "",
+      sha256: sha256(bytes),
+      byteSize: bytes.byteLength,
+    }),
+  })) {
+    events.push(event);
+  }
+  return { events, reserves, reconciles, terminals, deliveryPendings, ack };
+}
+
 describe("orchestrator media executor", () => {
   it("delivers a video clip via the binary write-ACK path (preview-only, debits on ok)", async () => {
     const events: any[] = [];
@@ -191,10 +269,81 @@ describe("orchestrator media executor", () => {
     expect(events.some((e) => e.status === "done")).toBe(true);
   });
 
-  it("releases the hold (no debit) when the user declines the video save", async () => {
+  it("bills the generation even when the user declines the folder save (delivered + viewed asset, no refund)", async () => {
+    // Bill-on-generation: by the time the client ACKs, the irreversible provider
+    // cost is already spent and the bytes were delivered (the preview renders
+    // before the save prompt). Declining the FOLDER save is not a refund lever —
+    // that was the bypass ("return a denied ACK to keep the bytes for free").
+    const { reconciles, terminals } = await runVideoGen({
+      ackOutcome: "denied_by_user",
+      linkedFolders: [{ folderId: "fld_1", displayName: "Movies", status: "granted" }],
+    });
+
+    expect(reconciles.some((r) => r.status === "debited")).toBe(true);
+    expect(reconciles.some((r) => r.status === "released")).toBe(false);
+    // Delivered + viewed → terminal (no re-delivery owed), and billed.
+    expect(terminals.some((t) => t.terminalState === "debited")).toBe(true);
+    expect(terminals.some((t) => t.terminalState === "released")).toBe(false);
+  });
+
+  it("bills on generation and marks the job re-deliverable when the delivery ACK fails/withholds (no refund)", async () => {
+    // The core bypass close: a client that received the bytes then returns an
+    // error / withholds the ACK is STILL billed (we debit on the provider's
+    // `done`, not on the ACK). The job is left re-deliverable rather than
+    // refunded, so an honest client that genuinely missed the bytes can recover
+    // the already-paid asset.
+    const { reconciles, terminals, deliveryPendings } = await runVideoGen({
+      ackOutcome: "error",
+    });
+
+    // Debited on generation; never released by a failed ACK.
+    expect(reconciles.some((r) => r.status === "debited" && r.actualQuotaUnits === 200)).toBe(true);
+    expect(reconciles.some((r) => r.status === "released")).toBe(false);
+    // Recorded as re-deliverable (billed, awaiting receipt) — NOT a terminal row.
+    expect(deliveryPendings.length).toBe(1);
+    expect(deliveryPendings[0].providerJobId).toBe("op-1");
+    expect(terminals.some((t) => t.terminalState === "released")).toBe(false);
+    expect(terminals.some((t) => t.terminalState === "debited")).toBe(false);
+  });
+
+  it("emits the recovery sentinel detail (not the ACK reason) on an error ACK so the client surfaces retrieval", async () => {
+    // Codex P2: when an ALIVE client reports an error/timeout ACK, awaitBinaryWriteAck
+    // returns outcome:"error" WITH a reason (e.g. BINARY_WRITE_ACK_TIMEOUT) — the
+    // MAIN recovery case. The web/mobile workspaces flip the "Retrieve your video"
+    // banner only on the exact sentinel detail VIDEO_GENERATE_DELIVERY_UNCONFIRMED_BILLED,
+    // so preferring the ACK reason over the sentinel made these billed,
+    // re-deliverable jobs invisible to the user. The recoverable (non-denied) error
+    // case must always carry the sentinel.
+    const { events, deliveryPendings } = await runVideoGen({
+      ackOutcome: "error",
+      ackReason: "BINARY_WRITE_ACK_TIMEOUT",
+    });
+
+    // Still billed + left re-deliverable.
+    expect(deliveryPendings.length).toBe(1);
+    const errorProgress = events.find(
+      (e) => e.kind === "orchestrator-media-job-progress" && e.status === "error",
+    );
+    expect(errorProgress).toBeDefined();
+    expect(errorProgress.detail).toBe("VIDEO_GENERATE_DELIVERY_UNCONFIRMED_BILLED");
+  });
+
+  it("leaves the row delivery_pending (no second reconcile, no markBillingPending) when delivery THROWS after the in-turn debit", async () => {
+    // Regression: once we have markDeliveryPending'd + reconciled('debited') in
+    // the same turn, the hold is settled and the row is `delivery_pending`. A
+    // throw AFTER that point — e.g. awaitBinaryWriteAck rejecting on a
+    // network/abort/timeout while waiting for the client — must NOT re-enter the
+    // billing_pending_provider reconcile / markBillingPending branch: doing so
+    // settles an already-debited hold a second time AND overwrites the
+    // delivery_pending row to billing_pending, which is outside both
+    // RESUMABLE_STATES and the user-scoped list_user_delivery_pending filter →
+    // the paid video is stranded out of every recovery path.
     const reconciles: any[] = [];
+    const deliveryPendings: any[] = [];
+    const billingPendings: any[] = [];
+    const terminals: any[] = [];
     const events: any[] = [];
-    const ack = fakeBinaryWriteAck("denied_by_user");
+    const bytes = new TextEncoder().encode("mp4");
     for await (const event of runMediaSubtask({
       agentTurnId: "turn_1",
       planId: "plan_1",
@@ -205,7 +354,7 @@ describe("orchestrator media executor", () => {
           start: async () => ({ providerJobId: "op-1" }),
           poll: async () => ({
             status: "done",
-            videoBytes: new TextEncoder().encode("mp4"),
+            videoBytes: bytes,
             mimeType: "video/mp4",
             actualQuotaUnits: 200,
             billingSource: "provider_operation_metadata",
@@ -223,10 +372,26 @@ describe("orchestrator media executor", () => {
           reconciles.push(input);
         },
       },
-      checkpointClient,
+      checkpointClient: {
+        ...checkpointClient,
+        load: async () => null,
+        markDeliveryPending: async (input: any) => {
+          deliveryPendings.push(input);
+        },
+        markBillingPending: async (input: any) => {
+          billingPendings.push(input);
+        },
+        markTerminal: async (input) => {
+          terminals.push(input);
+        },
+      },
       binaryWorkItems: new BinaryWorkItemManager({ sweepIntervalMs: null }),
-      awaitBinaryWriteAck: ack.fn,
-      linkedFolders: [{ folderId: "fld_1", displayName: "Movies", status: "granted" }],
+      // Reject AFTER the bytes are handed off, mimicking a client/connection drop
+      // while the enclave awaits the write ACK.
+      awaitBinaryWriteAck: async () => {
+        throw new Error("connection reset while awaiting ack");
+      },
+      linkedFolders: [],
       sessionId: "sess_1",
       now: FIXED_NOW,
       maxProviderPolls: 1,
@@ -234,16 +399,249 @@ describe("orchestrator media executor", () => {
       encryptArtifact: async () => ({
         artifactId: "artifact_1",
         ciphertextRef: "",
-        sha256: sha256(new TextEncoder().encode("mp4")),
-        byteSize: 3,
+        sha256: sha256(bytes),
+        byteSize: bytes.byteLength,
       }),
     })) {
       events.push(event);
     }
 
+    // Billed exactly once (the in-turn debit); never re-reconciled.
+    expect(reconciles.filter((r) => r.status === "debited").length).toBe(1);
+    expect(reconciles.some((r) => r.status === "billing_pending_provider")).toBe(false);
+    expect(reconciles.some((r) => r.status === "released")).toBe(false);
+    // Row stays delivery_pending — NEVER stomped to billing_pending.
+    expect(deliveryPendings.length).toBe(1);
+    expect(billingPendings.length).toBe(0);
+    expect(terminals.length).toBe(0);
+    // The turn still ends cleanly with an error progress event (no throw escapes).
+    expect(events.at(-1)?.status).toBe("error");
+  });
+
+  it("creates NO delivery_pending row and releases the hold when the debit reconcile THROWS (debit-first; no free-asset path)", async () => {
+    // Debit-FIRST ordering is the structural bypass close: the row is marked
+    // delivery_pending only AFTER a confirmed debit, so a debit failure can never
+    // leave an unpaid delivery_pending row for a later retrieve to re-deliver for
+    // free. Here the debit reconcile throws → markDeliveryPending is NEVER reached
+    // → no delivery_pending row exists → list_user_delivery_pending can never
+    // surface it. The bytes never shipped (the binary-write yield is after the
+    // debit), so nothing is owed: release the still-held hold. It must NOT fall
+    // into billing_pending_provider / markBillingPending (which would bill the
+    // user via the reconciler for an undelivered asset).
+    const reconciles: any[] = [];
+    const deliveryPendings: any[] = [];
+    const billingPendings: any[] = [];
+    const terminals: any[] = [];
+    const events: any[] = [];
+    const bytes = new TextEncoder().encode("mp4");
+    let ackCalled = false;
+    for await (const event of runMediaSubtask({
+      agentTurnId: "turn_1",
+      planId: "plan_1",
+      subtask: { ...baseSubtask, media: baseGenerateMedia },
+      route: baseRoute,
+      videoAdapters: {
+        google: {
+          start: async () => ({ providerJobId: "op-1" }),
+          poll: async () => ({
+            status: "done",
+            videoBytes: bytes,
+            mimeType: "video/mp4",
+            actualQuotaUnits: 200,
+            billingSource: "provider_operation_metadata",
+          }),
+        },
+      },
+      providerInput: baseProviderInput,
+      recordsByHandleId: makeRecords(),
+      handleStore,
+      provenanceSigner,
+      consentVerifier,
+      budgetClient: {
+        reserve: async () => ({ ok: true, holdId: "hold_1" }) as const,
+        reconcile: async (input) => {
+          reconciles.push(input);
+          // The actual charge fails transiently (quota broker RPC error).
+          if (input.status === "debited") throw new Error("quota broker transient");
+        },
+      },
+      checkpointClient: {
+        ...checkpointClient,
+        load: async () => null,
+        markDeliveryPending: async (input: any) => {
+          deliveryPendings.push(input);
+        },
+        markBillingPending: async (input: any) => {
+          billingPendings.push(input);
+        },
+        markTerminal: async (input) => {
+          terminals.push(input);
+        },
+      },
+      binaryWorkItems: new BinaryWorkItemManager({ sweepIntervalMs: null }),
+      awaitBinaryWriteAck: async () => {
+        ackCalled = true;
+        return { invocationId: "inv", outcome: "ok", resultJson: { status: "committed" } } as any;
+      },
+      linkedFolders: [],
+      sessionId: "sess_1",
+      now: FIXED_NOW,
+      maxProviderPolls: 1,
+      providerPollDelayMs: 0,
+      encryptArtifact: async () => ({
+        artifactId: "artifact_1",
+        ciphertextRef: "",
+        sha256: sha256(bytes),
+        byteSize: bytes.byteLength,
+      }),
+    })) {
+      events.push(event);
+    }
+
+    // Debit-first: the debit threw BEFORE markDeliveryPending → no delivery_pending
+    // row was ever written, so a retrieve can never re-deliver this unpaid asset.
+    expect(deliveryPendings.length).toBe(0);
+    // The debit was attempted exactly once (and threw); the bytes never shipped.
+    expect(reconciles.filter((r) => r.status === "debited").length).toBe(1);
+    expect(ackCalled).toBe(false);
+    // NOT billed via the reconciler, NOT stomped to billing_pending.
+    expect(reconciles.some((r) => r.status === "billing_pending_provider")).toBe(false);
+    expect(billingPendings.length).toBe(0);
+    // Released (no bill); no terminal_released needed (the provider_started row
+    // simply TTL-expires, and it was never re-deliverable).
+    expect(reconciles.some((r) => r.status === "released")).toBe(true);
+    expect(terminals.some((t) => t.terminalState === "debited")).toBe(false);
+    // Clean error event; no throw escapes the generator.
+    expect(events.at(-1)?.status).toBe("error");
+  });
+
+  it("best-effort re-records delivery_pending (no release, no re-bill) when markDeliveryPending throws AFTER a successful debit", async () => {
+    // Debit-first: the debit SUCCEEDED (asset paid) but markDeliveryPending threw,
+    // so the paid row was never recorded re-deliverable on the happy path. The
+    // catch must NOT release the already-debited hold and must NOT bill again — it
+    // best-effort re-records the row delivery_pending so the paid asset stays
+    // recoverable (a resume/retrieve then never re-debits). Here the retry (in the
+    // catch) succeeds, so the row ends up delivery_pending.
+    const reconciles: any[] = [];
+    const deliveryPendings: any[] = [];
+    const billingPendings: any[] = [];
+    const events: any[] = [];
+    const bytes = new TextEncoder().encode("mp4");
+    let markCalls = 0;
+    for await (const event of runMediaSubtask({
+      agentTurnId: "turn_1",
+      planId: "plan_1",
+      subtask: { ...baseSubtask, media: baseGenerateMedia },
+      route: baseRoute,
+      videoAdapters: {
+        google: {
+          start: async () => ({ providerJobId: "op-1" }),
+          poll: async () => ({
+            status: "done",
+            videoBytes: bytes,
+            mimeType: "video/mp4",
+            actualQuotaUnits: 200,
+            billingSource: "provider_operation_metadata",
+          }),
+        },
+      },
+      providerInput: baseProviderInput,
+      recordsByHandleId: makeRecords(),
+      handleStore,
+      provenanceSigner,
+      consentVerifier,
+      budgetClient: {
+        reserve: async () => ({ ok: true, holdId: "hold_1" }) as const,
+        reconcile: async (input) => {
+          reconciles.push(input);
+        },
+      },
+      checkpointClient: {
+        ...checkpointClient,
+        load: async () => null,
+        markDeliveryPending: async (input: any) => {
+          markCalls += 1;
+          // The happy-path call (right after the debit) throws; the catch's
+          // best-effort retry succeeds.
+          if (markCalls === 1) throw new Error("checkpoint RPC blip");
+          deliveryPendings.push(input);
+        },
+        markBillingPending: async (input: any) => {
+          billingPendings.push(input);
+        },
+      },
+      binaryWorkItems: new BinaryWorkItemManager({ sweepIntervalMs: null }),
+      awaitBinaryWriteAck: async () => ({
+        invocationId: "inv",
+        outcome: "ok",
+        resultJson: { status: "committed" },
+      }) as any,
+      linkedFolders: [],
+      sessionId: "sess_1",
+      now: FIXED_NOW,
+      maxProviderPolls: 1,
+      providerPollDelayMs: 0,
+      encryptArtifact: async () => ({
+        artifactId: "artifact_1",
+        ciphertextRef: "",
+        sha256: sha256(bytes),
+        byteSize: bytes.byteLength,
+      }),
+    })) {
+      events.push(event);
+    }
+
+    // Debited exactly once (the asset is paid); never released, never re-billed.
+    expect(reconciles.filter((r) => r.status === "debited").length).toBe(1);
+    expect(reconciles.some((r) => r.status === "released")).toBe(false);
+    expect(reconciles.some((r) => r.status === "billing_pending_provider")).toBe(false);
+    expect(billingPendings.length).toBe(0);
+    // markDeliveryPending was attempted twice (happy-path threw, catch retried)
+    // and the retry recorded the paid row re-deliverable.
+    expect(markCalls).toBe(2);
+    expect(deliveryPendings.length).toBe(1);
+  });
+
+  it("re-delivers an already-paid asset from a delivery_pending checkpoint without reserving or debiting again", async () => {
+    // Resume path: a job billed on a prior attempt (delivery_pending) re-polls
+    // the provider job and re-delivers the asset. It must NOT reserve a new hold
+    // or debit again (that would double-charge), and on success marks terminal.
+    const { reserves, reconciles, terminals, deliveryPendings, ack } = await runVideoGen({
+      ackOutcome: "ok",
+      load: async () => ({
+        state: "delivery_pending",
+        providerId: "google",
+        modelId: "veo-3.1-generate-preview",
+        providerJobId: "op-1",
+        provenanceSnapshotHash: promptProvenanceSnapshotHash,
+      }),
+    });
+
+    // The asset was actually re-delivered.
+    expect(ack.calls.length).toBe(1);
+    // No second charge: no reserve, no debit.
+    expect(reserves.length).toBe(0);
+    expect(reconciles.some((r) => r.status === "debited")).toBe(false);
+    expect(reconciles.some((r) => r.status === "released")).toBe(false);
+    // Not re-marked delivery_pending; finalised as delivered.
+    expect(deliveryPendings.length).toBe(0);
+    expect(terminals.some((t) => t.terminalState === "debited")).toBe(true);
+  });
+
+  it("releases the hold (no bill) when the generated video exceeds the deliverable cap", async () => {
+    // Bill-on-generation must NOT charge for an asset we can never deliver (our
+    // own output cap). This is not a bypass — the attacker gets nothing — so the
+    // honest-user protection (release, no debit) is preserved for undeliverable
+    // output. (videoMaxOutputBytes default is far below this 200MB payload.)
+    const { reconciles, deliveryPendings, events } = await runVideoGen({
+      ackOutcome: "ok",
+      videoBytes: new Uint8Array(200 * 1024 * 1024),
+    });
+
     expect(reconciles.some((r) => r.status === "released")).toBe(true);
     expect(reconciles.some((r) => r.status === "debited")).toBe(false);
-    expect(events.some((e) => e.status === "blocked")).toBe(true);
+    expect(deliveryPendings.length).toBe(0);
+    expect(events.some((e) => e.status === "error")).toBe(true);
   });
 
   it("blocks resumed specialist jobs when the provenance snapshot changed", async () => {

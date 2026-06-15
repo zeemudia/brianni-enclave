@@ -45,6 +45,7 @@ import {
 import {
   runVideoReconcilerOnce,
   VIDEO_RECONCILER_INTERVAL_MS,
+  type StaleDeliveryAlertState,
 } from "./video-reconciler";
 import { buildProviderDisplayNameMap } from "./providers/display-name";
 import { effectiveNativeWebSearchMode } from "./providers/native-web-search";
@@ -129,6 +130,7 @@ import {
   runOrchestrator,
   type RunOrchestratorDeps,
 } from "./orchestrator/executor";
+import { redeliverPendingMedia } from "./orchestrator/media-redeliver";
 import { toProgressChunk } from "./orchestrator/events";
 import { buildModelCapabilities } from "./orchestrator/model-capabilities";
 
@@ -654,10 +656,14 @@ export class EnclaveRouter {
     if (this.videoReconcilerTimer) return;
     const videoAdapters = this.media?.videoAdapters;
     if (!videoAdapters || Object.keys(videoAdapters).length === 0) return;
+    // Persistent across-tick holder so the stale-delivery alert is suppressed
+    // between sweeps (re-alerts at most once per window while a backlog persists).
+    const staleAlertState: StaleDeliveryAlertState = {};
     const tick = () =>
       void runVideoReconcilerOnce({
         videoAdapters,
         disabledVideoProviders: this.disabledVideoProviders,
+        staleAlertState,
       });
     this.videoReconcilerTimer = setInterval(tick, VIDEO_RECONCILER_INTERVAL_MS);
     this.videoReconcilerTimer.unref?.();
@@ -2407,8 +2413,52 @@ export class EnclaveRouter {
             singleModeAgentModel = admission.modelId;
           }
 
-          const agentEventStream =
-            orchestratorContext.runMode === "orchestrator"
+          const agentEventStream = orchestratorContext.retrievePendingMedia
+            ? // Honest-user recovery: re-deliver the user's billed-but-undelivered
+              // video(s) (delivery_pending checkpoints). This turn does NOT plan
+              // or call a model — it re-polls the provider job(s) and re-delivers
+              // over the same binary write-ACK pump below. Requires production
+              // media + an authenticated user (the per-user checkpoint store);
+              // otherwise there is nothing to retrieve, so end the turn cleanly.
+              this.productionMediaWired &&
+              this.media?.videoAdapters &&
+              authenticatedUserId
+              ? redeliverPendingMedia({
+                  // 'list' = quiet on-mount probe (#1b): report how many pending
+                  // jobs exist, no poll/deliver. true = deliver the asset(s).
+                  mode:
+                    orchestratorContext.retrievePendingMedia === "list"
+                      ? "list"
+                      : "deliver",
+                  agentTurnId: agentTurnId!,
+                  sessionId: sessionId!,
+                  videoAdapters: this.media.videoAdapters,
+                  binaryWorkItems: this.binaryWorkItems,
+                  awaitBinaryWriteAck: (payload) => {
+                    const key = invocationKey(
+                      sessionId!,
+                      payload.request.agentTurnId,
+                      payload.request.invocationId,
+                    );
+                    return buildBinaryWriteAckPromise(
+                      key,
+                      payload.request.invocationId,
+                    );
+                  },
+                  // The store client types listUserDeliveryPending optional (the
+                  // shared media checkpoint type predates re-delivery); the real
+                  // client always implements it.
+                  checkpointClient: ((c) => ({
+                    listUserDeliveryPending: c.listUserDeliveryPending!,
+                    markTerminal: c.markTerminal,
+                  }))(createVideoCheckpointClient({ userId: authenticatedUserId })),
+                  encryptArtifact: this.media.encryptArtifact,
+                  abortSignal: connectionSignal,
+                })
+              : (async function* emptyRetrieve() {
+                  yield { kind: "done" as const };
+                })()
+            : orchestratorContext.runMode === "orchestrator"
               ? runOrchestrator({
                   gateway,
                   pack: effectivePack,
