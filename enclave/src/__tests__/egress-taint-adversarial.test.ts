@@ -566,7 +566,7 @@ describe('orchestrator — taint across subtask working-memory DIGEST (B11 corpu
       ],
       // memory.read needs no linked folder (unlike the folder.read fixtures in
       // orchestrator-egress-memory-isolation.test.ts).
-      requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const },
+      requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const, connectedConnectors: [], connectorModeEchoes: [] },
       workerTimeoutMs: 5_000,
       summaryTimeoutMs: 5_000,
     };

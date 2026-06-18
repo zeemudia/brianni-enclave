@@ -1,7 +1,46 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { encodeFrame, decodeFrame, MSG } from "../vsock";
-import { webcrypto } from "node:crypto";
+import { webcrypto, generateKeyPairSync, sign as edSign } from "node:crypto";
 import { ProviderError } from "../providers/errors";
+import { canonicalConnectorsSigningInput } from "@calypso/chat-types";
+import {
+  initConnectorRegistry,
+  __resetConnectorRegistryForTest,
+} from "../connectors/registry";
+
+const { publicKey: connectorsPub, privateKey: connectorsPriv } =
+  generateKeyPairSync("ed25519");
+const connectorsVerifyKeyPem = connectorsPub
+  .export({ format: "pem", type: "spki" })
+  .toString();
+
+function signedConnectorCatalog(version: number) {
+  const connectors = [
+    {
+      id: "google-calendar",
+      displayName: "Google Calendar",
+      provider: "google",
+      platforms: ["web", "ios", "android"],
+      oauthScopes: ["https://www.googleapis.com/auth/calendar.events"],
+      operations: [
+        {
+          id: "list_events",
+          mutating: false,
+          destructive: false,
+          requiredScope: "calendar.readonly",
+          paramsSchema: {},
+        },
+      ],
+      mcp: null,
+    },
+  ];
+  const signature = edSign(
+    null,
+    canonicalConnectorsSigningInput(version, connectors),
+    connectorsPriv,
+  ).toString("base64");
+  return { version, connectors, signature };
+}
 
 const subtle = webcrypto.subtle;
 
@@ -203,6 +242,40 @@ describe("EnclaveRouter — extended", () => {
     const payload = JSON.parse(decoded.payload.toString());
     expect(payload.status).toBe("ok");
     expect(typeof payload.uptime).toBe("number");
+  });
+
+  it("health ping reports connector registry status (objective rotation-verify probe)", async () => {
+    // Loaded: HEALTH_PONG must carry connectorRegistryLoaded=true + the version.
+    initConnectorRegistry(signedConnectorCatalog(2), connectorsVerifyKeyPem);
+
+    const loadedFrames: Buffer[] = [];
+    for await (const frame of router.handleMessage(
+      encodeFrame(MSG.HEALTH_PING, Buffer.alloc(0)),
+    )) {
+      loadedFrames.push(frame);
+    }
+    const loadedBody = JSON.parse(
+      decodeFrame(loadedFrames[0]).payload.toString(),
+    );
+    expect(loadedBody.status).toBe("ok");
+    expect(loadedBody.connectorRegistryLoaded).toBe(true);
+    expect(loadedBody.connectorCatalogVersion).toBe(2);
+
+    // Unloaded/reset: connectorRegistryLoaded=false + null version (so an
+    // older enclave — or one booted before the connectors-broker exists —
+    // reports a deterministic, generic "not loaded" rather than throwing).
+    __resetConnectorRegistryForTest();
+
+    const resetFrames: Buffer[] = [];
+    for await (const frame of router.handleMessage(
+      encodeFrame(MSG.HEALTH_PING, Buffer.alloc(0)),
+    )) {
+      resetFrames.push(frame);
+    }
+    const resetBody = JSON.parse(decodeFrame(resetFrames[0]).payload.toString());
+    expect(resetBody.status).toBe("ok");
+    expect(resetBody.connectorRegistryLoaded).toBe(false);
+    expect(resetBody.connectorCatalogVersion).toBeNull();
   });
 
   it("error classifier maps DECRYPT error correctly", async () => {

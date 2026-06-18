@@ -55,6 +55,13 @@ describe("canonical packs", () => {
     expect(free.toolScopes).not.toContain("video.generate");
   });
 
+  it("default pack scopes the generic connector.* family", () => {
+    const def = ALL_SKILL_PACKS.find((p) => p.id === "personal-agent.default")!;
+    expect(def.toolScopes).toEqual(
+      expect.arrayContaining(["connector.list", "connector.read", "connector.act"]),
+    );
+  });
+
   it("career pack parses", () => {
     expect(() => SkillPackSchema.parse(careerPack)).not.toThrow();
     expect(careerPack.id).toBe("personal-agent.career");

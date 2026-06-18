@@ -407,6 +407,33 @@ export {
 } from "./canonical-skill-prompts";
 
 export {
+  CONNECTOR_WRITE_PERMISSION_MODES,
+  ConnectorWritePermissionModeSchema,
+  CONNECTOR_RESULT_ERROR_CODES,
+  ConnectorResultErrorCodeSchema,
+  ConnectorResultEnvelopeSchema,
+  ConnectorInvocationArgsSchema,
+  ConnectorListArgsSchema,
+  ConnectorOperationSchema,
+  ConnectorDescriptorSchema,
+  ConnectorCatalogSchema,
+  MIN_CONNECTOR_CATALOG_VERSION,
+  type ConnectorWritePermissionMode,
+  type ConnectorResultErrorCode,
+  type ConnectorResultEnvelope,
+  type ConnectorInvocationArgs,
+  type ConnectorListArgs,
+  type ConnectorOperation,
+  type ConnectorDescriptor,
+  type ConnectorCatalog,
+} from "./connectors";
+
+export {
+  canonicalConnectorsSigningInput,
+  CONNECTORS_SIGNING_DOMAIN,
+} from "./canonical-connectors";
+
+export {
   SIGNED_DELETION_JOB_KINDS,
   SignedDeletionJobKindSchema,
   SignedDeletionItemSchema,
@@ -457,6 +484,14 @@ export {
   type AgentLinkedFolderContext,
   type AgentRequestContext,
   type AgentWritePermissionMode,
+  ConnectedConnectorContextSchema,
+  ConnectorModeEchoSchema,
+  ConnectorTurnBudgetOverrideSchema,
+  MAX_AGENT_CONNECTORS,
+  buildConnectedConnectorContext,
+  type ConnectedConnectorContext,
+  type ConnectorModeEcho,
+  type ConnectorTurnBudgetOverride,
 } from "./agent-context";
 
 export { EGRESS_TAINT_READ_TOOLS } from "./egress-taint-read-tools";
@@ -553,6 +588,11 @@ export {
   type MediaBudgetReserveResult,
   type MediaBudgetReconcileResult,
 } from "./media-budget";
+
+export {
+  RotationDrainEventSchema,
+  type RotationDrainEvent,
+} from "./rotation";
 
 export {
   VideoCheckpointStateSchema,

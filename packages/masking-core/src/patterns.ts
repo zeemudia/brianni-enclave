@@ -121,6 +121,73 @@ const ROLE_TITLE_WORDS = new Set(
   ].map((word) => word.toLowerCase()),
 );
 const TITLE_PREFIX_RE = /^(?:Dr|Mr|Mrs|Ms|Miss|Prof|Rev)\.?$/i;
+// Determiners / place-prefixes that a real personal GIVEN name effectively
+// never begins with as a standalone first token, so a Title-Case phrase
+// starting with one is a place/idiom, not a person ("Los Angeles", "The
+// Hague", "New York"). Restricted to these four on purpose: El/La/Le/Les are
+// deliberately EXCLUDED because they are legitimate given names ("El Greco",
+// "La Toya", "Les Paul", "Le Carré") — using them here would leak a real
+// name. El/La-prefixed non-names are handled by NON_NAME_PHRASES instead.
+const LEADING_NON_NAME_WORDS = new Set(["los", "las", "the", "new"]);
+// Curated multi-word Title-Case terms that are not personal names, matched
+// case-insensitively against the whole entity text. The precise, collateral-
+// free way to drop the El/La/San-prefixed non-names the leading-word rule
+// won't touch. Seeded with the actual complaint class (weather phenomena)
+// plus a few high-frequency places the NAME regex genuinely emits. Phrases
+// with letters outside the regex accent class (á é í ó ú ñ) — e.g. "São
+// Paulo" — never match NAME and are not candidates here. Kept intentionally
+// minimal; the real long-tail fix is typed NER (Phase 2), not a growing list.
+const NON_NAME_PHRASES = new Set([
+  "costa rica",
+  "el niño",
+  "el salvador",
+  "hong kong",
+  "la niña",
+  "puerto rico",
+  "san diego",
+  "san francisco",
+  "santa monica",
+  "sierra leone",
+]);
+// US SSN structural shape (3-2-4 digits, optional separators). Used to reject
+// non-issuable area/group/serial ranges without affecting UK NI numbers,
+// which carry letters and never match this all-digit shape.
+const US_SSN_SHAPE_RE = /^(\d{3})[-\s]?(\d{2})[-\s]?(\d{4})$/;
+
+/** Luhn (mod-10) checksum — every issuable card number passes; ~90% of random
+ *  16-digit strings fail. */
+function passesLuhn(text: string): boolean {
+  const digits = text.replace(/\D/g, "");
+  if (digits.length === 0) return false;
+  let sum = 0;
+  let double = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let d = digits.charCodeAt(i) - 48;
+    if (double) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    double = !double;
+  }
+  return sum % 10 === 0;
+}
+
+/** True when an all-digit ID match is an SSN with a structurally invalid
+ *  area (000/666/900–999), group (00), or serial (0000). Returns false for
+ *  non-SSN shapes (e.g. UK NI numbers) so they are never suppressed here. */
+function isInvalidUsSsn(text: string): boolean {
+  const m = US_SSN_SHAPE_RE.exec(text.trim());
+  if (!m) return false;
+  const [, area, group, serial] = m;
+  return (
+    area === "000" ||
+    area === "666" ||
+    Number(area) >= 900 ||
+    group === "00" ||
+    serial === "0000"
+  );
+}
 const KNOWN_ORGANISATION_WORD_RE =
   /\b(?:Amazon|Apple|Google|Microsoft|OpenAI)\b/;
 const ORGANISATION_DESCRIPTOR_WORD_RE =
@@ -196,12 +263,41 @@ function shouldSuppressRegexEntity(
     return previous !== undefined && /[A-Za-z0-9]/.test(previous);
   }
 
+  // Credit-card numbers must pass the Luhn checksum — a 16-digit group that
+  // fails it is not a card (random reference/order numbers, IDs, etc.).
+  if (entity.type === "ACCT") {
+    return !passesLuhn(entity.text);
+  }
+
+  // SSNs with a non-issuable area/group/serial are not real numbers. (Leaves
+  // UK NI numbers, which carry letters, untouched.)
+  if (entity.type === "ID") {
+    return isInvalidUsSsn(entity.text);
+  }
+
   if (entity.type !== "NAME") return false;
+
+  const tokens = entity.text.split(/[ \t]+/).filter(Boolean);
+  const hasTitlePrefix = tokens.some((token) => TITLE_PREFIX_RE.test(token));
+
+  // A curated non-name phrase ("El Niño", "San Francisco") is a place/idiom,
+  // not a person — suppress precisely, with no collateral on real names.
+  if (NON_NAME_PHRASES.has(entity.text.toLowerCase().replace(/[ \t]+/g, " "))) {
+    return true;
+  }
+
+  // A Title-Case phrase beginning with a determiner/place-prefix a real given
+  // name never starts with ("Los Angeles", "New York") is a place, not a name.
+  if (
+    !hasTitlePrefix &&
+    tokens.length > 0 &&
+    LEADING_NON_NAME_WORDS.has(tokens[0].toLowerCase())
+  ) {
+    return true;
+  }
 
   // A phrase whose tokens are ALL generic role/title words is a job title,
   // not a person's name (no title prefix like "Dr" present). Suppress it.
-  const tokens = entity.text.split(/[ \t]+/).filter(Boolean);
-  const hasTitlePrefix = tokens.some((token) => TITLE_PREFIX_RE.test(token));
   if (
     !hasTitlePrefix &&
     tokens.length > 0 &&

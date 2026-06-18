@@ -1,5 +1,7 @@
 export { detectPII, PII_PATTERNS } from "./patterns";
 export { PIITokeniser, findSafeEmitPoint } from "./tokeniser";
+export { buildMaskPreview } from "./preview";
+export type { MaskPreview, MaskPreviewSegment } from "./preview";
 export {
   maskHistoricalUserContent,
   buildMaskedOutboundHistory,

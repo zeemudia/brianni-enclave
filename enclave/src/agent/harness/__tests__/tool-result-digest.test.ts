@@ -389,6 +389,8 @@ function mkRun(opts: { turn: string; planJson: string; bodyText: string }): {
     requestContext: {
       linkedFolders: [],
       writePermissionMode: "always_ask" as const,
+      connectedConnectors: [],
+      connectorModeEchoes: [],
     },
     workerTimeoutMs: 5_000,
     summaryTimeoutMs: 5_000,

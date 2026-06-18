@@ -7,7 +7,7 @@ verify the pinned PCR0 without cloning private product code:
 > **Canonical standalone repo:** https://github.com/zeemudia/brianni-enclave
 >
 > **Current pinned PCR0:**
-> `623822deee94688be44b363c4a150e72d94d7ef39381bea2313777766e0ba81b6c7996608ed7202d88df5a8bc9a43886`
+> `3be1c1818a2eb6e24ae3e037221759403030d6194417559572f2eb85fed757105f31fb84fa03f7a342ec0a69f8d95f0c`
 >
 > **Verified through the clean-host builder/appliance release path on 2026-06-12**
 > The standalone repo's `VERIFICATIONS.md` carries the published release
@@ -73,9 +73,9 @@ and KMS PCR allowlist rotation as any other enclave code change.
 ## Current pinned PCR0
 
 ```
-PCR0: 623822deee94688be44b363c4a150e72d94d7ef39381bea2313777766e0ba81b6c7996608ed7202d88df5a8bc9a43886
+PCR0: 3be1c1818a2eb6e24ae3e037221759403030d6194417559572f2eb85fed757105f31fb84fa03f7a342ec0a69f8d95f0c
 PCR1: 4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493
-PCR2: f966d7fde3d794801a0453c659546b91e1b592ed6ee6a853d05ebb54440fd3ae66c69f3bfe1ca51014946017a91abff2
+PCR2: 0a4eb59ec50a35a58f5e9a7b5625b14b89ef11d6a3173ade355a619cab0a64afc80f2ea9a13e643477a305ab4845780e
 ```
 
 Lives in `enclave/measurement.json` (source of truth in the build

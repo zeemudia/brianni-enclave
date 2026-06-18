@@ -7,7 +7,11 @@
 // replayed model context entirely (see calypso-follow-up.ts), so private content
 // read last turn is never re-exposed to a fresh (empty-ledger) gateway.
 //
-// Keep this in sync with the enclave's harvestEgressTaint switch.
+// Keep this in sync with the enclave's harvestEgressTaint switch. (connector.read
+// is the one exception: its dispatch returns early and harvests via the dedicated
+// harvestConnectorReadEgressTaint path, NOT the harvestEgressTaint switch — but it
+// MUST be in this set so the cross-subtask + client-follow-up consumers below
+// treat connector reads as private.)
 
 /** Tools whose results feed the egress-taint ledger. */
 export const EGRESS_TAINT_READ_TOOLS: ReadonlySet<string> = new Set([
@@ -30,4 +34,14 @@ export const EGRESS_TAINT_READ_TOOLS: ReadonlySet<string> = new Set([
   "video.transform",
   "document.edit",
   "pdf.edit",
+  // connector.read surfaces PRIVATE external data (calendar; later mail/chat) into
+  // the model context — a private read like folder.read/memory.read. Membership
+  // here is load-bearing BEYOND the in-gateway egress ledger (dispatchConnector
+  // harvests that directly): it also marks connector-read-derived ORCHESTRATOR
+  // subtasks/working-memory as private (so an egress web worker in another subtask
+  // can't replay it — executor.ts) and triggers the CLIENT follow-up omission
+  // (tool-fulfiller.ts) so last turn's connector answer isn't re-exposed to a
+  // fresh empty-ledger gateway. connector.act (mutation) and connector.list
+  // (catalog metadata) are deliberately NOT private reads.
+  "connector.read",
 ]);

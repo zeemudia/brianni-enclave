@@ -143,10 +143,123 @@ const TOOL_SCHEMAS: Record<AdvertisedToolName, PromptToolSchema> = {
       'Apply bounded PDF annotation, redaction, page extraction, or compression and write a derived copy. Do not claim arbitrary layout-preserving text rewrite.',
     args: '{ "folderId": string, "displayName": string, "filename": string, "outputPath": string, "transform": { "kind": "annotate", "page": number, "text": string, "x": number, "y": number } | { "kind": "redact_text", "search": string, "maxReplacements": number } | { "kind": "extract_pages", "pages": number[] } | { "kind": "compress" } }',
   },
+  'connector.list': {
+    describe: 'List available operations for a connected external service connector.',
+    args: '{ "connectorId"?: string }',
+  },
+  'connector.read': {
+    describe: 'Read data from a connected external service connector (non-mutating).',
+    args: '{ "connectorId": string, "operation": string, "params"?: Record<string, unknown> }',
+  },
+  'connector.act': {
+    describe: 'Perform a mutating action on a connected external service connector. Requires user confirmation.',
+    args: '{ "connectorId": string, "operation": string, "params"?: Record<string, unknown> }',
+  },
 };
 
 function hasPromptToolSchema(name: ToolName): name is AdvertisedToolName {
   return Object.prototype.hasOwnProperty.call(TOOL_SCHEMAS, name);
+}
+
+/**
+ * One operation entry as supplied by the RUNTIME connector catalog (the signed
+ * connectors.json, resolved per-turn by the registry). Deliberately opaque: the
+ * `id`, the `mutating` routing flag, and the `paramsSchema` are catalog DATA —
+ * they are NOT named anywhere in this measured prompt module. This is the load-
+ * bearing C1 property: operation ids ride the connector.list RESULT, never the
+ * PCR0-measured system prompt, so connector #2..N needs no enclave rotation.
+ */
+export interface RuntimeConnectorOperationView {
+  id: string;
+  mutating: boolean;
+  paramsSchema: Record<string, unknown>;
+}
+
+/**
+ * One connected connector as supplied by the runtime catalog: its stable id, a
+ * client-masked display name (the raw label is masked on-device before it ever
+ * reaches the enclave), and the operations the user has authorised this turn.
+ */
+export interface RuntimeConnectorView {
+  connectorId: string;
+  displayName: string;
+  operations: RuntimeConnectorOperationView[];
+}
+
+/**
+ * Build the `connector.list` RESULT payload from the runtime catalog view.
+ *
+ * A pure pass-through: operation ids, `mutating` routing flags, and param
+ * schemas are copied straight from the argument into the result. NO specific
+ * connector or operation literal appears in this module — everything the
+ * planner learns about a connector's surface arrives here at RUNTIME, then
+ * rides the (defanged) tool-result reinjection into the next model turn. The
+ * Task-11 dispatch wraps the returned `{ connectors }` object as
+ * `{ ok: true, data }`; this helper returns the RAW shape.
+ */
+export function buildConnectorListView(view: RuntimeConnectorView[]): {
+  connectors: Array<{
+    connectorId: string;
+    displayName: string;
+    operations: RuntimeConnectorOperationView[];
+  }>;
+} {
+  return {
+    connectors: view.map((connector) => ({
+      connectorId: connector.connectorId,
+      displayName: connector.displayName,
+      operations: connector.operations.map((operation) => ({
+        id: operation.id,
+        mutating: operation.mutating,
+        paramsSchema: operation.paramsSchema,
+      })),
+    })),
+  };
+}
+
+/**
+ * GENERIC connector usage clause. Names NO connector and embeds NO operation
+ * id: it only tells the planner the discover→read/act flow. The concrete
+ * operations + their params are surfaced ONLY by the runtime connector.list
+ * result (see {@link buildConnectorListView}), never this measured prompt.
+ */
+function connectorContractLine(toolScopes: readonly ToolName[]): string | null {
+  const hasList = toolScopes.includes("connector.list");
+  const hasRead = toolScopes.includes("connector.read");
+  const hasAct = toolScopes.includes("connector.act");
+  if (!hasList && !hasRead && !hasAct) return null;
+
+  // Render from the SCOPED connector tools only — an orchestrator worker may be
+  // narrowed to just one (e.g. only connector.read or only connector.act). The
+  // prompt declares the Available tools list exhaustive and the gateway rejects
+  // unscoped names, so naming connector.list / the other tools when they are NOT
+  // scoped would send the model into OUT_OF_SCOPE retries. (A guard test asserts
+  // unscoped tool names never appear in the prompt — mirrors webAccessContractLine.)
+  const ops: string[] = [];
+  if (hasRead) {
+    ops.push("connector.read for a non-mutating lookup");
+  }
+  if (hasAct) {
+    ops.push(
+      "connector.act for a mutating action (which requires the user to confirm)",
+    );
+  }
+
+  if (hasList) {
+    const opsClause = ops.length > 0 ? `, then call ${ops.join(" or ")}` : "";
+    return (
+      `To work with a connected external service, first call connector.list to ` +
+      `discover its available operations and their parameters${opsClause}. ` +
+      `Use only the operation ids and parameter names returned by connector.list — ` +
+      `do not invent operations.`
+    );
+  }
+  // No connector.list in scope: the model must use the operation ids it was
+  // already given; never tell it to call connector.list.
+  return (
+    `To work with a connected external service, call ${ops.join(" or ")}. ` +
+    `Use only the operation ids and parameter names you were given — do not invent operations.`
+  );
 }
 
 /**
@@ -331,6 +444,12 @@ export function assembleSystemPrompt(
       // path — not claim the web is unavailable, which would suppress the
       // verbatim-query approval modal.
       webAccessContractLine(pack.toolScopes),
+      // Generic connector flow (discover → read/act). Present only when a
+      // connector.* tool is scoped; names no connector and embeds no operation
+      // id — the concrete surface rides the runtime connector.list result.
+      ...(connectorContractLine(pack.toolScopes) !== null
+        ? [connectorContractLine(pack.toolScopes)]
+        : []),
     ].join(' '),
     '',
     'Available tools:',

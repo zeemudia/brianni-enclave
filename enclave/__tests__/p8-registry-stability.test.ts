@@ -236,6 +236,11 @@ describe('Privacy invariant P8 — Dockerfile.enclave must not bake providers.js
       // signed skill-prompts bundle is host-served (NOT baked), and this public
       // key is the verification anchor. Adding it bakes no prompt.
       '/app/enclave/src/skills/skill-prompts-verify-key.pem',
+      // Connector catalog verify key — same role again: the signed connectors.json
+      // is host-served (vsock:8106, NOT baked), and this public key is the
+      // verification anchor. Adding it names/bakes no connector (the catalog data
+      // stays host-served, so connector #2..N remains rotation-free).
+      '/app/enclave/src/connectors/connectors-verify-key.pem',
     ];
 
     const fromBuilderCopies = finalStageCopyLines.filter((l) =>

@@ -2,8 +2,9 @@
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": "..",
     "types": ["node"]
   },
-  "include": ["src"]
+  "//": "rootDir is widened to the repo root for the TYPECHECK pass only (tsconfig.build.json re-pins it to src for clean dist/ emit). A connectors signer↔verifier agreement test imports the offline signer at repo-root scripts/sign-connectors.ts; including it in the typecheck graph (but never the build emit — tsconfig.build.json excludes it via include:[src]) keeps the test type-checked without a TS6059 rootDir violation.",
+  "include": ["src", "../scripts/sign-connectors.ts"]
 }

@@ -115,6 +115,44 @@ describe("assembleSystemPrompt", () => {
     expect(out).not.toContain("audio.speech");
   });
 
+  it("connector guidance names ONLY the scoped connector tools (no OUT_OF_SCOPE bait)", () => {
+    // All three scoped → full discover → read/act guidance.
+    const all = assembleSystemPrompt({
+      ...defaultPack,
+      toolScopes: ["connector.list", "connector.read", "connector.act"],
+    });
+    expect(all).toContain("connector.list");
+    expect(all).toContain("connector.read");
+    expect(all).toContain("connector.act");
+
+    // Only connector.read scoped (e.g. a narrowed orchestrator worker) → the
+    // prompt must NOT name connector.list / connector.act, or the model loops on
+    // OUT_OF_SCOPE retries (the gateway rejects unscoped names).
+    const readOnly = assembleSystemPrompt({
+      ...defaultPack,
+      toolScopes: ["connector.read"],
+    });
+    expect(readOnly).toContain("connector.read");
+    expect(readOnly).not.toContain("connector.list");
+    expect(readOnly).not.toContain("connector.act");
+
+    // Only connector.act scoped → never names connector.list / connector.read.
+    const actOnly = assembleSystemPrompt({
+      ...defaultPack,
+      toolScopes: ["connector.act"],
+    });
+    expect(actOnly).toContain("connector.act");
+    expect(actOnly).not.toContain("connector.list");
+    expect(actOnly).not.toContain("connector.read");
+
+    // No connector tools → no connector guidance at all.
+    const none = assembleSystemPrompt({
+      ...defaultPack,
+      toolScopes: ["memory.read"],
+    });
+    expect(none).not.toContain("connector.");
+  });
+
   it("advertises every non-specialist scoped tool", () => {
     const liveToolScopes = TOOL_NAMES.filter(
       (tool) => !SPECIALIST_MEDIA_TOOLS.has(tool),

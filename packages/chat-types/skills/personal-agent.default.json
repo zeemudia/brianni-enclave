@@ -27,7 +27,10 @@
     "pdf.edit",
     "web.fetch",
     "research.ask",
-    "event.draft"
+    "event.draft",
+    "connector.list",
+    "connector.read",
+    "connector.act"
   ],
   "capabilitySuiteIds": [
     "text",

@@ -38,7 +38,14 @@ const PLANNER_CORRECTION_NOTE =
   'dependency graph. Every dependsOn entry MUST reference an existing ' +
   'subtask id in this plan, and the dependsOn graph MUST be acyclic (no ' +
   'subtask may depend on itself directly or transitively). Every allowedTools ' +
-  'entry MUST be listed in Available tools. Return a ' +
+  'entry MUST be listed in Available tools. ' +
+  'A connector.act subtask MUST NOT depend (directly or transitively) on ' +
+  'another connector.act subtask. If the mutations are ORDER-DEPENDENT (a ' +
+  'later write needs an earlier write to have happened first), put them in ONE ' +
+  'subtask that issues both tool calls in order — do NOT split them into ' +
+  'separate subtasks and do NOT drop the ordering by making them independent. ' +
+  'Only use separate independent subtasks (no dependsOn edge) when the writes ' +
+  'are genuinely order-independent. Return a ' +
   'corrected plan.';
 
 const FOLDER_READ_TOOLS = [
@@ -338,6 +345,17 @@ function parsePlanBlock(
     if (!usesOnlyAvailableTools(parsed.subtasks, toolScopes)) {
       return null;
     }
+    // §12 #2 orchestrator-DAG reject (plan-time, fail-fast/defense-in-depth):
+    // a connector mutation step must not transitively depend on another
+    // connector mutation step. The orchestrator AgentSubtask only carries the
+    // generic `connector.act` family (NOT the specific destructive op), so this
+    // coarse, operation-blind walk is the only check implementable at plan-parse
+    // time; the precise turn-scoped destructive guard in dispatchConnector (A1)
+    // is the runtime backstop. Treat a chain as invalid → createTaskPlan
+    // re-prompts with corrective feedback (and ultimately falls back).
+    if (hasConnectorActChain(parsed.subtasks)) {
+      return null;
+    }
     return AgentTaskPlanSchema.parse({ ...parsed, planId: generatedPlanId });
   } catch {
     return null;
@@ -369,6 +387,60 @@ function hasResolvableDependencyGraph(subtasks: AgentSubtask[]): boolean {
   };
 
   return subtasks.every(visit);
+}
+
+// The generic connector mutation family. MEASURED code must name ONLY this
+// allowed family token — never a specific connector/operation id (the static
+// connectors-no-measured-coupling tripwire enforces this).
+const CONNECTOR_ACT_TOOL: ToolName = 'connector.act';
+
+/**
+ * True iff some `connector.act` subtask transitively (walking `dependsOn`)
+ * reaches another `connector.act` subtask — the coarse, operation-blind
+ * orchestrator-DAG signal for a chained connector mutation (§12 #2). The
+ * orchestrator AgentSubtask carries only the generic `connector.act` family, not
+ * the specific destructive op, so this is the only plan-time check available;
+ * the runtime A1 guard is the precise backstop.
+ *
+ * Fast path: if no subtask scopes connector.act, there is no chain.
+ *
+ * KNOWN OVER-APPROXIMATION (intentional, fail-safe): a subtask counts as an
+ * "act node" purely because it SCOPES `connector.act` in `allowedTools`, not
+ * because it will necessarily USE it. A subtask the planner over-scoped (granted
+ * connector.act but that only reads/writes a file at runtime) can therefore trip
+ * the reject and push the plan to re-prompt/fallback even though no mutation
+ * chain was intended. This is bounded by `allowedTools` being the only
+ * structured mutation signal the plan exposes (there is no per-subtask "will
+ * mutate" flag), and by the planner trimming surplus scopes elsewhere
+ * (ensureArtifactToolScoped). The cost is planner-quality (degraded
+ * decomposition), never a safety regression — the runtime A1 guard is the
+ * precise enforcement. Covered by the "surplus connector.act scope still
+ * rejects a chain" planner-DAG test so the behaviour is pinned, not latent.
+ */
+function hasConnectorActChain(subtasks: AgentSubtask[]): boolean {
+  const isAct = (subtask: AgentSubtask | undefined): boolean =>
+    !!subtask && subtask.allowedTools.includes(CONNECTOR_ACT_TOOL);
+  if (!subtasks.some(isAct)) return false;
+
+  const byId = new Map(subtasks.map((subtask) => [subtask.id, subtask]));
+
+  // For each connector.act subtask, DFS its dependency closure; if any reachable
+  // dependency is itself a connector.act subtask, the plan chains mutations.
+  for (const root of subtasks) {
+    if (!isAct(root)) continue;
+    const stack = [...root.dependsOn];
+    const seen = new Set<string>();
+    while (stack.length > 0) {
+      const depId = stack.pop() as string;
+      if (seen.has(depId)) continue;
+      seen.add(depId);
+      const dependency = byId.get(depId);
+      if (!dependency) continue; // unknown deps already rejected upstream
+      if (isAct(dependency)) return true;
+      for (const next of dependency.dependsOn) stack.push(next);
+    }
+  }
+  return false;
 }
 
 function usesOnlyAvailableTools(

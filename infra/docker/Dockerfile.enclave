@@ -231,6 +231,10 @@ COPY --from=builder /app/enclave/src/tools/media_tools_service.py ./dist/tools/m
 COPY --from=builder /app/enclave/src/providers/registry-verify-key.pem ./dist/providers/registry-verify-key.pem
 # Verify key for skill-prompts signature (public key — safe to bundle).
 COPY --from=builder /app/enclave/src/skills/skill-prompts-verify-key.pem ./dist/skills/skill-prompts-verify-key.pem
+# Verify key for the connector catalog signature (public key — safe to bundle).
+# The signed connectors.json catalog itself is HOST-SERVED (vsock:8106), NOT
+# baked — only this measured verify key is, exactly like providers.json.
+COPY --from=builder /app/enclave/src/connectors/connectors-verify-key.pem ./dist/connectors/connectors-verify-key.pem
 
 # NSM attestation helper (Python script called by nsm.ts for /dev/nsm ioctl)
 COPY --from=builder /app/enclave/src/nsm_helper.py ./dist/nsm_helper.py
@@ -252,10 +256,12 @@ RUN chmod +x /usr/local/bin/kmstool_enclave_cli && \
 #   infra/host/keys-broker.py     (vsock:8102, serves /etc/calypso/encrypted-keys.json)
 #   infra/host/registry-broker.py (vsock:8101, serves /etc/calypso/providers.json)
 #   infra/host/skills-broker.py   (vsock:8103, serves /etc/calypso/skill-prompts.json)
+#   infra/host/connectors-broker.py (vsock:8106, serves /etc/calypso/connectors.json) [Phase-3 provisioning]
 # Enclave-side clients:
 #   enclave/src/keys-client.ts     (fetches + validates encrypted-keys blob)
 #   enclave/src/registry-client.ts (fetches + Ed25519-verifies providers.json)
 #   enclave/src/skills-client.ts   (fetches + Ed25519-verifies skill-prompts.json)
+#   enclave/src/connectors-client.ts (fetches + Ed25519-verifies connectors.json)
 # Why host-served rather than baked: any change to these files would
 # otherwise rotate PCR0, forcing a KMS policy rotation AND a mobile/web
 # client release. Host-serving decouples the lifecycles so provider-key
@@ -263,9 +269,10 @@ RUN chmod +x /usr/local/bin/kmstool_enclave_cli && \
 # operations. The skill-prompts case ALSO keeps the persona-prompt IP out
 # of the measured image AND out of every client bundle. Trust model:
 # encrypted-keys is protected by the KMS attestation policy (PCR0-bound);
-# providers.json and skill-prompts.json are Ed25519-signed (domain-
-# separated) against baked verify keys (registry-verify-key.pem and
-# skill-prompts-verify-key.pem, bundled in the builder stage). DO NOT
+# providers.json, skill-prompts.json and connectors.json are Ed25519-signed
+# (domain-separated) against baked verify keys (registry-verify-key.pem,
+# skill-prompts-verify-key.pem and connectors-verify-key.pem, bundled in the
+# builder stage). DO NOT
 # re-introduce a COPY of these data files —
 # the P8 static gate (enclave/__tests__/p8-registry-stability.test.ts)
 # will catch it and fail CI.

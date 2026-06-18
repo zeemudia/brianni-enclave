@@ -1,0 +1,173 @@
+{
+  "version": 1,
+  "connectors": [
+    {
+      "id": "google-calendar",
+      "displayName": "Google Calendar",
+      "provider": "google",
+      "platforms": [
+        "web",
+        "ios",
+        "android"
+      ],
+      "oauthScopes": [
+        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.readonly"
+      ],
+      "operations": [
+        {
+          "id": "list_events",
+          "mutating": false,
+          "requiredScope": "calendar.readonly",
+          "maxWindowDays": 370,
+          "maxResults": 250,
+          "windowParams": {
+            "start": "timeMin",
+            "end": "timeMax"
+          },
+          "maxResultsParam": "maxResults",
+          "paramsSchema": {
+            "timeMin": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "timeMax": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "maxResults": {
+              "type": "number"
+            },
+            "calendarId": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "id": "list_calendars",
+          "mutating": false,
+          "requiredScope": "calendar.readonly",
+          "paramsSchema": {}
+        },
+        {
+          "id": "get_event",
+          "mutating": false,
+          "requiredScope": "calendar.readonly",
+          "paramsSchema": {
+            "eventId": {
+              "type": "string"
+            },
+            "calendarId": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "id": "suggest_time",
+          "mutating": false,
+          "requiredScope": "calendar.readonly",
+          "paramsSchema": {
+            "durationMinutes": {
+              "type": "number"
+            },
+            "timeMin": {
+              "type": "string"
+            },
+            "timeMax": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "id": "create_event",
+          "mutating": true,
+          "destructive": false,
+          "idempotent": true,
+          "requiredScope": "calendar.events",
+          "contentFields": [
+            "summary",
+            "description",
+            "location"
+          ],
+          "paramsSchema": {
+            "summary": {
+              "type": "string"
+            },
+            "start": {
+              "type": "string"
+            },
+            "end": {
+              "type": "string"
+            },
+            "attendees": {
+              "type": "array"
+            },
+            "calendarId": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "id": "update_event",
+          "mutating": true,
+          "destructive": false,
+          "concurrency": "etag",
+          "requiredScope": "calendar.events",
+          "contentFields": [
+            "summary",
+            "description",
+            "location"
+          ],
+          "paramsSchema": {
+            "eventId": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "start": {
+              "type": "string"
+            },
+            "end": {
+              "type": "string"
+            },
+            "etag": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "id": "respond_to_event",
+          "mutating": true,
+          "destructive": false,
+          "requiredScope": "calendar.events",
+          "paramsSchema": {
+            "eventId": {
+              "type": "string"
+            },
+            "response": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "id": "delete_event",
+          "mutating": true,
+          "destructive": true,
+          "concurrency": "etag",
+          "requiredScope": "calendar.events",
+          "paramsSchema": {
+            "eventId": {
+              "type": "string"
+            },
+            "etag": {
+              "type": "string"
+            }
+          }
+        }
+      ],
+      "mcp": null
+    }
+  ],
+  "signature": "0LnlqQipYsexRD3JhYH2+EbVxJl+DOJVY4EKrJ+iI2PjYBXOy0629bZctCQm+HwdCnePX9w6b/LBB529cCalCw=="
+}

@@ -233,11 +233,14 @@ describe("clientInvocationTimeoutMs — confirmation-gated write window", () => 
     confirmationGatedWriteTimeoutMs: 5 * 60_000,
   };
 
-  it("folder.write gets the long human-review / durable-write window", () => {
+  it("folder.write + connector.act get the long human-review / durable-write window", () => {
     // In "Ask before saving" mode folder.write blocks on the user's
     // confirmation modal, which emits NO interim chunks to refresh the idle
     // timer — so it must not be cut off at the 60s machine-round-trip default.
     expect(clientInvocationTimeoutMs("folder.write", timeouts)).toBe(5 * 60_000);
+    // connector.act in a confirmation mode (always_ask / once_per_session) waits
+    // on the same human review modal before the external write — same window.
+    expect(clientInvocationTimeoutMs("connector.act", timeouts)).toBe(5 * 60_000);
   });
 
   it("every other client tool keeps the short machine-round-trip timeout", () => {
@@ -248,6 +251,9 @@ describe("clientInvocationTimeoutMs — confirmation-gated write window", () => 
       "folder.read",
       "web.fetch",
       "image.generate",
+      // connector READS / discovery do NOT wait on a modal → short timeout.
+      "connector.read",
+      "connector.list",
     ]) {
       expect(clientInvocationTimeoutMs(toolName, timeouts)).toBe(60_000);
     }

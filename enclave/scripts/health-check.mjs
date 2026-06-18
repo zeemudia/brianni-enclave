@@ -129,12 +129,23 @@ async function probe() {
           return;
         }
         // 2. Payload contract — see enclave/src/index.ts HEALTH_PING handler:
-        //    { status: 'ok', uptime: number }. The enclave no longer runs a
-        //    Presidio masking sidecar (de-identification is on-device only),
-        //    so the old `presidio_ready` readiness field was removed from
-        //    HEALTH_PONG; requiring it here would fail every probe against a
-        //    post-removal enclave and hang deploy.sh's wait into a rollback.
-        //    `status: 'ok'` is now the whole readiness contract; deploy.sh's
+        //    { status: 'ok', uptime: number,
+        //      connectorRegistryLoaded: boolean,
+        //      connectorCatalogVersion: number | null }.
+        //    `connectorRegistryLoaded` + `connectorCatalogVersion` are an
+        //    OBJECTIVE, Phase-2-independent rotation-verify probe: they let a
+        //    rotation verifier confirm the signed connector catalog loaded
+        //    inside the enclave (true + the version) WITHOUT driving a
+        //    connector.* agent turn. They are NOT part of the readiness gate
+        //    below — an older enclave (or one booted before the
+        //    connectors-broker exists) reports false + null, and connectors are
+        //    an additive capability, not a boot dependency.
+        //    The enclave no longer runs a Presidio masking sidecar
+        //    (de-identification is on-device only), so the old `presidio_ready`
+        //    readiness field was removed from HEALTH_PONG; requiring any extra
+        //    field here would fail every probe against an enclave that doesn't
+        //    emit it and hang deploy.sh's wait into a rollback.
+        //    `status: 'ok'` is the WHOLE readiness contract; deploy.sh's
         //    3-consecutive rule rides out brief startup flaps.
         if (body?.status !== 'ok') {
           reject(new Error(`unhealthy payload: ${JSON.stringify(body)}`));

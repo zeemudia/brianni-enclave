@@ -117,7 +117,17 @@ export class OpenAIProcessor implements ChatProcessor {
           options.temperature !== undefined && {
             temperature: options.temperature,
         }),
-        ...(options.max_tokens !== undefined && { max_tokens: options.max_tokens }),
+        /*
+         * The OpenAI chat catalog is the gpt-5.x family, which rejects the
+         * legacy `max_tokens` parameter with a 400 ("Unsupported parameter:
+         * 'max_tokens' is not supported with this model. Use
+         * 'max_completion_tokens' instead."). Emit the current parameter so a
+         * caller-supplied token cap doesn't hard-fail the turn. (Real clients
+         * leave it unset, so this is dormant until a cap is requested.)
+         */
+        ...(options.max_tokens !== undefined && {
+          max_completion_tokens: options.max_tokens,
+        }),
       });
     };
 

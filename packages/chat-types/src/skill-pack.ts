@@ -32,6 +32,13 @@ export const TOOL_NAMES = [
   "video.render",
   "document.edit",
   "pdf.edit",
+  // Generic external-integration capability (spec §5.1). ONE family for ALL
+  // connectors — per-connector knowledge lives in the signed connectors.json
+  // catalog, never here. The old per-service verbs (calendar/event/mailbox
+  // reads & writes, …) stay banned in scope-check.ts.
+  "connector.list",
+  "connector.read",
+  "connector.act",
 ] as const;
 
 export type ToolName = (typeof TOOL_NAMES)[number];

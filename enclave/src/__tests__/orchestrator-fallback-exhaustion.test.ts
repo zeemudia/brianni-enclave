@@ -225,6 +225,8 @@ function baseDeps(overrides: Partial<RunOrchestratorDeps> = {}): RunOrchestrator
         },
       ],
       writePermissionMode: 'always_ask' as const,
+      connectedConnectors: [],
+      connectorModeEchoes: [],
     },
     ...overrides,
   };

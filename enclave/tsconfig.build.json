@@ -1,6 +1,9 @@
 {
-  "//": "Production build config for the measured enclave image. Mirrors tsconfig.json but EXCLUDES test files so compiled tests never land in dist/ (and therefore in the Nitro EIF). Keeping test code out of the image avoids PCR0 churn on every test change and shrinks the measured attack surface (Codex LOW F21). tsconfig.json (no exclude) is still used by `typecheck` so tests stay type-checked.",
+  "//": "Production build config for the measured enclave image. Mirrors tsconfig.json but EXCLUDES test files so compiled tests never land in dist/ (and therefore in the Nitro EIF). Keeping test code out of the image avoids PCR0 churn on every test change and shrinks the measured attack surface (Codex LOW F21). tsconfig.json (no exclude) is still used by `typecheck` so tests stay type-checked. `rootDir` is pinned HERE (not in tsconfig.json) so dist/ keeps a clean src-rooted layout; the repo-root signer that tsconfig.json adds to the typecheck graph is re-scoped out via include:[src], so it never lands in the measured EIF.",
   "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src"
+  },
   "include": ["src"],
   "exclude": [
     "src/**/*.test.ts",

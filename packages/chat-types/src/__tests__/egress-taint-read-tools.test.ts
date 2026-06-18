@@ -20,13 +20,19 @@ describe("EGRESS_TAINT_READ_TOOLS", () => {
       "image.transform",
       "audio.transform",
       "video.transform",
+      // connector.read surfaces private external data; it must mark the turn as a
+      // private read so cross-subtask + client follow-up consumers treat it so.
+      "connector.read",
     ]) {
       expect(EGRESS_TAINT_READ_TOOLS.has(t)).toBe(true);
     }
   });
 
-  it("excludes egress + write tools", () => {
+  it("excludes egress + write tools (incl. connector mutation/list)", () => {
     expect(EGRESS_TAINT_READ_TOOLS.has("web.fetch")).toBe(false);
     expect(EGRESS_TAINT_READ_TOOLS.has("memory.write")).toBe(false);
+    // connector.act is a mutation, connector.list is catalog metadata — not reads.
+    expect(EGRESS_TAINT_READ_TOOLS.has("connector.act")).toBe(false);
+    expect(EGRESS_TAINT_READ_TOOLS.has("connector.list")).toBe(false);
   });
 });

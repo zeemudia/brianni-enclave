@@ -1,0 +1,20 @@
+{
+  "$schema": "../../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Pattern 5 (Grade your tests, not just your code). Scoped mutation run over the crypto-core logic surface. crypto-core is pure (no DB/network), so its own vitest.config.ts only sweeps fast, hermetic tests. Non-blocking by default: thresholds.break is null so a low score reports but never fails CI. See docs/quality/mutation-testing.md.",
+  "testRunner": "vitest",
+  "vitest": { "configFile": "vitest.config.ts" },
+  "mutate": [
+    "src/**/*.ts",
+    "!src/index.ts",
+    "!src/types.ts",
+    "!src/**/__tests__/**",
+    "!src/**/*.test.ts"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/crypto-core.html" },
+  "jsonReporter": { "fileName": "reports/mutation/crypto-core.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

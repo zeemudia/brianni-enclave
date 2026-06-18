@@ -54,6 +54,12 @@ import { createEnclaveListener } from "./vsock-listener";
 import { fetchKeysViaAttestedKMS, type AttestedKmsResult } from "./kms-client";
 import { fetchRegistryFromBroker } from "./registry-client";
 import { fetchSkillPromptsFromBroker } from "./skills-client";
+import { fetchConnectorsFromBroker } from "./connectors-client";
+import {
+  initConnectorRegistry,
+  isConnectorRegistryLoaded,
+  getConnectorCatalogVersion,
+} from "./connectors/registry";
 import {
   loadAndVerifySkillPrompts,
   buildPromptResolver,
@@ -171,12 +177,20 @@ const ORCHESTRATOR_PROVIDER_CALL_BUDGET_BY_PLAN = {
 
 /**
  * How long the per-invocation resolver waits for a client TOOL_RESULT before
- * giving up. `folder.write` is the exception: in "Ask before saving" mode it
- * blocks on the user's confirmation modal, which emits NO interim chunks to
- * refresh the idle timer — so a deliberate human review (reading a generated
- * report/letter before approving) must not be cut off at the short
- * machine-round-trip default. Give it the same human-review + durable-write
- * window a binary/media write already gets (the confirmation-gated window).
+ * giving up. Two tools are the exception:
+ *  - `folder.write`: in "Ask before saving" mode it blocks on the user's
+ *    confirmation modal, which emits NO interim chunks to refresh the idle timer.
+ *  - `connector.act`: a connector MUTATION in a confirmation mode
+ *    (always_ask / once_per_session) likewise blocks on the user's review modal
+ *    before the client performs the external write — same human-in-the-loop wait
+ *    as folder.write, no interim chunks.
+ * A deliberate human review (reading a generated letter, or a calendar change,
+ * before approving) must not be cut off at the short machine-round-trip default,
+ * else the resolver fires INVOCATION_TIMEOUT and a later approval lands as an
+ * UNSOLICITED result — the confirmed external action reported as lost. Give both
+ * the human-review / durable-write window a binary/media write already gets.
+ * This is a mode-AGNOSTIC ceiling (the enclave does not read the per-connector
+ * mode — S5): an `auto` connector.act simply has a higher ceiling it won't reach.
  * Every other tool keeps the short timeout so a dead client can't hang a turn.
  * Pure + exported so the policy is unit-tested without standing up a session.
  */
@@ -187,7 +201,7 @@ export function clientInvocationTimeoutMs(
     confirmationGatedWriteTimeoutMs: number;
   },
 ): number {
-  return toolName === "folder.write"
+  return toolName === "folder.write" || toolName === "connector.act"
     ? timeouts.confirmationGatedWriteTimeoutMs
     : timeouts.invocationTimeoutMs;
 }
@@ -705,6 +719,7 @@ export class EnclaveRouter {
     console.log("[enclave] EnclaveRouter.init(): loading provider registry...");
     await this.loadProviderRegistry();
     await this.loadSkillPrompts();
+    await this.loadConnectorRegistry();
     console.log("[enclave] EnclaveRouter.init(): provider registry loaded.");
 
     console.log("[enclave] EnclaveRouter.init(): fetching keys from KMS...");
@@ -942,6 +957,97 @@ export class EnclaveRouter {
     }
   }
 
+  private async loadConnectorRegistry(): Promise<void> {
+    // The connector catalog JSON is NOT baked into the EIF. Production fetches
+    // it from the host-side connectors-broker sidecar over vsock at boot; the
+    // enclave verifies the Ed25519 signature (signed offline, domain-separated
+    // from the provider registry and skill-prompts) against the baked verify
+    // key before trusting any bytes. This decouples "add or update a connector
+    // definition" from a PCR0 rotation. Mirrors loadProviderRegistry.
+    //
+    // Dev / test: filesystem fallback to the bundled connectors.json so the
+    // enclave boots without a host sidecar running.
+    const verifyKeyPath =
+      process.env.CONNECTORS_VERIFY_KEY_PATH ||
+      resolve(
+        import.meta.dirname ?? __dirname,
+        "connectors/connectors-verify-key.pem",
+      );
+
+    let catalogJson: string | null = null;
+
+    // 1. Prefer CONNECTORS_PATH (filesystem) when explicitly set — dev iteration.
+    const overridePath = process.env.CONNECTORS_PATH;
+    if (overridePath && existsSync(overridePath)) {
+      catalogJson = readFileSync(overridePath, "utf-8");
+    }
+
+    // 2. Try the vsock broker (production path on real Nitro hardware).
+    // The connectors-broker runs on vsock port 8106 (Phase-3 provisioning).
+    if (
+      catalogJson === null &&
+      process.env.NODE_ENV !== "test" &&
+      process.env.MOCK_KMS !== "true"
+    ) {
+      try {
+        catalogJson = await fetchConnectorsFromBroker();
+      } catch (err) {
+        // In production this is FATAL: the bundled fallback below is
+        // gated to test/MOCK_KMS boots, so catalogJson stays null
+        // and the loud "Connector catalog unavailable" throw fires.
+        console.warn(
+          `[enclave] connectors-broker fetch failed: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    // 3. Dev/test fallback: bundled catalog shipped alongside the code.
+    // PRODUCTION must NOT take this path (mirrors loadProviderRegistry L4).
+    const bundledFallbackAllowed =
+      process.env.NODE_ENV === "test" || process.env.MOCK_KMS === "true";
+    if (catalogJson === null && bundledFallbackAllowed) {
+      const bundledPath = resolve(
+        import.meta.dirname ?? __dirname,
+        "connectors/connectors.json",
+      );
+      if (existsSync(bundledPath)) {
+        catalogJson = readFileSync(bundledPath, "utf-8");
+        console.warn("[enclave] Using bundled connector catalog (development mode)");
+      }
+    }
+
+    if (catalogJson === null) {
+      // ABSENT catalog (no CONNECTORS_PATH, broker unreachable/unprovisioned, no
+      // dev fallback) is NON-FATAL: connectors are an ADDITIVE capability, not a
+      // core dependency like the provider registry / skill prompts. Leaving the
+      // registry UNLOADED makes connector.* reject CONNECTOR_CATALOG_NOT_LOADED at
+      // dispatch (the documented fail-closed path) while the rest of the enclave
+      // boots normally — so a PCR0 rotation carrying this measured code does NOT
+      // brick boot before the Phase-3 connectors-broker (vsock:8106) is
+      // provisioned. (A PRESENT-but-INVALID catalog — bad signature / rolled-back
+      // version / parse error — stays FATAL in the verify step below: that is a
+      // tamper signal, not an absent feature.)
+      console.warn(
+        "[enclave] Connector catalog unavailable (no CONNECTORS_PATH, no connectors-broker, no bundled fallback) — connectors DISABLED; connector.* will reject CONNECTOR_CATALOG_NOT_LOADED.",
+      );
+      return;
+    }
+
+    try {
+      const catalogData = JSON.parse(catalogJson);
+      const verifyKey = readFileSync(verifyKeyPath, "utf-8");
+      initConnectorRegistry(catalogData, verifyKey);
+    } catch (err) {
+      if (process.env.NODE_ENV === "test") {
+        console.warn("[enclave] Connector catalog loading skipped in test environment");
+        return;
+      }
+      throw new Error(
+        `Failed to load connector catalog: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   private async fetchKeysFromKMS(): Promise<AttestedKmsResult> {
     // Test / local dev: use env vars directly (no NSM hardware available).
     // MEDIA_ROOT_SECRET (optional) lets local dev exercise the stable derived
@@ -984,6 +1090,15 @@ export class EnclaveRouter {
             JSON.stringify({
               status: "ok",
               uptime: Math.floor((Date.now() - this.bootTime) / 1000),
+              // Objective, Phase-2-independent rotation-verify probe: report
+              // whether the signed connector catalog loaded + its version. Both
+              // are generic status values that name no connector/operation, so
+              // this rides the same measured rotation without coupling the
+              // measured code to any specific catalog content. When the
+              // registry is unloaded (older enclave, or booted before the
+              // connectors-broker is provisioned) these are false + null.
+              connectorRegistryLoaded: isConnectorRegistryLoaded(),
+              connectorCatalogVersion: getConnectorCatalogVersion(),
             }),
           ),
         );
@@ -1763,6 +1878,13 @@ export class EnclaveRouter {
             orchestrator?: unknown;
             linkedFolders?: unknown;
             writePermissionMode?: unknown;
+            // Per-request connector connection set + ledger-only mode echoes +
+            // owner per-turn budget override (spec §6/§7.3). MODE-FREE admission
+            // input; the schema validates/bounds them (AgentRequestContextSchema).
+            // Absent for old clients ⇒ defaults to [] / undefined (back-compat).
+            connectedConnectors?: unknown;
+            connectorModeEchoes?: unknown;
+            connectorTurnBudgetOverride?: unknown;
             // Inner skillPack is retained on the wire for back-compat
             // with older clients but the enclave IGNORES its prompt
             // content + scopes. If present, its `id` must match the
@@ -1848,6 +1970,14 @@ export class EnclaveRouter {
           const requestContext = AgentRequestContextSchema.parse({
             linkedFolders: body.linkedFolders,
             writePermissionMode: body.writePermissionMode,
+            // Connector request context (spec §6/§7.3). The schema bounds the
+            // count (.max(MAX_AGENT_CONNECTORS)), strips any token/mode from the
+            // mode-free admission entries, and validates the budget override; an
+            // absent field defaults to [] / undefined so old clients are
+            // unaffected. connectorModeEchoes feed ONLY the ledger (S5).
+            connectedConnectors: body.connectedConnectors,
+            connectorModeEchoes: body.connectorModeEchoes,
+            connectorTurnBudgetOverride: body.connectorTurnBudgetOverride,
           });
           const runMode =
             body.runMode === "orchestrator" ? "orchestrator" : "single";
@@ -2266,6 +2396,13 @@ export class EnclaveRouter {
             // instead of the opaque folderId. The client independently
             // re-validates the binding, so this never widens access.
             linkedFolders: requestContext.linkedFolders,
+            // Connector admission inputs (spec §5.2/§6). connectedConnectors is
+            // MODE-FREE; connectorModeEchoes reach ONLY the ledger; the override
+            // raises the per-turn caps. The gateway's connector.* dispatch reads
+            // these from deps (structural S5 boundary enforced at the call site).
+            connectedConnectors: requestContext.connectedConnectors,
+            connectorModeEchoes: requestContext.connectorModeEchoes,
+            connectorTurnBudgetOverride: requestContext.connectorTurnBudgetOverride,
             // Single-mode runs read tools and web.fetch in one model context,
             // so block egress after any private read (structural). Orchestrator
             // mode isolates them across subtasks and does NOT set this.

@@ -92,6 +92,9 @@ const ARTIFACT_PRODUCING_TOOLS = {
   'video.render': true,
   'document.edit': true,
   'pdf.edit': true,
+  'connector.list': false,
+  'connector.read': false,
+  'connector.act': false,
 } satisfies Record<ToolName, boolean>;
 
 export interface RunOrchestratorDeps {
@@ -690,13 +693,16 @@ export async function* runOrchestrator(
     const requiresReadResultTool = subtaskRequiresReadResultTool(subtask);
     const requiresFolderWriteTool = subtaskRequiresFolderWriteTool(subtask);
     const scopesResearchAskTool = subtaskScopesResearchAskTool(subtask);
+    const scopesConnectorActTool = subtaskScopesConnectorActTool(subtask);
     // A folder.write subtask must generate the artifact AND wait on the human
     // confirmation modal; a research.ask subtask must wait on the approval
     // round-trip AND the air-gapped subagent's real-client web.fetch round
-    // trips. Both get the longer write-subtask window; every other subtask
+    // trips; a connector.act subtask in a confirmation mode (always_ask /
+    // once_per_session) waits on the same human review modal before the external
+    // write. All three get the longer write-subtask window; every other subtask
     // keeps the short worker timeout (a quiet worker is stuck).
     const subtaskWorkerTimeoutMs =
-      requiresFolderWriteTool || scopesResearchAskTool
+      requiresFolderWriteTool || scopesResearchAskTool || scopesConnectorActTool
         ? deps.writeSubtaskTimeoutMs ??
           deps.workerTimeoutMs ??
           DEFAULT_WRITE_SUBTASK_TIMEOUT_MS
@@ -728,6 +734,12 @@ export async function* runOrchestrator(
     // timeout across that pause, exactly as pendingFolderWriteDispatch defers
     // across the confirmation modal.
     let pendingResearchApproval = false;
+    // True between a connector.act tool-invocation and its matching tool-result:
+    // the worker is parked inside gateway.dispatch(connector.act) on the user
+    // confirmation modal (always_ask / once_per_session) before the external
+    // write. Defers the worker timeout across that human pause, exactly as
+    // pendingResearchApproval defers across the research approval round-trip.
+    let pendingConnectorActApproval = false;
     let timedOutDuringFolderWriteDispatch = false;
     let folderWriteDispatchGraceExpired = false;
     let confirmedTerminalFolderWrite = false;
@@ -911,7 +923,9 @@ export async function* runOrchestrator(
             deps.abortSignal,
             {
               shouldDeferTimeout: () =>
-                pendingFolderWriteDispatch || pendingResearchApproval,
+                pendingFolderWriteDispatch ||
+                pendingResearchApproval ||
+                pendingConnectorActApproval,
               onTimeoutDeferred: () => {
                 timedOutDuringFolderWriteDispatch = true;
               },
@@ -935,6 +949,11 @@ export async function* runOrchestrator(
               // has completed — stop deferring the worker timeout for it.
               if (event.toolName === 'research.ask') {
                 pendingResearchApproval = false;
+              }
+              // The connector.act confirmation round-trip has completed (result
+              // back from the client fulfiller) — stop deferring for it.
+              if (event.toolName === 'connector.act') {
+                pendingConnectorActApproval = false;
               }
               // Internal-only: never forwarded to the wire. Capture a bounded,
               // structured digest of read-result tools (e.g. web.fetch
@@ -970,6 +989,12 @@ export async function* runOrchestrator(
                 // approval round-trip + subagent run — defer the timeout until
                 // the matching tool-result arrives.
                 pendingResearchApproval = true;
+              }
+              if (event.frame.toolName === 'connector.act') {
+                // The worker is about to park inside gateway.dispatch on the user
+                // confirmation modal before the external write — defer the timeout
+                // until the matching tool-result arrives (mirrors research.ask).
+                pendingConnectorActApproval = true;
               }
               if (event.frame.toolName === 'folder.write') {
                 invokedFolderWriteTool = true;
@@ -2069,6 +2094,21 @@ function subtaskRequiresFolderWriteTool(subtask: AgentSubtask): boolean {
  */
 function subtaskScopesResearchAskTool(subtask: AgentSubtask): boolean {
   return subtask.allowedTools.includes('research.ask');
+}
+
+/**
+ * A connector.act subtask whose worker timeout must span the human confirmation
+ * pause: in a confirmation mode (always_ask / once_per_session) the worker parks
+ * inside gateway.dispatch(connector.act) on the user's review modal before the
+ * external write, with no interim chunks to refresh the idle timer. Under the
+ * flat 60s worker timeout a slow approval trips ORCHESTRATOR_WORKER_TIMEOUT and
+ * the mutation may still complete client-side and be reported as lost — the same
+ * problem as folder.write / research.ask. Scope on connector.act presence; this
+ * is a mode-AGNOSTIC ceiling (the orchestrator never reads the per-connector
+ * mode — S5), so an auto connector.act simply won't reach it.
+ */
+function subtaskScopesConnectorActTool(subtask: AgentSubtask): boolean {
+  return subtask.allowedTools.includes('connector.act');
 }
 
 function isAlternativeArtifactTool(tool: ToolName): boolean {

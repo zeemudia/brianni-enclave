@@ -243,6 +243,8 @@ function baseDeps(overrides: Partial<RunOrchestratorDeps> = {}): RunOrchestrator
         },
       ],
       writePermissionMode: 'always_ask' as const,
+      connectedConnectors: [],
+      connectorModeEchoes: [],
     },
     ...overrides,
   };
@@ -1241,6 +1243,134 @@ describe('runOrchestrator', () => {
       expect.objectContaining({
         kind: 'ledger',
         entry: expect.objectContaining({ toolName: 'research.ask', outcome: 'ok' }),
+      }),
+    );
+  });
+
+  it('defers a connector.act subtask worker timeout across the confirmation modal via pendingConnectorActApproval (no ORCHESTRATOR_WORKER_TIMEOUT)', async () => {
+    // Codex re-review: a connector.act in a confirmation mode parks inside
+    // gateway.dispatch on the user's review modal before the external write, with
+    // no interim chunks. Under the flat worker timeout a slow approval trips
+    // ORCHESTRATOR_WORKER_TIMEOUT while the mutation may still complete client-
+    // side and be reported as lost. Mirrors the research.ask deferral: the standard
+    // worker timeout is TINY and no longer write-subtask window is configured, so
+    // it fires DURING the parked dispatch and only pendingConnectorActApproval
+    // keeps the subtask alive; the dispatch then resolves ok and it must SURVIVE.
+    const connectorPack = mkPack(['connector.act']);
+    const tool = JSON.stringify({
+      invocationId: 'inv_connector',
+      toolName: 'connector.act',
+      args: { connectorId: 'svc_1', operation: 'create_event', params: {} },
+    });
+    const dispatchResult = deferred<Awaited<ReturnType<ToolGateway['dispatch']>>>();
+    const dispatchStarted = deferred<void>();
+    let workerCalls = 0;
+    const connectorWorker: ChatProcessor = {
+      async *streamChat(): AsyncGenerator<ChatChunk> {
+        workerCalls += 1;
+        if (workerCalls === 1) {
+          yield {
+            id: 'tool',
+            choices: [
+              { delta: { content: `<tool>${tool}</tool>` }, finish_reason: 'stop' },
+            ],
+          };
+        } else {
+          yield {
+            id: 'final',
+            choices: [
+              { delta: { content: 'Created the calendar event.' }, finish_reason: 'stop' },
+            ],
+          };
+        }
+      },
+    };
+    const gateway = {
+      prepareInvocation: vi.fn((frame: ToolInvocationFrame) => ({
+        ok: true,
+        wireFrame: frame,
+      })),
+      dispatch: vi.fn(async () => {
+        dispatchStarted.resolve();
+        return dispatchResult.promise;
+      }),
+    } as unknown as ToolGateway;
+
+    const eventsPromise = collectEvents(
+      runOrchestrator(
+        baseDeps({
+          pack: connectorPack,
+          gateway,
+          models: [...models, anthropicWritingModel()],
+          plannerProvider: plannerProcessor(`{
+            "planId": "plan_connector",
+            "title": "Create a calendar event",
+            "summary": "Perform a mutating connector action with user confirmation.",
+            "subtasks": [
+              {
+                "id": "st_connector",
+                "title": "Create the event",
+                "objective": "Create a calendar event on the connected service.",
+                "kind": "general",
+                "requiredCapabilities": ["general_reasoning"],
+                "allowedTools": ["connector.act"],
+                "dependsOn": [],
+                "producesArtifact": false,
+                "risk": "low"
+              }
+            ]
+          }`),
+          workerProviderFactory: () => connectorWorker,
+          enabledGatewayTools: connectorPack.toolScopes,
+          // Tiny standard timeout — on the OLD behaviour the connector subtask
+          // would time out during the confirmation pause.
+          workerTimeoutMs: 20,
+          writeDispatchGraceMs: 1_000,
+        }),
+      ),
+    );
+
+    // Wait until the worker has dispatched connector.act, then idle well past the
+    // standard 20ms worker timeout BEFORE resolving the dispatch.
+    await dispatchStarted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(gateway.dispatch).toHaveBeenCalledTimes(1);
+
+    // The user finally confirms and the external write completes ok.
+    dispatchResult.resolve({
+      invocationId: 'inv_connector',
+      outcome: 'ok',
+      resultJson: { ok: true, data: { id: 'evt_123' } },
+      ledgerEntry: {
+        invokedAt: new Date().toISOString(),
+        toolName: 'connector.act',
+        scope: 'svc_1:create_event:mode=always_ask',
+        approvedPath: null,
+        outcome: 'ok',
+        reason: null,
+        skillPackId: connectorPack.id,
+        turnId: 'turn_1',
+      },
+    });
+
+    const events = await eventsPromise;
+
+    // The deferral kept the subtask alive — NO worker timeout error.
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: 'orchestrator-progress',
+        subtaskId: 'st_connector',
+        status: 'error',
+        detail: 'ORCHESTRATOR_WORKER_TIMEOUT',
+      }),
+    );
+    expect(gateway.dispatch).toHaveBeenCalledTimes(1);
+    expect(workerCalls).toBe(2);
+    // The connector.act ledger landed.
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: 'ledger',
+        entry: expect.objectContaining({ toolName: 'connector.act', outcome: 'ok' }),
       }),
     );
   });

@@ -215,7 +215,7 @@ describe('web.fetch orchestrator', () => {
           content: 'Fetch https://example.com and report the HTTP status and summarise it.',
         },
       ],
-      requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const },
+      requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const, connectedConnectors: [], connectorModeEchoes: [] },
       workerTimeoutMs: 5_000,
       summaryTimeoutMs: 5_000,
     };
@@ -332,7 +332,7 @@ describe('web.fetch orchestrator', () => {
           content: 'Look up the example page and then write a report about it.',
         },
       ],
-      requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const },
+      requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const, connectedConnectors: [], connectorModeEchoes: [] },
       workerTimeoutMs: 5_000,
       summaryTimeoutMs: 5_000,
     };
@@ -400,7 +400,7 @@ describe('web.fetch orchestrator', () => {
           content: 'Fetch https://example.com and report the HTTP status and summarise it.',
         },
       ],
-      requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const },
+      requestContext: { linkedFolders: [], writePermissionMode: 'always_ask' as const, connectedConnectors: [], connectorModeEchoes: [] },
       workerTimeoutMs: 5_000,
       summaryTimeoutMs: 5_000,
     };

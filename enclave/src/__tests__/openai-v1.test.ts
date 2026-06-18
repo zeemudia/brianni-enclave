@@ -90,6 +90,41 @@ async function collect(
   }
 }
 
+describe('OpenAIProcessor — token limit parameter', () => {
+  it('sends a token cap as max_completion_tokens, not max_tokens (gpt-5.x rejects max_tokens)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(CHAT_OK_SSE));
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+
+    const processor = new OpenAIProcessor('https://api.openai.com/v1', 'sk-test');
+    await collect(
+      processor.streamChat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-5.4-mini',
+        max_tokens: 256,
+      }),
+    );
+
+    const body = requestBody(fetchMock);
+    expect(body.max_completion_tokens).toBe(256);
+    expect(body).not.toHaveProperty('max_tokens');
+  });
+
+  it('omits both token-limit fields when no cap is requested', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(CHAT_OK_SSE));
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+
+    const processor = new OpenAIProcessor('https://api.openai.com/v1', 'sk-test');
+    await collect(
+      processor.streamChat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-5.4-mini',
+      }),
+    );
+
+    const body = requestBody(fetchMock);
+    expect(body).not.toHaveProperty('max_completion_tokens');
+    expect(body).not.toHaveProperty('max_tokens');
+  });
+});
+
 describe('OpenAIProcessor — chunk mapping', () => {
   it('maps SSE deltas to ChatChunks and does not yield the include_usage frame', async () => {
     const sse = [
@@ -415,7 +450,10 @@ describe('OpenAIProcessor — temperature-retry interplay', () => {
     expect(retry.messages).toEqual(first.messages);
     expect(retry.stream).toBe(true);
     expect(retry.stream_options).toEqual({ include_usage: true });
-    expect(retry.max_tokens).toBe(64);
+    // The token cap is preserved across the retry — as max_completion_tokens
+    // (gpt-5.x rejects the legacy max_tokens), never the legacy field.
+    expect(retry.max_completion_tokens).toBe(64);
+    expect(retry).not.toHaveProperty('max_tokens');
     expect(requestInit(fetchMock, 0).signal).toBe(controller.signal);
     expect(requestInit(fetchMock, 1).signal).toBe(controller.signal);
     expect(chunks[0]?.choices[0]?.delta.content).toBe('ok');

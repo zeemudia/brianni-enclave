@@ -11,6 +11,7 @@ import {
   type SkillPack,
   type ToolName,
 } from "../skill-pack";
+import { BinaryWorkItemToolNameSchema } from "../tool-protocol";
 
 const validPack = {
   id: "personal-agent.default",
@@ -186,6 +187,9 @@ describe("SkillPackSchema", () => {
         "video.render",
         "document.edit",
         "pdf.edit",
+        "connector.list",
+        "connector.read",
+        "connector.act",
       ].sort(),
     );
   });
@@ -317,5 +321,39 @@ describe("skill-pack id registry", () => {
   it("does not collide between different ids", () => {
     registerSkillPackId("personal-agent.default");
     expect(isRegisteredSkillPackId("personal-agent.career")).toBe(false);
+  });
+});
+
+describe("connector.* tool family", () => {
+  it("registers the three generic connector tool names", () => {
+    expect(TOOL_NAMES).toContain("connector.list");
+    expect(TOOL_NAMES).toContain("connector.read");
+    expect(TOOL_NAMES).toContain("connector.act");
+  });
+
+  it("ToolNameSchema accepts connector.* names", () => {
+    expect(ToolNameSchema.parse("connector.list")).toBe("connector.list");
+    expect(ToolNameSchema.parse("connector.read")).toBe("connector.read");
+    expect(ToolNameSchema.parse("connector.act")).toBe("connector.act");
+  });
+
+  it("connector.* are text/JSON tools — NOT in the binary-work-item set", () => {
+    for (const name of ["connector.list", "connector.read", "connector.act"]) {
+      expect(() => BinaryWorkItemToolNameSchema.parse(name)).toThrow();
+    }
+  });
+
+  it("the old per-service names stay BANNED — never in TOOL_NAMES (spec §7.1)", () => {
+    for (const banned of [
+      "calendar.read",
+      "calendar.write",
+      "event.create",
+      "event.update",
+      "event.delete",
+      "event.respond",
+    ]) {
+      expect(TOOL_NAMES).not.toContain(banned);
+      expect(() => ToolNameSchema.parse(banned)).toThrow();
+    }
   });
 });
