@@ -205,6 +205,35 @@ describe('applyAllStyleSuggestions', () => {
     expect(rig.dismissSpy).not.toHaveBeenCalled();
   });
 
+  it('does no work at all (does not even read text) when nothing is pending', () => {
+    // The `if (pending.length === 0) return` early-exit avoids ALL downstream
+    // work — including the `deps.getText()` read. Kills the guard -> `false`
+    // mutant, which would fall through and call getText even though there is
+    // nothing to apply or dismiss. (setText/accept/dismiss stay silent under
+    // the mutant too, because validPending/stalePending are both [], so reading
+    // text is the only observable signal that the early return was skipped.)
+    const getText = vi.fn(() => 'Hello!!!');
+    const setText = vi.fn();
+    const accept = vi.fn();
+    const dismiss = vi.fn();
+    const deps: StyleHandlerDeps = {
+      getText,
+      setText,
+      suggestions: [makeSuggestion({ id: 'x' })],
+      statuses: { x: 'accepted' }, // not pending -> pending is empty
+      accept,
+      dismiss,
+      dismissAll: vi.fn(),
+    };
+
+    applyAllStyleSuggestions(deps);
+
+    expect(getText).not.toHaveBeenCalled();
+    expect(setText).not.toHaveBeenCalled();
+    expect(accept).not.toHaveBeenCalled();
+    expect(dismiss).not.toHaveBeenCalled();
+  });
+
   it('applies all valid pending suggestions and accepts each id', () => {
     // Two suggestions both pending, both with matching slices.
     const a = makeSuggestion({
@@ -308,8 +337,27 @@ describe('applyAllStyleSuggestions', () => {
   });
 
   it('does not call setText when applyAccepted yields the same text', () => {
-    // Both suggestions are stale — validPending is empty, so setText never
-    // fires. Stale suggestions get dismissed.
+    const noop = makeSuggestion({
+      id: 'noop',
+      original: 'steady',
+      replacement: 'steady',
+      startIndex: 0,
+      endIndex: 6,
+    });
+    const rig = buildRig({
+      initialText: 'steady text',
+      suggestions: [noop],
+    });
+
+    applyAllStyleSuggestions(rig.deps);
+
+    expect(rig.setTextSpy).not.toHaveBeenCalled();
+    expect(rig.acceptSpy).toHaveBeenCalledExactlyOnceWith('noop');
+    expect(rig.dismissSpy).not.toHaveBeenCalled();
+    expect(rig.textState.value).toBe('steady text');
+  });
+
+  it('dismisses stale-only pending suggestions without mutating text', () => {
     const stale = makeSuggestion({
       id: 'stale',
       original: 'wow!!!',

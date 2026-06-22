@@ -153,6 +153,74 @@ describe("assembleSystemPrompt", () => {
     expect(none).not.toContain("connector.");
   });
 
+  it("explains the FREE external-service connector limit without advertising unscoped connector tools", () => {
+    const out = assembleSystemPrompt(
+      {
+        ...defaultPack,
+        toolScopes: ["memory.read", "event.draft"],
+      },
+      {
+        subscriptionPlanId: "FREE",
+        fullSkillToolScopes: [
+          "memory.read",
+          "event.draft",
+          "connector.list",
+          "connector.read",
+          "connector.act",
+        ],
+      },
+    );
+
+    expect(out).toContain("External service connectors require PRO or MAX");
+    expect(out).toContain("Settings");
+    expect(out).toContain("upgrade");
+    expect(out).toContain("manual draft");
+    expect(out).not.toContain("connector.");
+  });
+
+  it("does not add the FREE connector paywall line for paid turns", () => {
+    const out = assembleSystemPrompt(
+      {
+        ...defaultPack,
+        toolScopes: ["connector.list", "connector.read", "connector.act"],
+      },
+      { subscriptionPlanId: "PRO" },
+    );
+
+    expect(out).not.toContain("External service connectors require PRO or MAX");
+    expect(out).toContain("connector.list");
+    expect(out).toContain("connector.read");
+    expect(out).toContain("connector.act");
+  });
+
+  it("tells connector workers to resolve relative times and named external resources before mutations", () => {
+    const out = assembleSystemPrompt(
+      {
+        ...defaultPack,
+        toolScopes: ["connector.list", "connector.read", "connector.act"],
+      },
+      {
+        localTime: {
+          nowIso: "2026-06-21T16:48:00.000Z",
+          localDate: "2026-06-21",
+          localTime: "17:48:00",
+          timeZone: "Europe/London",
+          utcOffsetMinutes: 60,
+        },
+      },
+    );
+
+    expect(out).toContain("Current local date/time");
+    expect(out).toContain("2026-06-21");
+    expect(out).toContain("Europe/London");
+    expect(out).toContain("Resolve relative dates and times");
+    expect(out).toContain("ISO");
+    expect(out).toContain("required");
+    expect(out).toContain("missing required parameters");
+    expect(out).toContain("named external resources");
+    expect(out).toContain("do not guess default ids");
+  });
+
   it("advertises every non-specialist scoped tool", () => {
     const liveToolScopes = TOOL_NAMES.filter(
       (tool) => !SPECIALIST_MEDIA_TOOLS.has(tool),

@@ -1,0 +1,19 @@
+{
+  "$schema": "../../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Pattern 5 mutation run over chat-types' IMPERATIVE protocol helpers that sit OUTSIDE the existing padding.ts blocking target — the residual behaviour-bearing logic in this single-source-of-truth package. native-web-search.ts (the native web-search error classifier — which provider errors map to capability-rejection vs preoutput-failure vs auth/quota fall-through, a contract consumed by web+mobile+enclave), file-capabilities.ts (the extension->capability-family lookup behind the file-tools surface), and calypso-follow-up.ts (the follow-up message-history builder whose private-derived omission gate is a masking-roundtrip / privacy invariant). The declarative Zod schema bodies are deliberately excluded (mostly equivalent noise); only these imperative exported functions are mutated. Pure package, hermetic tests, dedicated vitest.mutation.protocol.config.ts pinned to pool:'forks'. TARGET-LOCAL / REPORT-ONLY (not registered in run-mutation.sh / gate.config.json). See docs/quality/mutation-triage/packages-protocol-residuals.md.",
+  "testRunner": "vitest",
+  "concurrency": 4,
+  "vitest": { "configFile": "vitest.mutation.protocol.config.ts" },
+  "mutate": [
+    "src/native-web-search.ts",
+    "src/file-capabilities.ts",
+    "src/calypso-follow-up.ts"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/chat-types-protocol.html" },
+  "jsonReporter": { "fileName": "reports/mutation/chat-types-protocol.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

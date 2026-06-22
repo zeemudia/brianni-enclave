@@ -40,7 +40,9 @@ describe('deriveNamespaceKey', () => {
     const root = hexToBytes(CHAT_ROOT_HEX);
 
     for (const bad of ['', 'finance', ' default', 'DEFAULT']) {
-      await expect(deriveNamespaceKey(root, bad as never)).rejects.toThrow();
+      await expect(deriveNamespaceKey(root, bad as never)).rejects.toThrow(
+        `INVARIANT VIOLATION: "${bad}" is not a valid memory namespace`,
+      );
     }
   });
 

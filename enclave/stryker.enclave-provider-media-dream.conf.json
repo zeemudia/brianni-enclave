@@ -1,0 +1,19 @@
+{
+  "$schema": "../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Target-local mutation run over three pure, hermetic, high-risk enclave slices: orchestrator/router.ts (agent provider/model SELECTION + provider-diverse FALLBACK ordering — security/correctness: a wrong hard-gate or fallback bug routes a private-modality subtask to a model that cannot perform it, or loses provider diversity), media/provenance.ts (media PROVENANCE — private-taint propagation, TTL expiry, sha256 integrity, signature verify; a return-true/flip mutant here would leak a private-derived asset to a provider or accept a tampered/expired record), and dream/model-routing.ts (dream reconcile model ESCALATION on likely conflict — wrong escalation silently reconciles conflicting memories with a weaker model). All three are pure (no node:* beyond crypto hashing, no vsock, no network, no DB), so they run hermetically. Report-only / not wired into the shared adjusted-gate while parallel mutation sessions are open. See docs/quality/mutation-triage/enclave-provider-media-dream.md.",
+  "testRunner": "vitest",
+  "concurrency": 4,
+  "vitest": { "configFile": "vitest.mutation.enclave-provider-media-dream.config.ts" },
+  "mutate": [
+    "src/orchestrator/router.ts",
+    "src/media/provenance.ts",
+    "src/dream/model-routing.ts"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/enclave-provider-media-dream.html" },
+  "jsonReporter": { "fileName": "reports/mutation/enclave-provider-media-dream.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

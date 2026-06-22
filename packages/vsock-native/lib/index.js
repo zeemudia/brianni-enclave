@@ -315,4 +315,15 @@ function createServer(connectionHandler) {
   return server;
 }
 
-module.exports = { connect, createServer, VsockSocket, _setAddonForTests };
+module.exports = {
+  connect,
+  createServer,
+  VsockSocket,
+  _setAddonForTests,
+  // Test seam: the accept-error classifier is the load-bearing decision for
+  // whether a failed accept(2) halts the enclave's listener (fatal) or re-arms
+  // it (retry / retry-delayed). Exported so its fatal/retry/delayed buckets and
+  // the code+message text assembly can be pinned directly, rather than only
+  // observed indirectly through accept-loop timing. Not for production use.
+  _classifyAcceptError: classifyAcceptError,
+};

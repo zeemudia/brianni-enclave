@@ -1,0 +1,24 @@
+{
+  "$schema": "../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Target-local mutation run over the REMAINING pure, hermetic, high-risk enclave provider/orchestrator/media/dream slices not covered by enclave-provider-media-dream (router/provenance/model-routing). Files: providers/errors.ts (provider error CLASSIFICATION → drives retry/fallback/auth trust; a misclassified rate_limit vs auth vs invalid changes circuit-breaker + fallback behavior), orchestrator/provider-health.ts (rate-limit CIRCUIT BREAKER + fallback attempt ordering; a clamp/ordering bug keeps hammering a cooling provider or drops a viable fallback), media/budget.ts (video QUOTA accounting — a wrong ceil/margin under-charges the user's media quota), media/custody-gate.ts (secure-render CUSTODY gate — a flip would let a private-tainted asset render on a non-attested backend), media/provider-visible-input.ts (provenance verify BEFORE egress to a provider — fail-closed; a return/flip mutant would send a tampered/unverified asset to a third-party provider), dream/extract.ts + dream/reconcile.ts (memory EXTRACTION precision + reconcile delta validation, both fail-closed on malformed model output — a flipped guard accepts an invalid candidate/delta), dream/parse-json.ts (strict fenced-JSON parse). All pure (node:crypto hashing only, no vsock/network/DB) so they run hermetically. Report-only / not wired into the shared adjusted-gate while parallel mutation sessions are open. See docs/quality/mutation-triage/enclave-provider-media-dream-2.md.",
+  "testRunner": "vitest",
+  "concurrency": 4,
+  "vitest": { "configFile": "vitest.mutation.enclave-provider-media-dream-2.config.ts" },
+  "mutate": [
+    "src/providers/errors.ts",
+    "src/orchestrator/provider-health.ts",
+    "src/media/budget.ts",
+    "src/media/custody-gate.ts",
+    "src/media/provider-visible-input.ts",
+    "src/dream/extract.ts",
+    "src/dream/reconcile.ts",
+    "src/dream/parse-json.ts"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/enclave-provider-media-dream-2.html" },
+  "jsonReporter": { "fileName": "reports/mutation/enclave-provider-media-dream-2.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

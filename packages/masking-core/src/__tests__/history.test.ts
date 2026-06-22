@@ -36,6 +36,27 @@ describe("maskHistoricalUserContent (Codex LOW F20/F24)", () => {
     );
   });
 
+  it("does NOT invoke the tokeniser when there is no PII (entities.length > 0 gate)", () => {
+    // Kills `entities.length > 0` -> `>= 0` / `true`: with no PII the masker
+    // must short-circuit and return verbatim content, never calling mask. A
+    // sentinel-returning tokeniser proves the mask branch was not taken.
+    let maskCalls = 0;
+    const sentinelTokeniser = {
+      mask: () => {
+        maskCalls++;
+        return { masked: "SENTINEL", tokens: [] };
+      },
+    };
+    const out = maskHistoricalUserContent(
+      "no identifiers here at all",
+      sentinelTokeniser as unknown as Parameters<
+        typeof maskHistoricalUserContent
+      >[1],
+    );
+    expect(out).toBe("no identifiers here at all");
+    expect(maskCalls).toBe(0);
+  });
+
   // claude-adv review — when a mixed outbound request contains a turn whose
   // maskedContent was already minted AND a re-masked turn echoing the same
   // identifier (e.g. an assistant turn), confirm the feared failure mode

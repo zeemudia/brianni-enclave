@@ -50,6 +50,10 @@ function makeDocB64(payloadEntries: Array<[CBORValue, Uint8Array]>): string {
   return Buffer.from(cose).toString('base64');
 }
 
+function makeRawCoseB64(items: CBORValue[]): string {
+  return Buffer.from(encodeCBOR(items)).toString('base64');
+}
+
 describe('structural payload validation (fail-closed, M2)', () => {
   const pcr = new Uint8Array(48).fill(7);
   const fullPcrs: Array<[CBORValue, Uint8Array]> = [
@@ -69,6 +73,77 @@ describe('structural payload validation (fail-closed, M2)', () => {
     if (withNonce) entries.push(['nonce', encodeCBOR(new Uint8Array(32).fill(9))]);
     return entries;
   };
+
+  it('rejects COSE arrays with the wrong arity or non-byte protected/payload/signature fields', async () => {
+    await expect(verifyNitroAttestation(makeRawCoseB64([]))).rejects.toThrow(
+      /expected COSE_Sign1 array with 4 elements/,
+    );
+    await expect(
+      verifyNitroAttestation(
+        makeRawCoseB64([
+          'not-protected-bytes',
+          null,
+          cborMapRaw([]),
+          new Uint8Array(96),
+        ]),
+      ),
+    ).rejects.toThrow(/expected byte strings/);
+    await expect(
+      verifyNitroAttestation(
+        makeRawCoseB64([
+          new Uint8Array([0xa0]),
+          null,
+          'not-payload-bytes',
+          new Uint8Array(96),
+        ]),
+      ),
+    ).rejects.toThrow(/expected byte strings/);
+    await expect(
+      verifyNitroAttestation(
+        makeRawCoseB64([
+          new Uint8Array([0xa0]),
+          null,
+          cborMapRaw([]),
+          'not-signature-bytes',
+        ]),
+      ),
+    ).rejects.toThrow(/expected byte strings/);
+  });
+
+  it('rejects payloads that are not CBOR maps', async () => {
+    await expect(
+      verifyNitroAttestation(
+        makeRawCoseB64([
+          new Uint8Array([0xa0]),
+          null,
+          encodeCBOR(['not', 'a', 'map']),
+          new Uint8Array(96),
+        ]),
+      ),
+    ).rejects.toThrow(/expected CBOR map/);
+  });
+
+  it('rejects payloads missing certificate, cabundle, or pcrs before crypto verification', async () => {
+    await expect(
+      verifyNitroAttestation(makeDocB64([['cabundle', encodeCBOR([])], ['pcrs', cborMapRaw(fullPcrs)]])),
+    ).rejects.toThrow(/missing certificate/);
+    await expect(
+      verifyNitroAttestation(
+        makeDocB64([
+          ['certificate', encodeCBOR(new Uint8Array([0x30, 0x00]))],
+          ['pcrs', cborMapRaw(fullPcrs)],
+        ]),
+      ),
+    ).rejects.toThrow(/missing cabundle/);
+    await expect(
+      verifyNitroAttestation(
+        makeDocB64([
+          ['certificate', encodeCBOR(new Uint8Array([0x30, 0x00]))],
+          ['cabundle', encodeCBOR([])],
+        ]),
+      ),
+    ).rejects.toThrow(/missing pcrs/);
+  });
 
   it('throws a typed error when pcrs[0] is missing', async () => {
     const doc = makeDocB64(
@@ -132,7 +207,7 @@ describe('AWS_NITRO_ROOT_CA_DER (pinned trust anchor)', () => {
     const { default: srcText } = await import('node:fs').then((fs) => ({
       default: fs.readFileSync(new URL('../nitro-verify.ts', import.meta.url), 'utf-8'),
     }));
-    const match = srcText.match(/AWS_NITRO_ROOT_CA_DER = \(\(\) => \{\s*[^]*?const b64 =\s*([^]*?);[\s]*return fromBase64\(b64\);/);
+    const match = srcText.match(/const\s+b64\s*=\s*([^]*?);/);
     expect(match).toBeTruthy();
     const b64 = match![1].replace(/\s*\+?\s*'([^']+)'/g, '$1');
     const pem = `-----BEGIN CERTIFICATE-----\n${b64.match(/.{1,64}/g)!.join('\n')}\n-----END CERTIFICATE-----`;

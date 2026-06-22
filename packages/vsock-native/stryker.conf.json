@@ -1,0 +1,15 @@
+{
+  "$schema": "../../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Pattern 5 mutation run over vsock-native's JS BOUNDARY wrapper (lib/index.js) — the enclave<->host AF_VSOCK transport surface. The native addon (src/vsock_addon.cc) is Linux-only and not compiled on macOS/CI, so it is OUT of scope and only the JS wrapper is mutated. Targets: the accept-error classifier (fatal halt vs immediate retry vs delayed-retry — a misclassification can leave the enclave deaf after a transient accept() error, the exact H2 incident this code fixed), the addon-load diagnostics (L1: surface the root cause), and the VsockSocket stream lifecycle (L2: surface EBADF while open, clear the timeout timer on destroy). Tests stub the native addon via `_setAddonForTests`, so the suite is fully hermetic — no real AF_VSOCK fd is opened. Non-blocking (thresholds.break=null). See docs/quality/mutation-testing.md and docs/quality/mutation-triage/packages-video-vsock-native.md.",
+  "testRunner": "vitest",
+  "concurrency": 4,
+  "vitest": { "configFile": "vitest.mutation.config.ts" },
+  "mutate": ["lib/index.js"],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/vsock-native-boundary.html" },
+  "jsonReporter": { "fileName": "reports/mutation/vsock-native-boundary.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

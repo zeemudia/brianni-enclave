@@ -136,6 +136,181 @@ const RequiredScopeSchema = z.union([
  */
 const OperationParamDescriptorSchema = z.record(z.string(), z.unknown());
 
+const ConnectorPlatformSchema = z.enum(["web", "ios", "android"]);
+
+const ConnectorHttpValueSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("literal"),
+    value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+  }),
+  z.object({
+    kind: z.literal("param"),
+    name: z.string().min(1).max(64),
+    required: z.boolean().default(false),
+    default: z.unknown().optional(),
+  }),
+  z.object({ kind: z.literal("idempotencyKey") }),
+  z.object({ kind: z.literal("ifMatchEtag") }),
+]);
+
+export type ConnectorHttpValue = z.infer<typeof ConnectorHttpValueSchema>;
+
+const ConnectorHttpResponseSchema = z.object({
+  /**
+   * Dot-path into the provider JSON body, e.g. "items" or "data.items".
+   * Omitted means return the whole JSON body. Empty/no-content responses return
+   * `{ status }` unless `dataKey` wraps another value.
+   */
+  dataPath: z.string().min(1).max(256).optional(),
+  /** Wrap the selected data as `{ [dataKey]: value }` for planner-friendly names. */
+  dataKey: z.string().min(1).max(64).optional(),
+});
+
+export type ConnectorHttpResponse = z.infer<
+  typeof ConnectorHttpResponseSchema
+>;
+
+const ConnectorHttpOperationSchema = z.object({
+  method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+  /** Full provider URL template. Path placeholders use `{name}`. */
+  url: z.string().url().max(2048),
+  /**
+   * Maps `{name}` placeholders in `url` to invocation params / literals. Missing
+   * required values fail closed before a provider call.
+   */
+  pathParams: z.record(z.string(), ConnectorHttpValueSchema).default({}),
+  query: z.record(z.string(), ConnectorHttpValueSchema).default({}),
+  headers: z.record(z.string(), ConnectorHttpValueSchema).default({}),
+  jsonBody: z.record(z.string(), ConnectorHttpValueSchema).optional(),
+  response: ConnectorHttpResponseSchema.default({}),
+});
+
+export type ConnectorHttpOperation = z.infer<
+  typeof ConnectorHttpOperationSchema
+>;
+
+const ConnectorOAuthClientConfigSchema = z
+  .object({
+    /**
+     * OAuth public client id. Prefer catalog data for catalog-only connector
+     * additions: browser builds cannot dynamically discover arbitrary new
+     * NEXT_PUBLIC_* env names after compilation.
+     */
+    clientId: z.string().min(1).max(512).optional(),
+    /**
+     * Back-compat / local override path. New catalog-only connectors should use
+     * `clientId` unless the build system also knows this env name statically.
+     */
+    clientIdEnv: z.string().min(1).max(128).optional(),
+  })
+  .refine((c) => c.clientId !== undefined || c.clientIdEnv !== undefined, {
+    message: "oauth client config requires clientId or clientIdEnv",
+  });
+
+const ConnectorOAuthWebConfigSchema = ConnectorOAuthClientConfigSchema.extend({
+  flow: z.enum(["google_gis", "authorization_code_pkce"]),
+  redirectPath: z.string().min(1).max(256).default("/oauth/callback"),
+  extraAuthorizeParams: z.record(z.string(), z.string()).default({}),
+  extraTokenParams: z.record(z.string(), z.string()).default({}),
+});
+
+const ConnectorOAuthNativeConfigSchema = ConnectorOAuthClientConfigSchema.extend({
+  flow: z.literal("authorization_code_pkce"),
+  /**
+   * Most providers can use the app-owned scheme ("calypso") for catalog-only
+   * mobile additions. Google installed-app clients are the known exception and
+   * use the reversed-client-id scheme already registered by the native plugin.
+   */
+  redirectScheme: z.string().min(1).max(256).optional(),
+  redirectSchemeMode: z
+    .enum(["app_scheme", "google_reversed_client_id"])
+    .default("app_scheme"),
+  redirectPath: z.string().min(1).max(128).default("oauthredirect"),
+  requireRefreshToken: z.boolean().default(true),
+  extraAuthorizeParams: z.record(z.string(), z.string()).default({}),
+  extraTokenParams: z.record(z.string(), z.string()).default({}),
+});
+
+const ConnectorOAuthTokenExchangeSchema = z
+  .enum(["client", "server"])
+  .default("client");
+
+const ConnectorOAuthSecretEnvSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Z][A-Z0-9_]*$/, {
+    message: "clientSecretEnv must be an uppercase env var name",
+  });
+
+const ConnectorOAuth2AuthSchema = z
+  .object({
+    type: z.literal("oauth2"),
+    /**
+     * `client`: browser/native app exchanges the code directly with the provider
+     * as a public PKCE client. `server`: app sends the code/refresh token to the
+     * first-party broker, which resolves `clientSecretEnv` and performs the
+     * confidential-client exchange without adding provider-specific code.
+     */
+    tokenExchange: ConnectorOAuthTokenExchangeSchema,
+    clientSecretEnv: ConnectorOAuthSecretEnvSchema.optional(),
+    authorizationEndpoint: z.string().url().max(2048).optional(),
+    tokenEndpoint: z.string().url().max(2048).optional(),
+    revocationEndpoint: z.string().url().max(2048).optional(),
+    tokenInfoEndpoint: z.string().url().max(2048).optional(),
+    defaultScopes: z.array(z.string().min(1).max(256)).min(1).max(32),
+    web: ConnectorOAuthWebConfigSchema.optional(),
+    ios: ConnectorOAuthNativeConfigSchema.optional(),
+    android: ConnectorOAuthNativeConfigSchema.optional(),
+  })
+  .superRefine((auth, ctx) => {
+    const pkceConfigured =
+      auth.web?.flow === "authorization_code_pkce" ||
+      auth.ios?.flow === "authorization_code_pkce" ||
+      auth.android?.flow === "authorization_code_pkce";
+    if (pkceConfigured && !auth.authorizationEndpoint) {
+      ctx.addIssue({
+        code: "custom",
+        message: "authorization_code_pkce requires authorizationEndpoint",
+      });
+    }
+    if (pkceConfigured && !auth.tokenEndpoint) {
+      ctx.addIssue({
+        code: "custom",
+        message: "authorization_code_pkce requires tokenEndpoint",
+      });
+    }
+    if (auth.tokenExchange === "server" && !auth.clientSecretEnv) {
+      ctx.addIssue({
+        code: "custom",
+        message: "server tokenExchange requires clientSecretEnv",
+      });
+    }
+    if (
+      auth.web?.flow === "authorization_code_pkce" &&
+      auth.tokenExchange !== "server"
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "web authorization_code_pkce requires server tokenExchange",
+      });
+    }
+  });
+
+export type ConnectorOAuth2Auth = z.infer<typeof ConnectorOAuth2AuthSchema>;
+
+export const ConnectorAuthSchema = ConnectorOAuth2AuthSchema;
+export type ConnectorAuth = z.infer<typeof ConnectorAuthSchema>;
+
+const ConnectorScopeSubsumesSchema = z.object({
+  grant: z.string().min(1).max(256),
+  covers: z.array(z.string().min(1).max(256)).min(1).max(32),
+});
+
+export type ConnectorScopeSubsumes = z.infer<
+  typeof ConnectorScopeSubsumesSchema
+>;
+
 export const ConnectorOperationSchema = z
   .object({
     id: z.string().min(1).max(64),
@@ -161,11 +336,32 @@ export const ConnectorOperationSchema = z
     // Names the count param key for the maxResults check. The actual key string
     // is catalog data supplied at runtime, never named here.
     maxResultsParam: z.string().min(1).max(64).optional(),
+    // Names the start/end param keys that carry an EVENT-TIME RANGE for a
+    // mutating op (e.g. a create/update start/end). At admission the enclave
+    // validates each PRESENT bound — a real calendar datetime or all-day date, as
+    // a string or a { dateTime } / { date } object — AND, when both are present,
+    // requires end > start. An unexecutable value ("tomorrow morning", an
+    // impossible date) OR an inverted/zero-length range is REJECTED BEFORE the
+    // mutation budget / destructive-sequence accounting is touched, so a malformed
+    // planner write cannot consume budget, poison the turn, or reach a provider
+    // 400 after the user confirmed. Connector-agnostic + rotation-free: the key
+    // strings are catalog data, never hardcoded in measured code (mirrors
+    // windowParams for reads).
+    eventTimeRange: z
+      .object({ start: z.string().min(1).max(64), end: z.string().min(1).max(64) })
+      .optional(),
     paramsSchema: OperationParamDescriptorSchema.default({}),
     // Finding-4: the read/write content fields whose per-field sentinel
     // survival is a blocking pre-deploy fixture gate (declared here so adding a
     // content field forces adding its survival fixture).
     contentFields: z.array(z.string().min(1).max(64)).max(64).optional(),
+    /**
+     * Optional catalog-declared HTTP execution recipe. When present, clients can
+     * build a generic REST adapter for this operation without shipping a
+     * connector-specific handler. Omitted means the operation still needs a
+     * registered adapter/MCP implementation.
+     */
+    http: ConnectorHttpOperationSchema.optional(),
     // Finding-2 / spec §15.2: an op that moves BINARY/large-blob content (file
     // bytes, attachments) does NOT fit the measured text/JSON reverse-channel +
     // tokeniser and is THE rotation exception. v1 forbids it: the field exists
@@ -198,8 +394,10 @@ export const ConnectorDescriptorSchema = z
     id: z.string().min(1).max(64),
     displayName: z.string().min(1).max(64),
     provider: z.string().min(1).max(64),
-    platforms: z.array(z.enum(["web", "ios", "android"])).min(1),
+    platforms: z.array(ConnectorPlatformSchema).min(1),
     oauthScopes: z.array(z.string().min(1).max(256)).min(1).max(32),
+    auth: ConnectorAuthSchema.optional(),
+    scopeSubsumes: z.array(ConnectorScopeSubsumesSchema).max(128).optional(),
     operations: z.array(ConnectorOperationSchema).min(1).max(64),
     // v2 forward-compat slot (spec §11). v1 MUST be null — any MCP descriptor is
     // fail-closed rejected until v2 widens this to a pinned-tool descriptor.
@@ -211,6 +409,15 @@ export const ConnectorDescriptorSchema = z
   .refine(
     (c) => new Set(c.operations.map((o) => o.id)).size === c.operations.length,
     { message: "operation ids must be unique within a connector" },
+  )
+  .refine(
+    (c) =>
+      !(
+        c.auth?.type === "oauth2" &&
+        c.auth.web?.flow === "google_gis" &&
+        c.provider !== "google"
+      ),
+    { message: "google_gis web flow requires provider google" },
   );
 
 export type ConnectorDescriptor = z.infer<typeof ConnectorDescriptorSchema>;

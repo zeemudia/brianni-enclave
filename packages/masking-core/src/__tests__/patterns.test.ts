@@ -1,6 +1,79 @@
 import { describe, it, expect } from "vitest";
 import { detectPII } from "../patterns";
 
+const roleTitleWords = [
+  "Senior",
+  "Junior",
+  "Lead",
+  "Principal",
+  "Staff",
+  "Chief",
+  "Head",
+  "Vice",
+  "Deputy",
+  "Associate",
+  "Assistant",
+  "Global",
+  "Regional",
+  "Group",
+  "Product",
+  "Project",
+  "Program",
+  "Programme",
+  "Engineering",
+  "Engineer",
+  "Software",
+  "Hardware",
+  "Data",
+  "Platform",
+  "Systems",
+  "Solutions",
+  "Manager",
+  "Director",
+  "Officer",
+  "Executive",
+  "President",
+  "Analyst",
+  "Designer",
+  "Developer",
+  "Architect",
+  "Consultant",
+  "Specialist",
+  "Coordinator",
+  "Administrator",
+  "Founder",
+  "Partner",
+  "Advisor",
+  "Adviser",
+  "Strategist",
+  "Scientist",
+  "Researcher",
+  "Technician",
+  "Representative",
+  "Supervisor",
+  "Recruiter",
+  "Marketing",
+  "Sales",
+  "Operations",
+  "Finance",
+  "Legal",
+  "Counsel",
+  "Intern",
+];
+
+const curatedNonNamePhrases = [
+  "Costa Rica",
+  "El Niño",
+  "El Salvador",
+  "Hong Kong",
+  "La Niña",
+  "Puerto Rico",
+  "San Diego",
+  "San Francisco",
+  "Santa Monica",
+  "Sierra Leone",
+];
+
 describe("Regex PII detection", () => {
   it("should detect email addresses", () => {
     const entities = detectPII("Contact me at osazee@example.com please");
@@ -73,6 +146,13 @@ describe("Regex PII detection", () => {
     expect(entities).toContainEqual(expect.objectContaining({ type: "ACCT" }));
   });
 
+  it("should not detect credit-card-shaped numbers that fail Luhn", () => {
+    const entities = detectPII("Reference: 4111 1111 1111 1112");
+    expect(entities).not.toContainEqual(
+      expect.objectContaining({ type: "ACCT", text: "4111 1111 1111 1112" }),
+    );
+  });
+
   it("should return empty array for no PII", () => {
     const entities = detectPII("The weather is nice today");
     expect(entities).toEqual([]);
@@ -115,6 +195,21 @@ describe("Regex PII detection", () => {
   it("should detect US Social Security numbers", () => {
     const entities = detectPII("SSN is 123-45-6789");
     expect(entities).toContainEqual(expect.objectContaining({ type: "ID" }));
+  });
+
+  it.each([
+    "000-45-6789",
+    "000456789",
+    "000 45 6789",
+    "666-45-6789",
+    "900-45-6789",
+    "123-00-6789",
+    "123-45-0000",
+  ])("should suppress structurally invalid US SSNs: %s", (ssn) => {
+    const entities = detectPII(`SSN is ${ssn}`);
+    expect(entities).not.toContainEqual(
+      expect.objectContaining({ type: "ID", text: ssn }),
+    );
   });
 
   it("should detect US ZIP codes", () => {
@@ -165,6 +260,16 @@ describe("Regex PII detection", () => {
     }
   });
 
+  it("should NOT mask any all-role Title-Case phrase as a person name", () => {
+    for (const word of roleTitleWords) {
+      const phrase = word === "Engineer" ? "Engineer Senior" : `${word} Engineer`;
+      expect(
+        detectPII(`the ${phrase} role`).some((e) => e.type === "NAME"),
+        `role word: ${word}`,
+      ).toBe(false);
+    }
+  });
+
   it("should NOT mask Title-Case phrases that are entirely job/role words", () => {
     // These are not personal names; masking them stranded agent tasks that
     // must reference the role (e.g. A10 negotiation email for the offer).
@@ -190,6 +295,25 @@ describe("Regex PII detection", () => {
     expect(detectPII("Dr Jane Doe").some((e) => e.type === "NAME")).toBe(true);
   });
 
+  it("should not suppress titled names even when they include role words", () => {
+    expect(detectPII("Please call Prof. Chief Engineer")).toContainEqual(
+      expect.objectContaining({ type: "NAME", text: "Prof. Chief Engineer" }),
+    );
+  });
+
+  it("should suppress curated place and non-name title-case phrases", () => {
+    for (const phrase of [
+      ...curatedNonNamePhrases,
+      "Los Angeles",
+      "New York",
+    ]) {
+      expect(
+        detectPII(`weather in ${phrase} today`).some((e) => e.type === "NAME"),
+        `non-name phrase: ${phrase}`,
+      ).toBe(false);
+    }
+  });
+
   it("should detect personal profile handles inside GitHub URLs without masking the repo path", () => {
     const entities = detectPII(
       "See https://github.com/iosazee/claude-adv/actions/runs/123",
@@ -202,12 +326,42 @@ describe("Regex PII detection", () => {
     );
   });
 
+  it("should detect profile handles for supported social/code hosts", () => {
+    const entities = detectPII(
+      "Profiles: gitlab.com/iosazee/thing bitbucket.org/work-user/repo x.com/zee_dev linkedin.com/in/zee-edigin",
+    );
+    expect(entities).toContainEqual(
+      expect.objectContaining({ type: "HANDLE", text: "iosazee" }),
+    );
+    expect(entities).toContainEqual(
+      expect.objectContaining({ type: "HANDLE", text: "work-user" }),
+    );
+    expect(entities).toContainEqual(
+      expect.objectContaining({ type: "HANDLE", text: "zee_dev" }),
+    );
+    expect(entities).toContainEqual(
+      expect.objectContaining({ type: "HANDLE", text: "zee-edigin" }),
+    );
+  });
+
   it("should detect local user path prefixes while preserving the rest of the path", () => {
     const entities = detectPII(
       "/Users/example/Projects/public-fixture",
     );
     expect(entities).toContainEqual(
       expect.objectContaining({ type: "PATH", text: "/Users/example" }),
+    );
+  });
+
+  it("should detect Linux home and Windows user path prefixes", () => {
+    const entities = detectPII(
+      String.raw`/home/zee/projects and C:\Users\Zee\Documents\file.txt`,
+    );
+    expect(entities).toContainEqual(
+      expect.objectContaining({ type: "PATH", text: "/home/zee" }),
+    );
+    expect(entities).toContainEqual(
+      expect.objectContaining({ type: "PATH", text: String.raw`C:\Users\Zee` }),
     );
   });
 

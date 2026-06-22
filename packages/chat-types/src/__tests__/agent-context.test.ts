@@ -55,6 +55,33 @@ describe("agent context contract", () => {
     expect(() => AgentWritePermissionModeSchema.parse("silent")).toThrow();
   });
 
+  it("accepts bounded local date/time context for relative scheduling", () => {
+    const localTime = {
+      nowIso: "2026-06-21T16:48:00.000Z",
+      localDate: "2026-06-21",
+      localTime: "17:48:00",
+      timeZone: "Europe/London",
+      utcOffsetMinutes: 60,
+    };
+
+    const parsed = AgentRequestContextSchema.parse({ localTime });
+
+    expect(parsed.localTime).toEqual(localTime);
+  });
+
+  it("rejects malformed local date/time context at the enclave boundary", () => {
+    expect(() =>
+      AgentRequestContextSchema.parse({
+        localTime: {
+          nowIso: "tomorrow afternoon",
+          localDate: "21/06/2026",
+          localTime: "5pm",
+          timeZone: "Europe London",
+        },
+      }),
+    ).toThrow();
+  });
+
   // --- linked folders cap: cross-pack claims advocate (Task 1A.4) ---
 
   function folders(n: number) {

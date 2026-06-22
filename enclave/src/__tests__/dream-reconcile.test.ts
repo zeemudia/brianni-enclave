@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { MemoryRecord } from "@calypso/chat-types";
 
 import { RecordedLlmTransport } from "../dream/llm-transport";
 import { reconcileCandidateMemories, runDreamSession } from "../dream";
@@ -42,25 +43,30 @@ function makeDreamCandidate(
   };
 }
 
+function memoryRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
+  return {
+    id: "mem-1",
+    namespace: "default",
+    baseVersion: 0,
+    tombstoneEpoch: 0,
+    dreamSessionId: "dream-1",
+    kind: "preference",
+    text: "User prefers focused mornings",
+    structured: {},
+    tags: ["work"],
+    provenance: candidateMemory().provenance,
+    confidence: 0.8,
+    createdAt: "2026-05-11T00:00:00.000Z",
+    updatedAt: "2026-05-11T00:00:00.000Z",
+    supersededBy: null,
+    visibleToUser: true,
+    ...overrides,
+  };
+}
+
 describe("reconcileCandidateMemories", () => {
   it("produces DreamDelta values with serialised records from the injected LLM transport", async () => {
-    const record = {
-      id: "mem-1",
-      namespace: "default",
-      baseVersion: 0,
-      tombstoneEpoch: 0,
-      dreamSessionId: "dream-1",
-      kind: "preference",
-      text: "User prefers focused mornings",
-      structured: {},
-      tags: ["work"],
-      provenance: candidateMemory().provenance,
-      confidence: 0.8,
-      createdAt: "2026-05-11T00:00:00.000Z",
-      updatedAt: "2026-05-11T00:00:00.000Z",
-      supersededBy: null,
-      visibleToUser: true,
-    };
+    const record = memoryRecord();
     const llmTransport = new RecordedLlmTransport([
       {
         text: JSON.stringify({
@@ -100,23 +106,7 @@ describe("reconcileCandidateMemories", () => {
   });
 
   it("accepts markdown-fenced JSON from the reconcile model", async () => {
-    const record = {
-      id: "mem-fenced",
-      namespace: "default",
-      baseVersion: 0,
-      tombstoneEpoch: 0,
-      dreamSessionId: "dream-1",
-      kind: "preference",
-      text: "User prefers focused mornings",
-      structured: {},
-      tags: ["work"],
-      provenance: candidateMemory().provenance,
-      confidence: 0.8,
-      createdAt: "2026-05-11T00:00:00.000Z",
-      updatedAt: "2026-05-11T00:00:00.000Z",
-      supersededBy: null,
-      visibleToUser: true,
-    };
+    const record = memoryRecord({ id: "mem-fenced" });
     const llmTransport = new RecordedLlmTransport([
       {
         text: `\`\`\`json\n${JSON.stringify({
@@ -148,6 +138,83 @@ describe("reconcileCandidateMemories", () => {
 
     expect(result).toHaveLength(1);
     expect(result[0].delta.targetId).toBe("mem-fenced");
+  });
+
+  it("rejects invalid JSON and wrong top-level shapes with static errors", async () => {
+    await expect(
+      reconcileCandidateMemories({
+        candidates: [candidateMemory()],
+        existingMemoryRecords: [],
+        context: {
+          userId: "user-1",
+          namespace: "default",
+          dreamSessionId: "dream-1",
+        },
+        llmTransport: new RecordedLlmTransport([
+          { text: "{not-json", inputTokens: 1, outputTokens: 1 },
+        ]),
+      }),
+    ).rejects.toThrow("dream_reconcile_json_parse_failed");
+
+    await expect(
+      reconcileCandidateMemories({
+        candidates: [candidateMemory()],
+        existingMemoryRecords: [],
+        context: {
+          userId: "user-1",
+          namespace: "default",
+          dreamSessionId: "dream-1",
+        },
+        llmTransport: new RecordedLlmTransport([
+          { text: JSON.stringify([{ deltas: [] }]), inputTokens: 1, outputTokens: 1 },
+        ]),
+      }),
+    ).rejects.toThrow(
+      "dream_reconcile_json_shape_invalid: expected deltas array",
+    );
+  });
+
+  it("serialises TOMBSTONE deltas with an empty record payload", async () => {
+    const llmTransport = new RecordedLlmTransport([
+      {
+        text: JSON.stringify({
+          deltas: [
+            {
+              action: "TOMBSTONE",
+              targetId: "mem-1",
+              record: null,
+              expectedBaseVersion: 0,
+              mutationId: "018f7f3a-91d8-7b3d-8d9e-000000000010",
+            },
+          ],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      },
+    ]);
+
+    const result = await reconcileCandidateMemories({
+      candidates: [candidateMemory()],
+      existingMemoryRecords: [memoryRecord()],
+      context: {
+        userId: "user-1",
+        namespace: "default",
+        dreamSessionId: "dream-1",
+      },
+      llmTransport,
+    });
+
+    expect(result).toEqual([
+      {
+        delta: expect.objectContaining({
+          action: "TOMBSTONE",
+          targetId: "mem-1",
+          record: null,
+          expectedBaseVersion: 0,
+        }),
+        recordSerialised: "",
+      },
+    ]);
   });
 
   // Privacy boundary: rejected LLM deltas can carry plaintext memory text.

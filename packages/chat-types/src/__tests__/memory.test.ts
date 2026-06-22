@@ -7,6 +7,7 @@ import {
   MemoryMutationEnvelopeSchema,
   MemoryNamespaceSchema,
   MemoryRecordSchema,
+  MemorySourceRefSchema,
   SHA256_OF_EMPTY,
   TOMBSTONE_RECORD_SERIALISED_HASH,
   type MemoryNamespace,
@@ -113,6 +114,75 @@ describe('MemoryRecordSchema', () => {
       }).success,
     ).toBe(false);
   });
+
+  it('accepts conversation, file, and web provenance source references', () => {
+    expect(
+      MemorySourceRefSchema.parse({
+        type: 'conversation',
+        conversationId: 'conv-1',
+        messageIndex: 0,
+      }),
+    ).toEqual({
+      type: 'conversation',
+      conversationId: 'conv-1',
+      messageIndex: 0,
+    });
+    expect(
+      MemorySourceRefSchema.parse({
+        type: 'file',
+        fileHandleAlias: 'linked-notes',
+        fileContentHash: `sha256:${'a'.repeat(64)}`,
+      }),
+    ).toMatchObject({ type: 'file' });
+    expect(
+      MemorySourceRefSchema.parse({
+        type: 'web',
+        urlHash: `sha256:${'b'.repeat(64)}`,
+        host: 'example.com',
+      }),
+    ).toMatchObject({ type: 'web' });
+  });
+
+  it('rejects malformed source references and out-of-range record fields', () => {
+    expect(
+      MemorySourceRefSchema.safeParse({
+        type: 'conversation',
+        conversationId: '',
+        messageIndex: -1,
+      }).success,
+    ).toBe(false);
+    expect(
+      MemorySourceRefSchema.safeParse({
+        type: 'file',
+        fileHandleAlias: 'linked-notes',
+        fileContentHash: 'sha256:not-hex',
+      }).success,
+    ).toBe(false);
+    expect(
+      MemoryRecordSchema.safeParse({
+        ...validRecord,
+        confidence: 1.01,
+      }).success,
+    ).toBe(false);
+    expect(
+      MemoryRecordSchema.safeParse({
+        ...validRecord,
+        text: '',
+      }).success,
+    ).toBe(false);
+    expect(
+      MemoryRecordSchema.safeParse({
+        ...validRecord,
+        createdAt: 'not-a-date',
+      }).success,
+    ).toBe(false);
+    expect(
+      MemoryRecordSchema.safeParse({
+        ...validRecord,
+        tags: Array.from({ length: 33 }, (_, i) => `tag-${i}`),
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe('DreamDeltaSchema + MemoryMutationEnvelopeSchema action invariants', () => {
@@ -194,5 +264,69 @@ describe('DreamDeltaSchema + MemoryMutationEnvelopeSchema action invariants', ()
     });
 
     expect(r.success).toBe(false);
+  });
+
+  it('rejects non-ADD deltas with expectedBaseVersion=-1 and mismatched record nullability', () => {
+    expect(
+      DreamDeltaSchema.safeParse({
+        action: 'UPDATE',
+        targetId: 'mem-1',
+        record: validRecord,
+        expectedBaseVersion: -1,
+        mutationId: '018f9b2a-7c4d-7000-8000-000000000001',
+      }).success,
+    ).toBe(false);
+    expect(
+      DreamDeltaSchema.safeParse({
+        action: 'UPDATE',
+        targetId: 'mem-1',
+        record: null,
+        expectedBaseVersion: 1,
+        mutationId: '018f9b2a-7c4d-7000-8000-000000000001',
+      }).success,
+    ).toBe(false);
+    expect(
+      DreamDeltaSchema.safeParse({
+        action: 'TOMBSTONE',
+        targetId: 'mem-1',
+        record: validRecord,
+        expectedBaseVersion: 1,
+        mutationId: '018f9b2a-7c4d-7000-8000-000000000001',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects non-tombstone envelopes that use empty-content or tombstone sentinels', () => {
+    const baseEnv = {
+      v: 1 as const,
+      userId: 'u',
+      namespace: 'default' as const,
+      blobId: 'b',
+      action: 'SUPERSEDE' as const,
+      expectedBaseVersion: 1,
+      newRecordVersion: 2,
+      kind: 'lesson' as const,
+      mutationId: '018f9b2a-7c4d-7000-8000-000000000001',
+      dreamSessionId: 'ds',
+      teeSessionId: 'tee',
+      provenanceConversationIds: ['conv-1'],
+      issuedAt: '2026-05-11T00:00:00.000Z',
+      expiresAt: '2026-05-11T00:01:00.000Z',
+    };
+
+    expect(
+      MemoryMutationEnvelopeSchema.safeParse({
+        ...baseEnv,
+        contentHash: 'a'.repeat(64),
+        recordSerialisedHash: TOMBSTONE_RECORD_SERIALISED_HASH,
+      }).success,
+    ).toBe(false);
+    expect(
+      MemoryMutationEnvelopeSchema.safeParse({
+        ...baseEnv,
+        contentHash: 'a'.repeat(64),
+        recordSerialisedHash: 'c'.repeat(64),
+      }).success,
+    ).toBe(true);
   });
 });

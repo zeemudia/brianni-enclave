@@ -219,11 +219,13 @@ describe("EnclaveRouter — invocation timeout (codex R4 finding #5)", () => {
 
   it("chunk refreshes cannot extend an invocation beyond the absolute lifetime cap", () => {
     expect(indexSource).toContain("absoluteInvocationDeadline");
-    expect(indexSource).toContain("this.invocationTimeoutMs * 10");
+    expect(indexSource).toMatch(/this\.invocationTimeoutMs[\s\S]{0,80}\*[\s\S]{0,80}\b10\b/);
     expect(indexSource).toMatch(
-      /Math\.min\(\s*this\.invocationTimeoutMs,\s*remainingMs\s*\)/,
+      /Math\.min\s*\([\s\S]{0,160}this\.invocationTimeoutMs[\s\S]{0,160}remainingMs[\s\S]{0,80}\)/,
     );
-    expect(indexSource).toMatch(/if\s*\(remainingMs\s*<=\s*0\)/);
+    expect(indexSource).toMatch(
+      /if\s*\([\s\S]{0,220}remainingMs[\s\S]{0,80}<=[\s\S]{0,80}\b0\b[\s\S]{0,80}\)/,
+    );
   });
 });
 

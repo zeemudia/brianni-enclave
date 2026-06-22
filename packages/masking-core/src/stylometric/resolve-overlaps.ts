@@ -25,6 +25,10 @@ function overlaps(a: StyleSuggestion, b: StyleSuggestion): boolean {
 export function resolveOverlaps(
   suggestions: readonly StyleSuggestion[],
 ): StyleSuggestion[] {
+  // Stryker disable next-line ConditionalExpression: equivalent — forcing this
+  // guard false only skips an early `return []` for empty input. With no items,
+  // `[].map(...).sort(...)` is [], the accept loop over [] does nothing, and the
+  // final `[].sort(...)` returns []. resolveOverlaps([]) === [] either way.
   if (suggestions.length === 0) return [];
 
   const indexed = suggestions.map((s, i) => ({ s, i }));
@@ -32,7 +36,21 @@ export function resolveOverlaps(
     const pa = CATEGORY_PRIORITY[a.s.category];
     const pb = CATEGORY_PRIORITY[b.s.category];
     if (pa !== pb) return pa - pb;
+    // Stryker disable next-line ConditionalExpression: equivalent — forcing this
+    // guard true makes the comparator return `startIndex - startIndex` (= 0) for
+    // same-startIndex pairs instead of the `a.i - b.i` tertiary tie-break.
+    // `indexed` is built ascending in `i` (map index), and Array.prototype.sort
+    // is stable (ES2019+), so returning 0 for an equal-key pair preserves the
+    // same ascending-`i` order the tie-break would impose. No observable change.
     if (a.s.startIndex !== b.s.startIndex) return a.s.startIndex - b.s.startIndex;
+    // Stryker disable next-line ArithmeticOperator: equivalent — `a.i + b.i`
+    // vs `a.i - b.i` is reached only for (priority, startIndex)-tied pairs, which
+    // form an ascending-`i` subsequence (i = map index). V8 invokes this only as
+    // predecessor comparisons (a.i > b.i ≥ 0), where both `a.i - b.i` and
+    // `a.i + b.i` are strictly positive — identical sign, identical decision. A
+    // divergence would need an `a.i < b.i` call, which a stable sort over an
+    // already-ascending-`i` run never makes. The earliest-input element wins
+    // under both; output is unchanged.
     return a.i - b.i;
   });
 

@@ -3,108 +3,51 @@ import { makeId } from '../id';
 import { getExcludedRanges, spanIsExcluded, type ExcludedRange } from '../exclusions';
 
 /**
- * Acronyms that should remain ALL-CAPS even when they look like emphatic
- * shouting. Expanded during the false-positive audit (Task 1.12) if needed.
+ * Acronyms that must stay ALL-CAPS even when they look like emphatic shouting.
+ *
+ * `isAcronym()` below ALSO has a length/vowel heuristic — a word of length <= 3,
+ * or with no vowel at all, is treated as an acronym. The whitelist is split into
+ * two groups so that relationship (and what each entry is actually worth) is
+ * explicit and self-checking:
+ *
+ *  - {@link HEURISTIC_ESCAPING_ACRONYMS} — length >= 4 AND containing a vowel,
+ *    so the heuristic does NOT catch them on its own. The whitelist is
+ *    load-bearing here: drop one and the word gets lowercased. That change is
+ *    behaviourally observable and is covered by case.test.ts.
+ *  - {@link HEURISTIC_REDUNDANT_ACRONYMS} — length <= 3 OR vowelless, so
+ *    `isAcronym()` already returns true for them via the heuristic. Listing them
+ *    is an explicit, auditable allow-list / defence-in-depth, but removing any
+ *    one is behaviourally inert. Each `'X' -> ''` mutation is therefore an
+ *    EQUIVALENT mutant (it cannot change any output), which is why the block is
+ *    Stryker-disabled. case.test.ts asserts the redundancy invariant so the
+ *    equivalence can never silently rot.
+ *
+ * Expanded during the false-positive audit (Task 1.12) if needed.
  */
-const ACRONYM_WHITELIST: ReadonlySet<string> = new Set([
-  'NHS',
-  'USA',
-  'UK',
-  'US',
-  'BBC',
-  'CEO',
-  'CTO',
-  'CFO',
-  'COO',
-  'API',
-  'URL',
-  'CSS',
-  'HTML',
-  'JSON',
-  'XML',
-  'HTTP',
-  'HTTPS',
-  'NASA',
-  'FBI',
-  'CIA',
-  'WHO',
-  'UN',
-  'EU',
-  'NATO',
-  'AI',
-  'ML',
-  'LLM',
-  'GPU',
-  'CPU',
-  'RAM',
-  'SSD',
-  'OS',
-  'IDE',
-  'SDK',
-  'CLI',
-  'GUI',
-  'SQL',
-  'TCP',
-  'UDP',
-  'DNS',
-  'IP',
-  'VPN',
-  'SSH',
-  'TLS',
-  'SSL',
-  'JWT',
-  'PDF',
-  'GIF',
-  'JPG',
-  'PNG',
-  'IOS',
-  'MAC',
-  'PC',
-  'UI',
-  'UX',
-  'FAQ',
-  'IMO',
-  'IMHO',
-  'LOL',
-  'OK',
-  'TODO',
-  'FIXME',
-  'NOTE',
-  'ECDH',
-  'HKDF',
-  'KMS',
-  'ARN',
-  'ORM',
-  'REST',
-  'RPC',
-  'GRPC',
-  'AWS',
-  'GCP',
-  'CDN',
-  'MVP',
-  'PII',
-  'PCR',
-  'PCR0',
-  'PCR1',
-  'PCR2',
-  'TEE',
-  'SEV',
-  'SNP',
-  'TPM',
-  'PKI',
-  'CSR',
-  'SAML',
-  'OIDC',
-  'OAUTH',
-  'DPAPI',
-  'SRP',
-  'GCM',
-  'CBC',
-  'CTR',
-  'IV',
-]);
+export const HEURISTIC_ESCAPING_ACRONYMS: readonly string[] = [
+  'JSON', 'NASA', 'NATO', 'IMHO', 'TODO', 'FIXME', 'NOTE', 'ECDH', 'REST',
+  'SAML', 'OIDC', 'OAUTH', 'DPAPI',
+];
 
-const HONORIFICS: readonly string[] = ['Mr.', 'Dr.', 'Mrs.', 'Ms.', 'Prof.'];
+// Stryker disable StringLiteral: equivalent — every entry here is also matched
+// by isAcronym()'s length<=3-or-no-vowel heuristic (invariant asserted in
+// case.test.ts), so mutating any of these to '' cannot change any output.
+export const HEURISTIC_REDUNDANT_ACRONYMS: readonly string[] = [
+  'NHS', 'USA', 'UK', 'US', 'BBC', 'CEO', 'CTO', 'CFO', 'COO', 'API', 'URL',
+  'CSS', 'HTML', 'XML', 'HTTP', 'HTTPS', 'FBI', 'CIA', 'WHO', 'UN', 'EU', 'AI',
+  'ML', 'LLM', 'GPU', 'CPU', 'RAM', 'SSD', 'OS', 'IDE', 'SDK', 'CLI', 'GUI',
+  'SQL', 'TCP', 'UDP', 'DNS', 'IP', 'VPN', 'SSH', 'TLS', 'SSL', 'JWT', 'PDF',
+  'GIF', 'JPG', 'PNG', 'IOS', 'MAC', 'PC', 'UI', 'UX', 'FAQ', 'IMO', 'LOL',
+  'OK', 'HKDF', 'KMS', 'ARN', 'ORM', 'RPC', 'GRPC', 'AWS', 'GCP', 'CDN', 'MVP',
+  'PII', 'PCR', 'PCR0', 'PCR1', 'PCR2', 'TEE', 'SEV', 'SNP', 'TPM', 'PKI',
+  'CSR', 'SRP', 'GCM', 'CBC', 'CTR', 'IV',
+];
+// Stryker restore StringLiteral
+
+const ACRONYM_WHITELIST: ReadonlySet<string> = new Set([
+  ...HEURISTIC_ESCAPING_ACRONYMS,
+  ...HEURISTIC_REDUNDANT_ACRONYMS,
+]);
 
 /**
  * Word token matcher. `[A-Z]{2,}` so "I" (single letter) and "Wait" (mixed
@@ -124,22 +67,16 @@ function isAcronym(word: string): boolean {
   return false;
 }
 
-function precedingHonorific(text: string, startIndex: number): boolean {
-  // Walk back past whitespace.
-  let i = startIndex - 1;
-  while (i >= 0 && /\s/.test(text[i])) i--;
-  if (i < 0) return false;
-  const prefix = text.slice(0, i + 1);
-  for (const honorific of HONORIFICS) {
-    if (prefix.endsWith(honorific)) return true;
-  }
-  return false;
-}
-
 function isSentenceStart(text: string, startIndex: number): boolean {
   // Sentence-start: first non-whitespace, OR first after ".!?" followed by
-  // whitespace.
+  // whitespace. A word preceded by an honorific ("Mr. SMITH", "Dr.   SMITH")
+  // is also caught here: every honorific ends in '.', so the walk-back lands on
+  // that '.' and returns true — which is why no separate honorific check is
+  // needed (case.test.ts pins this behaviour).
   let i = startIndex - 1;
+  // Stryker disable next-line ConditionalExpression: forcing the `i >= 0` bound
+  // true is equivalent — at i === -1, text[i] is undefined and /\s/.test(undefined)
+  // is false, so the loop still terminates exactly where the bound would stop it.
   while (i >= 0 && /\s/.test(text[i])) i--;
   if (i < 0) return true; // Start of text.
   const prev = text[i];
@@ -166,7 +103,6 @@ export function detectCase(
     if (spanIsExcluded(startIndex, endIndex, ranges)) continue;
     if (isAcronym(original)) continue;
     if (isSentenceStart(text, startIndex)) continue;
-    if (precedingHonorific(text, startIndex)) continue;
 
     const replacement = original.toLowerCase();
     out.push({

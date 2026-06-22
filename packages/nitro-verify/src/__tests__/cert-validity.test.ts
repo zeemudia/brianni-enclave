@@ -206,4 +206,53 @@ describe('certificate validity enforcement', () => {
       verifyNitroAttestation(badDoc, { verificationTimeMs: IN_WINDOW }),
     ).rejects.toThrow(/validity/i);
   });
+
+  // --- Mutation hardening: validity-window boundary exactness --------------
+
+  it('treats notBefore as INCLUSIVE (verification time == notBefore is valid)', async () => {
+    // Kills `verificationTimeMs < notBefore` -> `<=`: at the exact lower edge
+    // the cert is still valid and must reach (and fail at) chain signature,
+    // NOT be rejected as not-yet-valid.
+    await expect(
+      verifyNitroAttestation(doc, { verificationTimeMs: Date.parse(NOT_BEFORE) }),
+    ).rejects.toThrow(/chain verification failed at cert 0/i);
+  });
+
+  it('treats notAfter as INCLUSIVE (verification time == notAfter is valid)', async () => {
+    // Kills `verificationTimeMs > notAfter` -> `>=`: at the exact upper edge
+    // the cert is still valid (not yet expired).
+    await expect(
+      verifyNitroAttestation(doc, { verificationTimeMs: Date.parse(NOT_AFTER) }),
+    ).rejects.toThrow(/chain verification failed at cert 0/i);
+  });
+
+  it('rejects one millisecond before notBefore', async () => {
+    await expect(
+      verifyNitroAttestation(doc, { verificationTimeMs: Date.parse(NOT_BEFORE) - 1 }),
+    ).rejects.toThrow(/not yet valid/i);
+  });
+
+  it('rejects one millisecond after notAfter', async () => {
+    await expect(
+      verifyNitroAttestation(doc, { verificationTimeMs: Date.parse(NOT_AFTER) + 1 }),
+    ).rejects.toThrow(/expired/i);
+  });
+
+  // --- Mutation hardening: UTCTime two-digit-year pivot (RFC 5280) ---------
+
+  it('maps a UTCTime year >= 50 to the 1900s (pivot), not the 2000s', async () => {
+    // notBefore yy=80 -> 1980, notAfter yy=95 -> 1995. Verified IN-WINDOW in
+    // 1990. Kills the `yy >= 50 ? 1900 + yy : 2000 + yy` pivot mutants: if the
+    // century were chosen wrongly the years become 2080/2095 and a 1990
+    // verification time would be reported "not yet valid" instead of reaching
+    // (and failing at) chain signature.
+    const pivotDoc = makeAttestationDocB64(
+      makeCertDER(utcTime('1980-06-01T00:00:00Z'), utcTime('1995-06-01T00:00:00Z')),
+    );
+    await expect(
+      verifyNitroAttestation(pivotDoc, {
+        verificationTimeMs: Date.parse('1990-06-01T00:00:00Z'),
+      }),
+    ).rejects.toThrow(/chain verification failed at cert 0/i);
+  });
 });

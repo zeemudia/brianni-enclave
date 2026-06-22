@@ -876,3 +876,705 @@ describe('selectModelForSubtask — image generation routing (both gates open)',
     ).toThrow('NO_MODEL_FOR_SUBTASK');
   });
 });
+
+// Provider-diverse fallback ordering & cap. The fallback list must (a) exclude
+// the primary, (b) round-robin across DISTINCT providers so the first fallbacks
+// come from providers other than the primary's, (c) keep same-provider models
+// LAST, and (d) be capped at 4 entries.
+describe('selectModelForSubtask — provider-diverse fallback ordering', () => {
+  function writer(
+    modelId: string,
+    providerId: string,
+    tier: 'frontier' | 'strong' | 'standard' | 'basic',
+  ): ModelCapability {
+    return {
+      modelId,
+      providerId,
+      strengths: ['writing', 'general_reasoning'],
+      strengthQuality: [{ strength: 'writing', tier }],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'medium',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 200_000,
+    };
+  }
+
+  const writeSubtask = {
+    id: 'st_write',
+    title: 'Write report',
+    objective: 'Write the final report.',
+    kind: 'writing' as const,
+    requiredCapabilities: ['writing' as const],
+    allowedTools: [],
+    dependsOn: [],
+    producesArtifact: true,
+    risk: 'low' as const,
+  };
+
+  it('excludes the primary model from its own fallback list', () => {
+    const decision = selectModelForSubtask(
+      writeSubtask,
+      [
+        writer('openai-frontier', 'openai', 'frontier'),
+        writer('anthropic-strong', 'anthropic', 'strong'),
+      ],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('openai-frontier');
+    expect(decision.fallbackModelIds).not.toContain('openai-frontier');
+    expect(decision.fallbackModelIds).toContain('anthropic-strong');
+  });
+
+  it('orders cross-provider fallbacks before same-provider lower-ranked models', () => {
+    // Primary = openai-frontier (openai). openai also has a weaker model.
+    // Cross-provider anthropic/google models must come BEFORE the second openai
+    // model, which is appended last.
+    const decision = selectModelForSubtask(
+      writeSubtask,
+      [
+        writer('openai-frontier', 'openai', 'frontier'),
+        writer('openai-weak', 'openai', 'basic'),
+        writer('anthropic-strong', 'anthropic', 'strong'),
+        writer('google-standard', 'google', 'standard'),
+      ],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('openai-frontier');
+    // anthropic + google (distinct providers) come first; the same-provider
+    // openai-weak is last.
+    expect(decision.fallbackModelIds).toEqual([
+      'anthropic-strong',
+      'google-standard',
+      'openai-weak',
+    ]);
+  });
+
+  it('round-robins one model per provider before taking a second from any provider', () => {
+    // openai (primary) has two extra models; anthropic has one. Round-robin must
+    // interleave: first pass takes one anthropic (cross-provider) then one
+    // openai extra, second pass takes the remaining openai extra.
+    const decision = selectModelForSubtask(
+      writeSubtask,
+      [
+        writer('openai-frontier', 'openai', 'frontier'),
+        writer('openai-strong', 'openai', 'strong'),
+        writer('openai-standard', 'openai', 'standard'),
+        writer('anthropic-strong', 'anthropic', 'strong'),
+      ],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('openai-frontier');
+    // anthropic provider is ordered before primary's own provider; each pass
+    // shifts one per provider.
+    expect(decision.fallbackModelIds).toEqual([
+      'anthropic-strong',
+      'openai-strong',
+      'openai-standard',
+    ]);
+  });
+
+  it('caps the fallback list at exactly four entries', () => {
+    // Six distinct cross-provider fallbacks available; only four are returned.
+    const decision = selectModelForSubtask(
+      writeSubtask,
+      [
+        writer('openai-frontier', 'openai', 'frontier'),
+        writer('p1-a', 'prov1', 'strong'),
+        writer('p2-a', 'prov2', 'strong'),
+        writer('p3-a', 'prov3', 'strong'),
+        writer('p4-a', 'prov4', 'strong'),
+        writer('p5-a', 'prov5', 'strong'),
+        writer('p6-a', 'prov6', 'strong'),
+      ],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('openai-frontier');
+    expect(decision.fallbackModelIds).toHaveLength(4);
+  });
+
+  it('returns an empty fallback list when the primary is the only viable model', () => {
+    const decision = selectModelForSubtask(
+      writeSubtask,
+      [writer('openai-frontier', 'openai', 'frontier')],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('openai-frontier');
+    expect(decision.fallbackModelIds).toEqual([]);
+  });
+
+  it('reports the matched capabilities and subtask kind in the decision reason', () => {
+    // Two required capabilities so the ", " join separator is observable (a
+    // single cap cannot distinguish join(", ") from join("")).
+    const decision = selectModelForSubtask(
+      {
+        ...writeSubtask,
+        kind: 'research',
+        requiredCapabilities: ['writing', 'general_reasoning'],
+      },
+      [writer('openai-frontier', 'openai', 'frontier')],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.reason).toBe('Matched writing, general_reasoning for research.');
+    expect(decision.subtaskId).toBe('st_write');
+  });
+
+  it('interleaves cross-provider fallbacks one-per-provider per round (round-robin, not drain-first)', () => {
+    // Primary is provC. Two cross-providers remain: provA has TWO models, provB
+    // has ONE. Correct round-robin takes provA-1, provB-1, provA-2 (one per
+    // provider per pass). A drain-first bug (break after every single push)
+    // would produce provA-1, provA-2, provB-1. provA sorts before provB so
+    // bucket insertion order is provA then provB.
+    const decision = selectModelForSubtask(
+      writeSubtask,
+      [
+        writer('provC-primary', 'provC', 'frontier'),
+        writer('provA-1', 'provA', 'strong'),
+        writer('provA-2', 'provA', 'standard'),
+        writer('provB-1', 'provB', 'strong'),
+      ],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('provC-primary');
+    expect(decision.fallbackModelIds).toEqual(['provA-1', 'provB-1', 'provA-2']);
+  });
+});
+
+// Hard-capability gate coverage for the modality strengths that the existing
+// suite does not exercise as fail-closed gates: vision, embedding, computer_use.
+// If any of these were demoted to a soft preference (the literal `''` mutants on
+// HARD_CAPABILITIES), a subtask requiring it would route to a chat model that
+// lacks it instead of failing closed.
+describe('selectModelForSubtask — hard modality gates (vision/embedding/computer_use)', () => {
+  const chatOnly: ModelCapability[] = [
+    {
+      modelId: 'gpt-5.5',
+      providerId: 'openai',
+      strengths: ['writing', 'general_reasoning'],
+      strengthQuality: [{ strength: 'writing', tier: 'frontier' }],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'high',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 400_000,
+    },
+  ];
+
+  function base(
+    cap: 'vision' | 'embedding' | 'computer_use',
+    allowedTools: string[] = [],
+  ) {
+    return {
+      id: 'st_hard',
+      title: 'Hard cap subtask',
+      objective: 'Needs a true modality capability.',
+      kind: 'reasoning' as const,
+      requiredCapabilities: [cap, 'general_reasoning' as const],
+      allowedTools: allowedTools as never,
+      dependsOn: [],
+      producesArtifact: false,
+      risk: 'low' as const,
+    };
+  }
+
+  it('fails closed when a vision capability is required and no model (or local tool) supplies it', () => {
+    expect(() =>
+      selectModelForSubtask(base('vision'), chatOnly, {
+        enabledEndpointFamilies: ['chat'],
+      }),
+    ).toThrow('NO_MODEL_FOR_SUBTASK');
+  });
+
+  it('fails closed when an embedding capability is required and no model supplies it', () => {
+    expect(() =>
+      selectModelForSubtask(base('embedding'), chatOnly, {
+        enabledEndpointFamilies: ['chat'],
+      }),
+    ).toThrow('NO_MODEL_FOR_SUBTASK');
+  });
+
+  it('fails closed when a computer_use capability is required and no model supplies it', () => {
+    expect(() =>
+      selectModelForSubtask(base('computer_use'), chatOnly, {
+        enabledEndpointFamilies: ['chat'],
+      }),
+    ).toThrow('NO_MODEL_FOR_SUBTASK');
+  });
+
+  it('fails closed when an audio_generation capability is required and no model (or local tool) supplies it', () => {
+    expect(() =>
+      selectModelForSubtask(
+        {
+          id: 'st_audio_hard',
+          title: 'Generate speech',
+          objective: 'Generate provider speech.',
+          kind: 'audio',
+          requiredCapabilities: ['audio_generation', 'general_reasoning'],
+          allowedTools: [],
+          dependsOn: [],
+          producesArtifact: true,
+          risk: 'low',
+        },
+        chatOnly,
+        { enabledEndpointFamilies: ['chat'] },
+      ),
+    ).toThrow('NO_MODEL_FOR_SUBTASK');
+  });
+
+  it('fails closed when a speech_to_text capability is required and no model (or local tool) supplies it', () => {
+    expect(() =>
+      selectModelForSubtask(
+        {
+          id: 'st_stt_hard',
+          title: 'Transcribe',
+          objective: 'Transcribe with a provider STT endpoint.',
+          kind: 'audio',
+          requiredCapabilities: ['speech_to_text', 'general_reasoning'],
+          allowedTools: [],
+          dependsOn: [],
+          producesArtifact: true,
+          risk: 'low',
+        },
+        chatOnly,
+        { enabledEndpointFamilies: ['chat'] },
+      ),
+    ).toThrow('NO_MODEL_FOR_SUBTASK');
+  });
+
+  // Each local-modality family's FIRST tool must satisfy the family's hard caps.
+  // Existing tests scope the 2nd/3rd tool of each family (image.ocr,
+  // audio.transcribe, video.transform); these scope the FIRST tool
+  // (image.inspect, audio.inspect, video.inspect / video.transcribe) so a blank
+  // of those literals is caught.
+  it('routes vision via a chat model when image.inspect is the scoped local tool', () => {
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_inspect_img',
+        title: 'Inspect image',
+        objective: 'Inspect proof-image.png with the local inspect tool.',
+        kind: 'image',
+        requiredCapabilities: ['vision', 'general_reasoning'],
+        allowedTools: ['image.inspect'],
+        dependsOn: [],
+        producesArtifact: false,
+        risk: 'low',
+      },
+      chatOnly,
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('gpt-5.5');
+  });
+
+  it('routes speech_to_text via a chat model when audio.inspect is the scoped local tool', () => {
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_inspect_audio',
+        title: 'Inspect audio',
+        objective: 'Inspect proof-audio.m4a with the local inspect tool.',
+        kind: 'audio',
+        requiredCapabilities: ['speech_to_text', 'general_reasoning'],
+        allowedTools: ['audio.inspect'],
+        dependsOn: [],
+        producesArtifact: false,
+        risk: 'low',
+      },
+      chatOnly,
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('gpt-5.5');
+  });
+
+  it('routes vision via a chat model when video.inspect is the scoped local tool', () => {
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_inspect_video',
+        title: 'Inspect video',
+        objective: 'Inspect proof-video.mp4 with the local inspect tool.',
+        kind: 'video',
+        requiredCapabilities: ['vision', 'general_reasoning'],
+        allowedTools: ['video.inspect'],
+        dependsOn: [],
+        producesArtifact: false,
+        risk: 'low',
+      },
+      chatOnly,
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('gpt-5.5');
+  });
+
+  it('routes speech_to_text via a chat model when video.transcribe is the scoped local tool', () => {
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_video_transcribe',
+        title: 'Transcribe video',
+        objective: 'Transcribe proof-video.mp4 with the local transcribe tool.',
+        kind: 'video',
+        requiredCapabilities: ['speech_to_text', 'general_reasoning'],
+        allowedTools: ['video.transcribe'],
+        dependsOn: [],
+        producesArtifact: false,
+        risk: 'low',
+      },
+      chatOnly,
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('gpt-5.5');
+  });
+
+  it('routes a vision subtask when a model carries the vision strength', () => {
+    const visionModel: ModelCapability = {
+      modelId: 'gpt-5.5-vision',
+      providerId: 'openai',
+      strengths: ['vision', 'general_reasoning'],
+      strengthQuality: [{ strength: 'vision', tier: 'strong' }],
+      modalities: ['text_in', 'image_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'high',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 400_000,
+    };
+    const decision = selectModelForSubtask(base('vision'), [...chatOnly, visionModel], {
+      enabledEndpointFamilies: ['chat'],
+    });
+    expect(decision.modelId).toBe('gpt-5.5-vision');
+  });
+
+  // embedding has NO local-tool family, so even scoping a media tool cannot
+  // satisfy it — it must still fail closed. Pins that embedding stays hard and
+  // is not accidentally covered by the LOCAL_MODALITY_TOOL_FAMILIES table.
+  it('still fails closed for embedding even when local media tools are scoped', () => {
+    expect(() =>
+      selectModelForSubtask(
+        base('embedding', ['image.ocr', 'audio.transcribe', 'video.transform']),
+        chatOnly,
+        { enabledEndpointFamilies: ['chat'] },
+      ),
+    ).toThrow('NO_MODEL_FOR_SUBTASK');
+  });
+});
+
+// Score-shape coverage: context bonus, quality-sensitive weighting, and the
+// utility/coverage arithmetic that several survivors mutate. These pick a
+// DIFFERENT winner depending on the arithmetic, so flipping an operator changes
+// the selected model.
+describe('selectModelForSubtask — scoring shape', () => {
+  it('prefers a >=1M-context model over an otherwise-equal sub-1M model (context bonus)', () => {
+    const subtask = {
+      id: 'st_long',
+      title: 'Long context read',
+      objective: 'Summarise a very large document.',
+      kind: 'synthesis' as const,
+      requiredCapabilities: ['general_reasoning' as const],
+      allowedTools: [],
+      dependsOn: [],
+      producesArtifact: false,
+      risk: 'low' as const,
+    };
+    // Two identical models except maxContextTokens: one exactly at 1_000_000,
+    // one just under. The context bonus (only granted at >= 1_000_000) must
+    // break the tie toward the 1M model. Ids chosen so the tie-break (localeCompare,
+    // ascending) would otherwise pick 'a-small'.
+    const millionModel: ModelCapability = {
+      modelId: 'z-million',
+      providerId: 'openai',
+      strengths: ['general_reasoning'],
+      strengthQuality: [{ strength: 'general_reasoning', tier: 'standard' }],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'medium',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 1_000_000,
+    };
+    const almostModel: ModelCapability = {
+      ...millionModel,
+      modelId: 'a-small',
+      maxContextTokens: 999_999,
+    };
+    const decision = selectModelForSubtask(subtask, [almostModel, millionModel], {
+      enabledEndpointFamilies: ['chat'],
+    });
+    expect(decision.modelId).toBe('z-million');
+  });
+
+  // The SAME contrast pair routes to DIFFERENT winners depending on the kind's
+  // quality/utility weighting. Model A is moderate-quality (standard) but
+  // cheap/fast; model B is higher-quality (strong) but expensive/slow.
+  //   non-sensitive (q=2,u=3): A=27, B=21 -> A wins
+  //   quality-sensitive (q=4,u=1): A=23, B=31 -> B wins
+  // (coverage is equal — both match exactly one soft cap.) Flipping the
+  // quality/utility weight assignment swaps both outcomes, so this pins the
+  // QUALITY_SENSITIVE_KINDS membership and the weight values.
+  function moderateCheapFast(cap: 'writing' | 'classification'): ModelCapability {
+    return {
+      modelId: 'a-cheap-fast',
+      providerId: 'anthropic',
+      strengths: [cap],
+      strengthQuality: [{ strength: cap, tier: 'standard' }],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'low',
+      latencyTier: 'fast',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 200_000,
+    };
+  }
+  function strongExpensiveSlow(cap: 'writing' | 'classification'): ModelCapability {
+    return {
+      modelId: 'z-strong-slow',
+      providerId: 'openai',
+      strengths: [cap],
+      strengthQuality: [{ strength: cap, tier: 'strong' }],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'high',
+      latencyTier: 'slow',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 200_000,
+    };
+  }
+
+  it('weights quality over utility for quality-sensitive kinds (writing)', () => {
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_quality',
+        title: 'Write polished copy',
+        objective: 'Write polished marketing copy.',
+        kind: 'writing',
+        requiredCapabilities: ['writing'],
+        allowedTools: [],
+        dependsOn: [],
+        producesArtifact: true,
+        risk: 'low',
+      },
+      [moderateCheapFast('writing'), strongExpensiveSlow('writing')],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('z-strong-slow');
+  });
+
+  it('weights utility over quality for non-quality-sensitive kinds (classification)', () => {
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_classify',
+        title: 'Classify intent',
+        objective: 'Classify the message intent.',
+        kind: 'classification',
+        requiredCapabilities: ['classification'],
+        allowedTools: [],
+        dependsOn: [],
+        producesArtifact: false,
+        risk: 'low',
+      },
+      [moderateCheapFast('classification'), strongExpensiveSlow('classification')],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('a-cheap-fast');
+  });
+
+  // Every quality-sensitive kind must apply the quality-favouring weights. The
+  // 'writing' soft cap is matched by both models regardless of kind, so the kind
+  // alone decides the weighting. If any of these kinds were dropped from
+  // QUALITY_SENSITIVE_KINDS, the cheap-fast model would win for that kind.
+  it.each(['planning', 'reasoning', 'writing', 'code', 'synthesis'] as const)(
+    'treats %s as a quality-sensitive kind (strong model wins)',
+    (kind) => {
+      const decision = selectModelForSubtask(
+        {
+          id: `st_${kind}`,
+          title: 'Sensitive kind',
+          objective: 'A quality-sensitive subtask.',
+          kind,
+          requiredCapabilities: ['writing'],
+          allowedTools: [],
+          dependsOn: [],
+          producesArtifact: true,
+          risk: 'low',
+        },
+        [moderateCheapFast('writing'), strongExpensiveSlow('writing')],
+        { enabledEndpointFamilies: ['chat'] },
+      );
+      expect(decision.modelId).toBe('z-strong-slow');
+    },
+  );
+
+  // The complementary non-sensitive kinds must apply the utility-favouring
+  // weights (cheap-fast wins). Pins the boundary of the sensitive set so a stray
+  // ADDITION (e.g. 'classification' -> '' collapses two entries, or another kind
+  // wrongly joining) is observable.
+  it.each(['classification', 'audio', 'image', 'video'] as const)(
+    'treats %s as a non-quality-sensitive kind (cheap-fast model wins)',
+    (kind) => {
+      const decision = selectModelForSubtask(
+        {
+          id: `st_${kind}`,
+          title: 'Non-sensitive kind',
+          objective: 'A utility-favoured subtask.',
+          kind,
+          requiredCapabilities: ['writing'],
+          allowedTools: [],
+          dependsOn: [],
+          producesArtifact: false,
+          risk: 'low',
+        },
+        [moderateCheapFast('writing'), strongExpensiveSlow('writing')],
+        { enabledEndpointFamilies: ['chat'] },
+      );
+      expect(decision.modelId).toBe('a-cheap-fast');
+    },
+  );
+
+  it('rewards broader capability coverage (more matched soft caps wins)', () => {
+    // Two writers of equal quality tier; one matches an extra requested soft
+    // capability. The coverage bonus (matched-cap count * 10) must pick the
+    // broader-coverage model. Flipping `* 10` -> `/ 10` collapses the bonus and
+    // the localeCompare tie-break would pick the alphabetically-first id.
+    const broad: ModelCapability = {
+      modelId: 'z-broad',
+      providerId: 'openai',
+      strengths: ['writing', 'general_reasoning'],
+      strengthQuality: [
+        { strength: 'writing', tier: 'strong' },
+        { strength: 'general_reasoning', tier: 'standard' },
+      ],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'medium',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 200_000,
+    };
+    const narrow: ModelCapability = {
+      modelId: 'a-narrow',
+      providerId: 'anthropic',
+      strengths: ['writing'],
+      strengthQuality: [{ strength: 'writing', tier: 'strong' }],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'medium',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 200_000,
+    };
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_write',
+        title: 'Write and reason',
+        objective: 'Write copy and reason about it.',
+        kind: 'writing',
+        requiredCapabilities: ['writing', 'general_reasoning'],
+        allowedTools: [],
+        dependsOn: [],
+        producesArtifact: true,
+        risk: 'low',
+      },
+      [broad, narrow],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('z-broad');
+  });
+
+  // Coverage (matched-cap COUNT * 10) is a real swing term. A model matching
+  // THREE soft caps at low (basic) quality must beat a model matching ONE soft
+  // cap at frontier quality for a non-sensitive kind, because the coverage bonus
+  // (30 vs 10) outweighs the quality gap (3*2 vs 10*2). Flipping `* 10` -> `/ 10`
+  // collapses coverage to a fraction and the frontier-but-narrow model would win.
+  it('rewards broad capability coverage over a single high-quality match (coverage * 10)', () => {
+    const broadBasic: ModelCapability = {
+      modelId: 'a-broad-basic',
+      providerId: 'openai',
+      strengths: ['classification', 'structured_extraction', 'fast_reasoning'],
+      strengthQuality: [
+        { strength: 'classification', tier: 'basic' },
+        { strength: 'structured_extraction', tier: 'basic' },
+        { strength: 'fast_reasoning', tier: 'basic' },
+      ],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'medium',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 200_000,
+    };
+    const narrowFrontier: ModelCapability = {
+      modelId: 'z-narrow-frontier',
+      providerId: 'anthropic',
+      strengths: ['classification'],
+      strengthQuality: [{ strength: 'classification', tier: 'frontier' }],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'medium',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 200_000,
+    };
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_cov',
+        title: 'Classify with extraction',
+        objective: 'Classify and extract fields.',
+        kind: 'classification', // non-sensitive: qualityWeight 2
+        requiredCapabilities: [
+          'classification',
+          'structured_extraction',
+          'fast_reasoning',
+        ],
+        allowedTools: [],
+        dependsOn: [],
+        producesArtifact: false,
+        risk: 'low',
+      },
+      [broadBasic, narrowFrontier],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('a-broad-basic');
+  });
+
+  it('breaks exact score ties by ascending modelId (localeCompare)', () => {
+    // Two fully-identical models differing only by id. The sort tie-break picks
+    // the lexicographically smaller id. Pins `a.model.modelId.localeCompare(b...)`.
+    const make = (modelId: string): ModelCapability => ({
+      modelId,
+      providerId: 'openai',
+      strengths: ['writing'],
+      strengthQuality: [{ strength: 'writing', tier: 'strong' }],
+      modalities: ['text_in', 'text_out'],
+      endpointFamily: 'chat',
+      costTier: 'medium',
+      latencyTier: 'standard',
+      routingStatus: 'enabled',
+      requiredGatewayTools: [],
+      maxContextTokens: 200_000,
+    });
+    const decision = selectModelForSubtask(
+      {
+        id: 'st_tie',
+        title: 'Write',
+        objective: 'Write.',
+        kind: 'writing',
+        requiredCapabilities: ['writing'],
+        allowedTools: [],
+        dependsOn: [],
+        producesArtifact: true,
+        risk: 'low',
+      },
+      [make('m-zzz'), make('m-aaa')],
+      { enabledEndpointFamilies: ['chat'] },
+    );
+    expect(decision.modelId).toBe('m-aaa');
+  });
+});

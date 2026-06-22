@@ -1,5 +1,6 @@
 import type {
   AgentLinkedFolderContext,
+  AgentLocalTimeContext,
   AgentWritePermissionMode,
   SkillPack,
   ToolName,
@@ -173,6 +174,11 @@ export interface RuntimeConnectorOperationView {
   id: string;
   mutating: boolean;
   paramsSchema: Record<string, unknown>;
+  contentFields?: string[];
+  maxWindowDays?: number;
+  maxResults?: number;
+  windowParams?: { start: string; end: string };
+  maxResultsParam?: string;
 }
 
 /**
@@ -211,10 +217,62 @@ export function buildConnectorListView(view: RuntimeConnectorView[]): {
       operations: connector.operations.map((operation) => ({
         id: operation.id,
         mutating: operation.mutating,
-        paramsSchema: operation.paramsSchema,
+        paramsSchema: plannerParamsSchema(operation),
       })),
     })),
   };
+}
+
+function plannerParamsSchema(
+  operation: RuntimeConnectorOperationView,
+): Record<string, unknown> {
+  if (!operation.contentFields || operation.contentFields.length === 0) {
+    return plannerReadCeilingParamsSchema(operation, operation.paramsSchema);
+  }
+  const out: Record<string, unknown> = { ...operation.paramsSchema };
+  for (const field of operation.contentFields) {
+    if (!(field in out)) out[field] = { type: "string" };
+  }
+  return plannerReadCeilingParamsSchema(operation, out);
+}
+
+function plannerReadCeilingParamsSchema(
+  operation: RuntimeConnectorOperationView,
+  paramsSchema: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!operation.windowParams && !operation.maxResultsParam) {
+    return paramsSchema;
+  }
+  const out: Record<string, unknown> = { ...paramsSchema };
+  if (operation.windowParams) {
+    for (const key of [
+      operation.windowParams.start,
+      operation.windowParams.end,
+    ] as const) {
+      out[key] = {
+        ...(typeof out[key] === "object" && out[key] !== null
+          ? (out[key] as Record<string, unknown>)
+          : {}),
+        required: true,
+        ...(operation.maxWindowDays !== undefined
+          ? { maxWindowDays: operation.maxWindowDays }
+          : {}),
+      };
+    }
+  }
+  if (operation.maxResultsParam) {
+    const key = operation.maxResultsParam;
+    out[key] = {
+      ...(typeof out[key] === "object" && out[key] !== null
+        ? (out[key] as Record<string, unknown>)
+        : {}),
+      required: true,
+      ...(operation.maxResults !== undefined
+        ? { maximum: operation.maxResults }
+        : {}),
+    };
+  }
+  return out;
 }
 
 /**
@@ -251,14 +309,22 @@ function connectorContractLine(toolScopes: readonly ToolName[]): string | null {
       `To work with a connected external service, first call connector.list to ` +
       `discover its available operations and their parameters${opsClause}. ` +
       `Use only the operation ids and parameter names returned by connector.list — ` +
-      `do not invent operations.`
+      `do not invent operations. If connector.list marks any parameter as ` +
+      `required, supply it on the first connector call; do not call an operation ` +
+      `with missing required parameters and then retry the same shape. ` +
+      `Resolve relative dates and times to explicit ` +
+      `ISO values before connector calls. Before connector.act, resolve named ` +
+      `external resources to exact provider ids from available list/read results; ` +
+      `do not guess default ids.`
     );
   }
   // No connector.list in scope: the model must use the operation ids it was
   // already given; never tell it to call connector.list.
   return (
     `To work with a connected external service, call ${ops.join(" or ")}. ` +
-    `Use only the operation ids and parameter names you were given — do not invent operations.`
+    `Use only the operation ids and parameter names you were given — do not invent operations. ` +
+    `Resolve relative dates and times to explicit ISO values before connector calls. ` +
+    `Before a mutating action, resolve named external resources to exact provider ids from available data; do not guess default ids.`
   );
 }
 
@@ -299,8 +365,41 @@ function webAccessContractLine(toolScopes: readonly ToolName[]): string {
 
 export interface AgentPromptContext {
   linkedFolders?: AgentLinkedFolderContext[];
+  localTime?: AgentLocalTimeContext;
+  subscriptionPlanId?: 'FREE' | 'PRO' | 'MAX';
   writePermissionMode?: AgentWritePermissionMode;
   fullSkillToolScopes?: readonly ToolName[];
+}
+
+function localTimeContextLine(localTime: AgentLocalTimeContext | undefined): string {
+  if (!localTime) return "";
+  const offset =
+    typeof localTime.utcOffsetMinutes === "number"
+      ? `, utcOffsetMinutes=${localTime.utcOffsetMinutes}`
+      : "";
+  return [
+    `Current local date/time: localDate=${localTime.localDate}, localTime=${localTime.localTime}, timeZone=${localTime.timeZone}, nowIso=${localTime.nowIso}${offset}.`,
+    "Resolve relative dates and times against this local date/time and use explicit ISO date/time values in tool and connector parameters. Give the local wall-clock time (e.g. YYYY-MM-DDTHH:MM:SS); it is interpreted in the time zone above, so do NOT compute or append a UTC offset yourself — that is error-prone across daylight-saving changes. Only when a time is meant in a DIFFERENT time zone, make that explicit by including its UTC offset (…±HH:MM or Z).",
+  ].join("\n");
+}
+
+function freeExternalConnectorLimitLine(
+  context: AgentPromptContext,
+  availableToolScopes: readonly ToolName[],
+): string {
+  if (context.subscriptionPlanId !== 'FREE') return '';
+  const fullSkillToolScopes = context.fullSkillToolScopes ?? availableToolScopes;
+  const fullHasExternalConnectors = fullSkillToolScopes.some((tool) =>
+    tool.startsWith('connector.'),
+  );
+  const currentHasExternalConnectors = availableToolScopes.some((tool) =>
+    tool.startsWith('connector.'),
+  );
+  if (!fullHasExternalConnectors || currentHasExternalConnectors) return '';
+  return [
+    'Plan limit:',
+    'External service connectors require PRO or MAX. If the user asks to read from or write to an external service, say this is a paid connector feature, point them to Settings to upgrade, and offer any local/manual draft that the available tools support. Do not describe the blocker as a missing connection when the current plan is the blocker.',
+  ].join('\n');
 }
 
 export function assembleSystemPrompt(
@@ -423,6 +522,7 @@ export function assembleSystemPrompt(
     pack.systemPromptBlock,
     '',
     namespaceLine,
+    localTimeContextLine(context.localTime),
     '',
     folderContext,
     linkedFolderReadRules,
@@ -432,6 +532,7 @@ export function assembleSystemPrompt(
     mediaBinaryRules,
     '',
     regulatedInfoRule,
+    freeExternalConnectorLimitLine(context, availableToolScopes),
     '',
     [
       "Tool availability contract: the Available tools list below is authoritative for this turn and may be narrower than the skill's general description. Only those tools are callable. Use exact tool names only; do not invent aliases or unlisted tool names.",

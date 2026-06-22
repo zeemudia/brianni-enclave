@@ -5,6 +5,7 @@ import {
   ProviderError,
   MAX_PROVIDER_RETRY_AFTER_MS,
   classifyProviderHttpError,
+  classifyProviderStreamError,
   normaliseProviderError,
   parseRetryAfterMs,
   providerErrorFromUnknown,
@@ -96,6 +97,97 @@ describe('provider error classification', () => {
     expect(invalid.retryAfterMs).toBeUndefined();
   });
 
+  it('parses Retry-After only from non-empty seconds or valid dates', () => {
+    expect(parseRetryAfterMs(null)).toBeUndefined();
+    expect(parseRetryAfterMs(undefined)).toBeUndefined();
+    expect(parseRetryAfterMs('   ')).toBeUndefined();
+    expect(parseRetryAfterMs('not a retry-after')).toBeUndefined();
+    expect(parseRetryAfterMs(' 004 ', () => 1_000)).toBe(4_000);
+    expect(parseRetryAfterMs('Sat, 06 Jun 2026 09:59:55 GMT', () =>
+      Date.parse('2026-06-06T10:00:00.000Z'),
+    )).toBe(0);
+  });
+
+  it('classifies every HTTP status boundary used by fallback routing', () => {
+    expect(
+      classifyProviderHttpError({
+        providerId: 'openai',
+        providerName: 'OpenAI',
+        status: 401,
+      }).kind,
+    ).toBe('auth');
+    expect(
+      classifyProviderHttpError({
+        providerId: 'openai',
+        providerName: 'OpenAI',
+        status: 403,
+      }).kind,
+    ).toBe('auth');
+    expect(
+      classifyProviderHttpError({
+        providerId: 'google',
+        providerName: 'Google',
+        status: 408,
+      }).kind,
+    ).toBe('transient');
+    expect(
+      classifyProviderHttpError({
+        providerId: 'google',
+        providerName: 'Google',
+        status: 425,
+      }).kind,
+    ).toBe('transient');
+    expect(
+      classifyProviderHttpError({
+        providerId: 'anthropic',
+        providerName: 'Anthropic',
+        status: 500,
+      }).kind,
+    ).toBe('server');
+    expect(
+      classifyProviderHttpError({
+        providerId: 'anthropic',
+        providerName: 'Anthropic',
+        status: 499,
+      }).kind,
+    ).toBe('invalid');
+    expect(
+      classifyProviderHttpError({
+        providerId: 'anthropic',
+        providerName: 'Anthropic',
+        status: 302,
+        body: 'resource_exhausted',
+      }).kind,
+    ).toBe('rate_limit');
+  });
+
+  it('classifies machine-readable stream error tokens without leaking payload text', () => {
+    const rateLimit = classifyProviderStreamError({
+      providerId: 'anthropic',
+      providerName: 'Anthropic',
+      errorType: 'overloaded_error',
+      errorCode: 'ignored prose FAKE_PROVIDER_SECRET',
+    });
+    const transient = classifyProviderStreamError({
+      providerId: 'openai',
+      providerName: 'OpenAI',
+      errorType: 'socket hang up',
+      errorCode: 429,
+    });
+    const unknown = classifyProviderStreamError({
+      providerId: 'google',
+      providerName: 'Google',
+      errorType: { type: 'rate_limit' },
+      errorCode: ['429'],
+    });
+
+    expect(rateLimit.kind).toBe('rate_limit');
+    expect(rateLimit.message).toBe('Anthropic API error: rate_limit');
+    expect(inspect(rateLimit)).not.toContain('FAKE_PROVIDER_SECRET');
+    expect(transient.kind).toBe('transient');
+    expect(unknown.kind).toBe('unknown');
+  });
+
   it('normalises legacy bare provider errors by status in the message', () => {
     const original = new Error('OpenAI API error: 429');
     const err = normaliseProviderError(original, 'openai', 'OpenAI');
@@ -105,6 +197,24 @@ describe('provider error classification', () => {
     expect(err.status).toBe(429);
     expect(err.cause).not.toBe(original);
     expect(err.cause).toBeInstanceOf(Error);
+  });
+
+  it('keeps string errors sanitized while still classifying known tokens', () => {
+    const rateLimit = normaliseProviderError(
+      'upstream returned rate limit with FAKE_PROVIDER_SECRET',
+      'openai',
+      'OpenAI',
+    );
+    const unknown = normaliseProviderError(
+      { message: 429 },
+      'openai',
+      'OpenAI',
+    );
+
+    expect(rateLimit.kind).toBe('rate_limit');
+    expect(rateLimit.cause).toBeInstanceOf(Error);
+    expect(inspect(rateLimit)).not.toContain('FAKE_PROVIDER_SECRET');
+    expect(unknown.kind).toBe('unknown');
   });
 
   it('sanitizes direct ProviderError causes before loggers can inspect them', () => {
@@ -169,6 +279,36 @@ describe('provider error classification', () => {
 
     expect((err.cause as { code?: unknown } | undefined)?.code).toBeUndefined();
     expect(inspected).not.toContain('FAKE_PROVIDER_SECRET');
+  });
+
+  it('normalises safe provider cause metadata and rejects unsafe boundaries', () => {
+    const safeStringCode = normaliseProviderError(
+      Object.assign(new Error('request timed out'), {
+        name: 'TypeError',
+        code: ' etimedout ',
+      }),
+      'openai',
+      'OpenAI',
+    );
+    const highNumericCode = normaliseProviderError(
+      Object.assign(new Error('provider error'), { code: 600 }),
+      'openai',
+      'OpenAI',
+    );
+    const lowNumericStatus = normaliseProviderError(
+      Object.assign(new Error('provider error'), { statusCode: 99 }),
+      'openai',
+      'OpenAI',
+    );
+
+    expect((safeStringCode.cause as { code?: unknown }).code).toBe('ETIMEDOUT');
+    expect((safeStringCode.cause as { originalName?: unknown }).originalName).toBe(
+      'Error',
+    );
+    expect((highNumericCode.cause as { code?: unknown }).code).toBeUndefined();
+    expect(highNumericCode.status).toBeUndefined();
+    expect((lowNumericStatus.cause as { status?: unknown }).status).toBeUndefined();
+    expect(lowNumericStatus.status).toBeUndefined();
   });
 
   it('normalises hostile provider error objects without throwing', () => {
@@ -320,5 +460,25 @@ describe('provider error classification', () => {
     expect(normaliseProviderError(secondWrapper, 'openai', 'OpenAI')).toBe(
       cause,
     );
+  });
+
+  it('stops ProviderError cause search at cycles and beyond the bounded depth limit', () => {
+    const cycle: { cause?: unknown } = {};
+    cycle.cause = cycle;
+    expect(providerErrorFromUnknown(cycle)).toBeNull();
+
+    const providerError = new ProviderError({
+      providerId: 'google',
+      providerName: 'Google',
+      status: 429,
+      kind: 'rate_limit',
+    });
+    const tooDeep = {
+      cause: { cause: { cause: { cause: { cause: { cause: providerError } } } } },
+    };
+    const justInRange = { cause: { cause: { cause: { cause: providerError } } } };
+
+    expect(providerErrorFromUnknown(tooDeep)).toBeNull();
+    expect(providerErrorFromUnknown(justInRange)).toBe(providerError);
   });
 });

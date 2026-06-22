@@ -1,0 +1,20 @@
+{
+  "$schema": "../../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Pattern 5 mutation run over the nitro-verify enclave-attestation verifier — the client-side trust gate that proves the server-side enclave is genuine + measured (CBOR/COSE decode, X.509 cert-chain + validity-window checks, ECDSA-P384 signature, PCR extraction). Pure package, hermetic tests. Non-blocking (thresholds.break=null). coverageAnalysis 'all' + vitest.related false make every mutant run the WHOLE suite (no per-test/related-files narrowing) so the DER ECDSA strip-guard mutants stay reliably killed under concurrent self-hosted-runner load — see docs/quality/mutation-triage/nitro-verify.md §2. See docs/quality/mutation-testing.md.",
+  "testRunner": "vitest",
+  "concurrency": 4,
+  "vitest": { "configFile": "vitest.config.ts", "related": false },
+  "mutate": [
+    "src/**/*.ts",
+    "!src/index.ts",
+    "!src/**/__tests__/**",
+    "!src/**/*.test.ts"
+  ],
+  "coverageAnalysis": "all",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/nitro-verify.html" },
+  "jsonReporter": { "fileName": "reports/mutation/nitro-verify.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

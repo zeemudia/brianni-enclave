@@ -37,6 +37,8 @@ export interface AgentLoopDeps {
   maxToolCalls?: number;
   /** Encrypted client-local context for prompt assembly. */
   requestContext?: AgentRequestContext;
+  /** Trusted server-authored plan id, used only for plan-limit prompt wording. */
+  subscriptionPlanId?: 'FREE' | 'PRO' | 'MAX';
   /**
    * Full effective skill tool scope for orchestrator workers whose runtime pack
    * is narrowed to a subtask. Used only for capability wording in the prompt;
@@ -189,6 +191,7 @@ export async function* runAgentLoop(
   const maxToolCalls = deps.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS;
   const systemPrompt = assembleSystemPrompt(deps.pack, {
     ...deps.requestContext,
+    subscriptionPlanId: deps.subscriptionPlanId,
     fullSkillToolScopes: deps.fullSkillToolScopes,
   });
 

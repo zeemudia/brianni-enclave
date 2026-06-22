@@ -1,6 +1,20 @@
 import { describe, it, expect } from 'vitest';
-import { PIITokeniser } from '../tokeniser';
+import { findSafeEmitPoint, PIITokeniser } from '../tokeniser';
 import { detectPII } from '../patterns';
+import type { PIIEntity } from '../types';
+
+const entity = (
+  startIndex: number,
+  endIndex: number,
+  type = 'NAME',
+  confidence = 0.9,
+): PIIEntity => ({
+  type,
+  text: '',
+  startIndex,
+  endIndex,
+  confidence,
+});
 
 describe('PIITokeniser', () => {
   it('should mask PII and rehydrate correctly', () => {
@@ -81,19 +95,42 @@ describe('PIITokeniser', () => {
     expect(tokens).toHaveLength(0);
   });
 
+  it('masks right-to-left so earlier replacements do not shift later spans', () => {
+    const tokeniser = new PIITokeniser();
+    const { masked, tokens } = tokeniser.mask('Alice and Bob', [
+      entity(0, 5, 'NAME'),
+      entity(10, 13, 'NAME'),
+    ]);
+
+    expect(masked).toBe('[NAME_2] and [NAME_1]');
+    expect(tokens.map((token) => token.original)).toEqual(['Bob', 'Alice']);
+    expect(tokeniser.rehydrate(masked)).toBe('Alice and Bob');
+  });
+
+  it('tracks the total token count and clears it with the token map', () => {
+    const tokeniser = new PIITokeniser();
+    tokeniser.mask('a@b.com and Bob', [
+      entity(0, 7, 'EMAIL'),
+      entity(12, 15, 'NAME'),
+    ]);
+
+    expect(tokeniser.getTokenCount()).toBe(2);
+    expect(tokeniser.getSubstitutions()).toEqual([
+      { token: '[NAME_1]', original: 'Bob' },
+      { token: '[EMAIL_1]', original: 'a@b.com' },
+    ]);
+
+    tokeniser.clear();
+
+    expect(tokeniser.getTokenCount()).toBe(0);
+    expect(tokeniser.getSubstitutions()).toEqual([]);
+  });
+
   // L7 error-handling-audit — mask() must FAIL CLOSED on invalid entity
   // sets. Overlapping or out-of-range entities silently corrupted the
   // masked output (partially-overwritten tokens, resurfaced PII fragments);
   // corrupted masking must never be sent to the provider.
   describe('entity validation (fail-closed, L7)', () => {
-    const entity = (startIndex: number, endIndex: number, type = 'NAME') => ({
-      type,
-      text: '',
-      startIndex,
-      endIndex,
-      confidence: 0.9,
-    });
-
     it('throws on overlapping entities', () => {
       const text = 'Alice Bobson lives here';
       expect(() =>
@@ -140,5 +177,32 @@ describe('PIITokeniser', () => {
       ]);
       expect(masked).toBe('[NAME_1] [EMAIL_1]');
     });
+
+    it('accepts directly touching entities without requiring a separating character', () => {
+      const { masked } = new PIITokeniser().mask('abcd', [
+        entity(2, 4, 'EMAIL'),
+        entity(0, 2),
+      ]);
+      expect(masked).toBe('[NAME_1][EMAIL_1]');
+    });
+  });
+});
+
+describe('findSafeEmitPoint', () => {
+  it('holds back an unterminated token at exactly the max token length', () => {
+    const chunk = `prefix [${'A'.repeat(29)}`;
+    expect(chunk.length - chunk.lastIndexOf('[')).toBe(30);
+    expect(findSafeEmitPoint(chunk)).toBe('prefix '.length);
+  });
+
+  it('emits a distant unterminated bracket as ordinary text', () => {
+    const chunk = `prefix [${'A'.repeat(30)}`;
+    expect(chunk.length - chunk.lastIndexOf('[')).toBe(31);
+    expect(findSafeEmitPoint(chunk)).toBe(chunk.length);
+  });
+
+  it('emits the full chunk when the token closes before the end', () => {
+    const chunk = 'prefix [NAME_1] suffix';
+    expect(findSafeEmitPoint(chunk)).toBe(chunk.length);
   });
 });

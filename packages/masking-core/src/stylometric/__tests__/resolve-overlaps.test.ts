@@ -63,3 +63,34 @@ describe('resolveOverlaps', () => {
     expect(out[0].original).toBe('alpha');
   });
 });
+
+describe('resolveOverlaps — mutation hardening', () => {
+  it('keeps a higher-priority suggestion adjacent AFTER a lower-priority one', () => {
+    // The higher-priority punctuation sorts first and is accepted; the idiom
+    // touches it at index 5 but does NOT overlap, so both survive. Kills
+    // overlaps() `a.startIndex < b.endIndex` -> `<=` (would wrongly treat the
+    // touching pair as overlapping once the accepted item starts where the
+    // candidate ends).
+    const idiom = mk('idiom', 0, 5); // priority 5
+    const punct = mk('punctuation', 5, 10); // priority 1 -> accepted first
+    const out = resolveOverlaps([idiom, punct]);
+    expect(out).toHaveLength(2);
+    expect(out.map((s) => s.category).sort()).toEqual(['idiom', 'punctuation']);
+  });
+
+  it('keeps the earlier-start span among same-priority overlaps (earliest-first input)', () => {
+    // Kills the secondary sort `a.s.startIndex - b.s.startIndex` -> `+`.
+    const out = resolveOverlaps([mk('case', 0, 10), mk('case', 5, 15)]);
+    expect(out).toHaveLength(1);
+    expect(out[0].startIndex).toBe(0);
+  });
+
+  it('sorts same-priority overlaps by startIndex regardless of input order', () => {
+    // Kills `if (a.s.startIndex !== b.s.startIndex)` -> `===` / false and the
+    // priority guard `if (pa !== pb) ...` -> true: the earlier-start span must
+    // win even when listed second.
+    const out = resolveOverlaps([mk('case', 5, 15), mk('case', 0, 10)]);
+    expect(out).toHaveLength(1);
+    expect(out[0].startIndex).toBe(0);
+  });
+});

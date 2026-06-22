@@ -158,6 +158,9 @@ const US_SSN_SHAPE_RE = /^(\d{3})[-\s]?(\d{2})[-\s]?(\d{4})$/;
  *  16-digit strings fail. */
 function passesLuhn(text: string): boolean {
   const digits = text.replace(/\D/g, "");
+  // Stryker disable next-line ConditionalExpression,BooleanLiteral: defensive
+  // guard — an ACCT match always contains >= 16 digits, so digits.length is
+  // never 0 here; forcing this branch cannot change any output.
   if (digits.length === 0) return false;
   let sum = 0;
   let double = false;
@@ -167,6 +170,9 @@ function passesLuhn(text: string): boolean {
       d *= 2;
       if (d > 9) d -= 9;
     }
+    // Stryker disable next-line AssignmentOperator: equivalent — negating every
+    // summand turns `sum` into `-sum`, and `-sum % 10 === 0` iff `sum % 10 === 0`,
+    // so the Luhn pass/fail verdict is unchanged.
     sum += d;
     double = !double;
   }
@@ -258,6 +264,10 @@ function shouldSuppressRegexEntity(
   entity: PIIEntity,
   sourceText: string,
 ): boolean {
+  // Stryker disable next-line LogicalOperator: equivalent — `startsWith("+44")`
+  // already implies `type === "PHONE"` (no other entity text starts with "+44"),
+  // and every non-+44 phone is \b-anchored so `previous` is never alphanumeric;
+  // the body therefore returns false regardless of `&&` vs `||`.
   if (entity.type === "PHONE" && entity.text.startsWith("+44")) {
     const previous = sourceText[entity.startIndex - 1];
     return previous !== undefined && /[A-Za-z0-9]/.test(previous);

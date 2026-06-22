@@ -6,7 +6,9 @@ import {
   type AgentLinkedFolderContext,
   type BinaryWorkItemWriteRequestFrame,
   type ConnectedConnectorContext,
+  type ConnectorDescriptor,
   type ConnectorModeEcho,
+  type ConnectorOperation,
   type MediaProvenanceRecord,
   type MemoryMutationEnvelope,
   type MemoryNamespace,
@@ -889,6 +891,41 @@ export class ToolGateway {
       );
     }
 
+    // 4a-bis — subsumption-aware granted-scope satisfaction, applied to the
+    // INVOCATION (not just the connector.list discovery view). The SAME signed-
+    // catalog check that HIDES a write op from a read-only grant in connector.list
+    // is enforced here, so a write op reached by a DIRECT or alias-normalized
+    // connector.act (which the planner was never shown) fails closed BEFORE the
+    // budget / destructive lock / client modal — never a "confirm then provider
+    // 403". Authoritative (it honours catalog scopeSubsumes, accounting for a
+    // broader grant), so unlike admission's coarse flat-match (deliberately
+    // inconclusive-never-reject) it is safe to hard-reject. Keeps "invocable" ==
+    // "listed". Catalog-driven; names no connector/op (C1).
+    {
+      const scopeDescriptor = getConnector(connectorId);
+      const scopeOp = scopeDescriptor?.operations.find(
+        (o) => o.id === operation,
+      );
+      const grantedScopes =
+        connected.find((c) => c.connectorId === connectorId)?.grantedScopes ??
+        [];
+      if (
+        scopeDescriptor &&
+        scopeOp &&
+        !connectorOperationScopeSatisfied(scopeDescriptor, scopeOp, grantedScopes)
+      ) {
+        return this.connectorReject(
+          frame,
+          pack,
+          turnId,
+          'CONNECTOR_SCOPE_NOT_GRANTED',
+          echoes,
+          connectorId,
+          operation,
+        );
+      }
+    }
+
     // 4b — per-turn budget (override may RAISE the cap; never lower it).
     const override = this.deps.connectorTurnBudgetOverride;
     const turnState = this.connectorTurnState(turnId);
@@ -1125,10 +1162,22 @@ export class ToolGateway {
             // v1 forbids binary ops; do not advertise an op the gateway would
             // hard-reject at admission.
             .filter((op) => op.binary !== true)
+            .filter((op) =>
+              connectorOperationScopeSatisfied(
+                descriptor,
+                op,
+                c.grantedScopes,
+              ),
+            )
             .map((op) => ({
               id: op.id,
               mutating: op.mutating,
               paramsSchema: op.paramsSchema,
+              contentFields: op.contentFields,
+              maxWindowDays: op.maxWindowDays,
+              maxResults: op.maxResults,
+              windowParams: op.windowParams,
+              maxResultsParam: op.maxResultsParam,
             })),
         };
       })
@@ -1548,4 +1597,44 @@ export class ToolGateway {
       }
     }
   }
+}
+
+function connectorOperationScopeSatisfied(
+  descriptor: ConnectorDescriptor,
+  operation: ConnectorOperation,
+  grantedScopes: readonly string[],
+): boolean {
+  const requiredScopes = Array.isArray(operation.requiredScope)
+    ? operation.requiredScope
+    : [operation.requiredScope];
+  return requiredScopes.some((requiredScope) =>
+    grantedScopes.some((grantedScope) =>
+      grantCoversRequiredScope(descriptor, grantedScope, requiredScope),
+    ),
+  );
+}
+
+function grantCoversRequiredScope(
+  descriptor: ConnectorDescriptor,
+  grantedScope: string,
+  requiredScope: string,
+): boolean {
+  if (scopeTokenMatches(grantedScope, requiredScope)) return true;
+  return (
+    descriptor.scopeSubsumes?.some(
+      (rule) =>
+        scopeTokenMatches(grantedScope, rule.grant) &&
+        rule.covers.some((coveredScope) =>
+          scopeTokenMatches(coveredScope, requiredScope),
+        ),
+    ) ?? false
+  );
+}
+
+function scopeTokenMatches(left: string, right: string): boolean {
+  return (
+    left === right ||
+    left.endsWith(`/${right}`) ||
+    right.endsWith(`/${left}`)
+  );
 }

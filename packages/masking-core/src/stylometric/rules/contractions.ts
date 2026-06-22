@@ -11,6 +11,10 @@ interface ContractionEntry {
 const ENTRIES: readonly ContractionEntry[] = CONTRACTIONS_JSON as readonly ContractionEntry[];
 
 function escapeRegex(raw: string): string {
+  // Stryker disable next-line StringLiteral: equivalent — no contraction
+  // dictionary entry contains a regex metacharacter, so the replacement string
+  // is never exercised (the character class never matches) and '\\$&' -> '' is
+  // behaviourally inert.
   return raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
@@ -31,6 +35,9 @@ const COMPILED: ReadonlyArray<{ regex: RegExp; to: string; from: string }> = ENT
 );
 
 function capitaliseFirst(word: string): string {
+  // Stryker disable next-line all: defensive empty-string guard — capitaliseFirst
+  // is only ever called with a non-empty dictionary expansion, so this branch is
+  // unreachable and its mutants are equivalent (kept to avoid word[0] === undefined).
   if (word.length === 0) return word;
   return word[0].toUpperCase() + word.slice(1);
 }
@@ -52,11 +59,14 @@ export function detectContractions(
       const startIndex = match.index;
       const endIndex = startIndex + original.length;
       if (spanIsExcluded(startIndex, endIndex, ranges)) continue;
+      // Preserve the original leading case. Every contraction begins with a
+      // letter, so "did the writer capitalise it?" reduces to a single check:
+      // an upper-case letter differs from its own lower-casing. (The earlier
+      // triple-guard — truthy AND === toUpperCase() AND !== toLowerCase() — was
+      // redundant for cased letters and only produced equivalent mutants.)
       const firstChar = original[0];
       const replacement =
-        firstChar && firstChar === firstChar.toUpperCase() && firstChar !== firstChar.toLowerCase()
-          ? capitaliseFirst(to)
-          : to;
+        firstChar !== firstChar.toLowerCase() ? capitaliseFirst(to) : to;
       out.push({
         id: makeId('contraction', startIndex, endIndex, original),
         category: 'contraction',

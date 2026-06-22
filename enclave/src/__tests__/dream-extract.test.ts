@@ -20,6 +20,27 @@ function makeCandidate(overrides: Partial<DreamCandidate> = {}): DreamCandidate 
   };
 }
 
+function validCandidatePayload(overrides: Record<string, unknown> = {}) {
+  return {
+    namespace: 'default',
+    kind: 'preference',
+    text: 'User prefers focused mornings',
+    structured: {},
+    tags: ['work'],
+    provenance: [
+      {
+        excerpt: 'I prefer focused mornings',
+        excerptHash: 'sha256:abc',
+        sourceRef: { type: 'conversation', conversationId: 'conv-1' },
+        extractedAt: '2026-05-11T00:00:00.000Z',
+        dreamSessionId: 'dream-1',
+      },
+    ],
+    confidence: 0.8,
+    ...overrides,
+  };
+}
+
 describe('extractCandidateMemories', () => {
   it('skips conversations with fewer than 3 turns', async () => {
     const llmTransport = new RecordedLlmTransport([]);
@@ -37,17 +58,32 @@ describe('extractCandidateMemories', () => {
     expect(llmTransport.requests).toEqual([]);
   });
 
+  it('does not count system messages toward the extraction turn threshold', async () => {
+    const llmTransport = new RecordedLlmTransport([
+      { text: 'should-not-be-used', inputTokens: 1, outputTokens: 1 },
+    ]);
+    const result = await extractCandidateMemories({
+      candidate: makeCandidate({
+        conversationMessages: [
+          { role: 'system', content: 'System prompt' },
+          { role: 'user', content: 'One user turn' },
+          { role: 'assistant', content: 'One assistant turn' },
+          { role: 'system', content: 'More system context' },
+        ],
+      }),
+      llmTransport,
+    });
+
+    expect(result).toEqual([]);
+    expect(llmTransport.requests).toEqual([]);
+  });
+
   it('refuses to emit a candidate without provenance excerpt and excerptHash', async () => {
     const llmTransport = new RecordedLlmTransport([
       {
         text: JSON.stringify({
           candidates: [
-            {
-              namespace: 'default',
-              kind: 'preference',
-              text: 'User prefers focused mornings',
-              structured: {},
-              tags: ['work'],
+            validCandidatePayload({
               provenance: [
                 {
                   sourceRef: { type: 'conversation', conversationId: 'conv-1' },
@@ -55,8 +91,7 @@ describe('extractCandidateMemories', () => {
                   dreamSessionId: 'dream-1',
                 },
               ],
-              confidence: 0.8,
-            },
+            }),
           ],
         }),
         inputTokens: 1,
@@ -85,29 +120,52 @@ describe('extractCandidateMemories', () => {
     ).rejects.toThrow(/json/i);
   });
 
+  it('rejects non-array extract payloads with a static shape error', async () => {
+    const llmTransport = new RecordedLlmTransport([
+      {
+        text: JSON.stringify({ candidates: { not: 'an-array' } }),
+        inputTokens: 1,
+        outputTokens: 1,
+      },
+    ]);
+
+    await expect(
+      extractCandidateMemories({
+        candidate: makeCandidate(),
+        llmTransport,
+      }),
+    ).rejects.toThrow('dream_extract_json_shape_invalid: expected candidates array');
+  });
+
+  it('accepts a top-level array from the extract model', async () => {
+    const llmTransport = new RecordedLlmTransport([
+      {
+        text: JSON.stringify([validCandidatePayload()]),
+        inputTokens: 1,
+        outputTokens: 1,
+      },
+    ]);
+
+    const result = await extractCandidateMemories({
+      candidate: makeCandidate(),
+      llmTransport,
+    });
+
+    expect(result).toEqual([
+      expect.objectContaining({
+        namespace: 'default',
+        kind: 'preference',
+        text: 'User prefers focused mornings',
+        confidence: 0.8,
+      }),
+    ]);
+  });
+
   it('accepts markdown-fenced JSON from the extract model', async () => {
     const llmTransport = new RecordedLlmTransport([
       {
         text: `\`\`\`json\n${JSON.stringify({
-          candidates: [
-            {
-              namespace: 'default',
-              kind: 'preference',
-              text: 'User prefers focused mornings',
-              structured: {},
-              tags: ['work'],
-              provenance: [
-                {
-                  excerpt: 'I prefer focused mornings',
-                  excerptHash: 'sha256:abc',
-                  sourceRef: { type: 'conversation', conversationId: 'conv-1' },
-                  extractedAt: '2026-05-11T00:00:00.000Z',
-                  dreamSessionId: 'dream-1',
-                },
-              ],
-              confidence: 0.8,
-            },
-          ],
+          candidates: [validCandidatePayload()],
         })}\n\`\`\``,
         inputTokens: 1,
         outputTokens: 1,
@@ -160,25 +218,7 @@ describe('extractCandidateMemories', () => {
     const llmTransport = new RecordedLlmTransport([
       {
         text: JSON.stringify({
-          candidates: [
-            {
-              namespace: 'default',
-              kind: 'preference',
-              text: 'User prefers focused mornings',
-              structured: {},
-              tags: ['work'],
-              provenance: [
-                {
-                  excerpt: 'I prefer focused mornings',
-                  excerptHash: 'sha256:abc',
-                  sourceRef: { type: 'conversation', conversationId: 'conv-1' },
-                  extractedAt: '2026-05-11T00:00:00.000Z',
-                  dreamSessionId: 'dream-1',
-                },
-              ],
-              confidence: 0.8,
-            },
-          ],
+          candidates: [validCandidatePayload()],
         }),
         inputTokens: 1,
         outputTokens: 1,
@@ -203,5 +243,90 @@ describe('extractCandidateMemories', () => {
     expect(llmTransport.requests[0].systemPrompt).toContain('zero tool access');
     expect(llmTransport.requests[0].systemPrompt).toContain('namespace: default');
     expect(llmTransport.requests[0].userMessage).toContain('[NAME_1]');
+  });
+
+  it.each([
+    ['namespace invalid', { namespace: 'not-a-namespace' }, /namespace invalid/],
+    ['namespace mismatch', { namespace: 'health' }, /namespace mismatch/],
+    ['kind invalid', { kind: 'bad-kind' }, /kind invalid/],
+    ['text required', { text: '   ' }, /text required/],
+    ['structured required', { structured: null }, /structured object required/],
+    ['tags required', { tags: 'work' }, /tags array required/],
+    ['provenance required', { provenance: [] }, /provenance required/],
+    ['confidence low', { confidence: -0.01 }, /confidence must be 0..1/],
+    ['confidence high', { confidence: 1.01 }, /confidence must be 0..1/],
+  ])('rejects extract candidate validation failure: %s', async (_name, patch, message) => {
+    const llmTransport = new RecordedLlmTransport([
+      {
+        text: JSON.stringify({ candidates: [validCandidatePayload(patch)] }),
+        inputTokens: 1,
+        outputTokens: 1,
+      },
+    ]);
+
+    await expect(
+      extractCandidateMemories({
+        candidate: makeCandidate(),
+        llmTransport,
+      }),
+    ).rejects.toThrow(message);
+  });
+
+  it('keeps rejected model-derived candidate values out of thrown errors', async () => {
+    const llmTransport = new RecordedLlmTransport([
+      {
+        text: JSON.stringify({
+          candidates: [
+            validCandidatePayload({
+              text: 'PLAINTEXT_MEMORY_SHOULD_NOT_LEAK',
+              provenance: [
+                {
+                  excerpt: 'PLAINTEXT_EXCERPT_SHOULD_NOT_LEAK',
+                  excerptHash: 'bad',
+                  sourceRef: { type: 'conversation', conversationId: 'conv-1' },
+                  extractedAt: '2026-05-11T00:00:00.000Z',
+                  dreamSessionId: 'dream-1',
+                },
+              ],
+            }),
+          ],
+        }),
+        inputTokens: 1,
+        outputTokens: 1,
+      },
+    ]);
+
+    await expect(
+      extractCandidateMemories({
+        candidate: makeCandidate(),
+        llmTransport,
+      }),
+    ).rejects.toThrow('dream_extract_candidate_invalid:0: provenance 0 invalid');
+    await expect(
+      extractCandidateMemories({
+        candidate: makeCandidate(),
+        llmTransport: new RecordedLlmTransport([
+          {
+            text: JSON.stringify({
+              candidates: [
+                validCandidatePayload({
+                  provenance: [
+                    {
+                      excerpt: 'PLAINTEXT_EXCERPT_SHOULD_NOT_LEAK',
+                      excerptHash: 'bad',
+                      sourceRef: { type: 'conversation', conversationId: 'conv-1' },
+                      extractedAt: '2026-05-11T00:00:00.000Z',
+                      dreamSessionId: 'dream-1',
+                    },
+                  ],
+                }),
+              ],
+            }),
+            inputTokens: 1,
+            outputTokens: 1,
+          },
+        ]),
+      }),
+    ).rejects.not.toThrow(/PLAINTEXT/);
   });
 });

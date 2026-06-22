@@ -1,0 +1,27 @@
+{
+  "$schema": "../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Target-local mutation run over pure, hermetic, high-risk enclave AGENT + TOOL guard slices. tools/scope-check.ts (tool allow/deny: a banned/out-of-scope Tier C/D tool must never authorize), agent/parse-tool-call.ts (streaming tool-call parser: banned-name + unknown-name + invalid-frame rejection, fence boundary handling — a parse bug could admit a malformed/banned tool call or split a fence), agent/cross-pack-grant.ts (cross-pack read authorization: fail-closed commitment-before-expiry, oversize folder/document caps, namespace intersection + health gating — a flipped guard widens private cross-pack reads), agent/tool-output-sanitizer.ts (prompt-injection defence: <tool> fence escaping + role-spoof stripping + internal-key removal reinjected as untrusted tool-result), tools/bridge-result-sanitiser.ts (bridge error mapping: unknown/missing outcome fail-closed to error, timeout detection, reason truncation), tools/folder-path-validator.ts + tools/copy-on-write-policy.ts (path input validation: bounded segments reject control/format chars + traversal, copy-on-write collision suffix grammar), tools/folder-resolver.ts (folder authorization repair: unique-label resolution never widens access). All are pure (no node:* beyond what chat-types pulls, no vsock, no network, no DB), so they run hermetically. Report-only / not wired into the shared adjusted-gate while parallel mutation sessions are open. See docs/quality/mutation-triage/enclave-agent-tools.md.",
+  "testRunner": "vitest",
+  "concurrency": 4,
+  "vitest": {
+    "configFile": "vitest.mutation.enclave-agent-tools.config.ts",
+    "related": false
+  },
+  "mutate": [
+    "src/tools/scope-check.ts",
+    "src/agent/parse-tool-call.ts",
+    "src/agent/cross-pack-grant.ts",
+    "src/agent/tool-output-sanitizer.ts",
+    "src/tools/bridge-result-sanitiser.ts",
+    "src/tools/folder-path-validator.ts",
+    "src/tools/copy-on-write-policy.ts",
+    "src/tools/folder-resolver.ts"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/enclave-agent-tools.html" },
+  "jsonReporter": { "fileName": "reports/mutation/enclave-agent-tools.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

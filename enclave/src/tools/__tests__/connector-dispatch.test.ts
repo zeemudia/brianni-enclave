@@ -39,6 +39,12 @@ function signedCatalog(version = 1) {
       provider: "google",
       platforms: ["web", "ios", "android"],
       oauthScopes: ["https://www.googleapis.com/auth/calendar.events"],
+      scopeSubsumes: [
+        {
+          grant: "calendar",
+          covers: ["calendar.readonly", "calendar.events"],
+        },
+      ],
       operations: [
         {
           id: "list_events",
@@ -56,7 +62,31 @@ function signedCatalog(version = 1) {
           mutating: true,
           destructive: false,
           requiredScope: ["calendar.events"],
-          paramsSchema: {},
+          eventTimeRange: { start: "start", end: "end" },
+          paramsSchema: {
+            calendarId: { type: "string", required: true },
+            summary: { type: "string", required: true },
+            start: { type: "string", required: true },
+            end: { type: "string", required: true },
+          },
+          contentFields: ["summary", "description", "location"],
+        },
+        {
+          id: "update_event",
+          mutating: true,
+          destructive: false,
+          concurrency: "etag",
+          requiredScope: ["calendar.events"],
+          eventTimeRange: { start: "start", end: "end" },
+          paramsSchema: {
+            calendarId: { type: "string", required: true },
+            eventId: { type: "string", required: true },
+            etag: { type: "string", required: true },
+            // start/end are OPTIONAL on a partial update — the eventTimeRange guard
+            // enforces both-or-neither + validity + ordering when present.
+            start: { type: "string" },
+            end: { type: "string" },
+          },
         },
         {
           id: "download_attachment",
@@ -81,6 +111,12 @@ function signedCatalog(version = 1) {
 function loadRegistry() {
   initConnectorRegistry(signedCatalog(), verifyKeyPem);
 }
+const createParams = {
+  calendarId: "primary",
+  summary: "Lunch",
+  start: "2026-07-01T09:00:00Z",
+  end: "2026-07-01T09:30:00Z",
+};
 
 function mkPack(
   scopes: string[] = ["connector.list", "connector.read", "connector.act"],
@@ -197,6 +233,21 @@ describe("connector.* dispatch (Task 11)", () => {
     expect(env.ok).toBe(true);
     expect(Array.isArray(env.data.connectors)).toBe(true);
     expect(env.data.connectors).toHaveLength(1);
+    const connector = env.data.connectors[0] as {
+      operations: Array<{
+        id: string;
+        paramsSchema: Record<string, unknown>;
+      }>;
+    };
+    const create = connector.operations.find((op) => op.id === "create_event");
+    expect(create?.paramsSchema).toMatchObject({
+      calendarId: { type: "string", required: true },
+      summary: { type: "string", required: true },
+      start: { type: "string", required: true },
+      end: { type: "string", required: true },
+      description: { type: "string" },
+      location: { type: "string" },
+    });
     // Parses as a ConnectorResultEnvelope
     const parsed = ConnectorResultEnvelopeSchema.safeParse(res.resultJson);
     expect(parsed.success).toBe(true);
@@ -205,6 +256,131 @@ describe("connector.* dispatch (Task 11)", () => {
     const state = gw.__connectorTurnStateForTest(TURN);
     expect(state.reads).toBe(0);
     expect(state.mutations).toBe(0);
+  });
+
+  it("connector.list hides write operations when the connected grant is read-only", async () => {
+    loadRegistry();
+    const gw = new ToolGateway(
+      mkDeps({
+        connectedConnectors: [
+          {
+            connectorId: "google-calendar",
+            displayName: "[C_1]",
+            status: "connected",
+            grantedScopes: ["calendar.readonly"],
+          },
+        ],
+      }),
+    );
+    const res = await gw.dispatch(readFrame({}, "connector.list"), mkPack(), TURN);
+
+    expect(res.outcome).toBe("ok");
+    const env = res.resultJson as {
+      ok: true;
+      data: { connectors: Array<{ operations: Array<{ id: string }> }> };
+    };
+    const operationIds = env.data.connectors[0]?.operations.map((op) => op.id);
+    expect(operationIds).toContain("list_events");
+    expect(operationIds).not.toContain("create_event");
+  });
+
+  it("rejects a DIRECT connector.act write op under a read-only grant BEFORE the bridge/budget (scope not granted)", async () => {
+    // The write op is hidden from this read-only grant's connector.list view, but
+    // a direct (or alias-normalized) connector.act could still target it. The
+    // invocation-time scope gate must fail it closed — no client modal, no
+    // mutation-budget consumption — instead of "confirm then provider 403".
+    loadRegistry();
+    const { bridge, calls } = recordingBridge((frame) => ({
+      invocationId: frame.invocationId,
+      outcome: "ok",
+      resultJson: { ok: true, data: { id: "evt" } },
+    }));
+    const gw = new ToolGateway(
+      mkDeps({
+        clientBridge: bridge,
+        connectedConnectors: [
+          {
+            connectorId: "google-calendar",
+            displayName: "[C_1]",
+            status: "connected",
+            grantedScopes: ["calendar.readonly"],
+          },
+        ],
+      }),
+    );
+    const res = await gw.dispatch(
+      readFrame(
+        { connectorId: "google-calendar", operation: "create_event", params: createParams },
+        "connector.act",
+      ),
+      mkPack(),
+      TURN,
+    );
+    expect(res.outcome).toBe("gateway_rejected");
+    expect(res.reason).toBe("CONNECTOR_SCOPE_NOT_GRANTED");
+    expect(calls).toHaveLength(0);
+    expect(gw.__connectorTurnStateForTest(TURN).mutations).toBe(0);
+  });
+
+  it("rejects a present-but-NULL update event-time bound BEFORE budget (no turn poisoning)", async () => {
+    // `{ start: null, end: null }` must not slip through as "neither bound" and
+    // consume the mutation budget / arm the destructive lock before the client
+    // adapter rejects it. A present (own-property) null is INVALID at admission.
+    loadRegistry();
+    const { bridge, calls } = recordingBridge((frame) => ({
+      invocationId: frame.invocationId,
+      outcome: "ok",
+      resultJson: { ok: true, data: { id: "evt" } },
+    }));
+    const gw = new ToolGateway(mkDeps({ clientBridge: bridge }));
+    const res = await gw.dispatch(
+      readFrame(
+        {
+          connectorId: "google-calendar",
+          operation: "update_event",
+          params: {
+            calendarId: "primary",
+            eventId: "evt-1",
+            etag: '"e1"',
+            start: null,
+            end: null,
+          },
+        },
+        "connector.act",
+      ),
+      mkPack(),
+      TURN,
+    );
+    expect(res.outcome).toBe("gateway_rejected");
+    expect(res.reason).toBe("CONNECTOR_PARAM_DATETIME_INVALID");
+    expect(calls).toHaveLength(0);
+    expect(gw.__connectorTurnStateForTest(TURN).mutations).toBe(0);
+  });
+
+  it("connector.list keeps write operations when a signed scopeSubsumes rule covers them", async () => {
+    loadRegistry();
+    const gw = new ToolGateway(
+      mkDeps({
+        connectedConnectors: [
+          {
+            connectorId: "google-calendar",
+            displayName: "[C_1]",
+            status: "connected",
+            grantedScopes: ["calendar"],
+          },
+        ],
+      }),
+    );
+    const res = await gw.dispatch(readFrame({}, "connector.list"), mkPack(), TURN);
+
+    expect(res.outcome).toBe("ok");
+    const env = res.resultJson as {
+      ok: true;
+      data: { connectors: Array<{ operations: Array<{ id: string }> }> };
+    };
+    const operationIds = env.data.connectors[0]?.operations.map((op) => op.id);
+    expect(operationIds).toContain("list_events");
+    expect(operationIds).toContain("create_event");
   });
 
   // 2b ───────────────────────────────────────────────────────────────────
@@ -330,7 +506,7 @@ describe("connector.* dispatch (Task 11)", () => {
     const gw = new ToolGateway(mkDeps({ clientBridge: bridge }));
     const res = await gw.dispatch(
       readFrame(
-        { connectorId: "google-calendar", operation: "create_event", params: {} },
+        { connectorId: "google-calendar", operation: "create_event", params: createParams },
         "connector.act",
       ),
       mkPack(),
@@ -340,6 +516,36 @@ describe("connector.* dispatch (Task 11)", () => {
     expect(calls).toHaveLength(1);
     expect(gw.__connectorTurnStateForTest(TURN).mutations).toBe(1);
     expect(gw.__connectorTurnStateForTest(TURN).reads).toBe(0);
+  });
+
+  it("rejects connector.act before the client bridge when signed required params are missing", async () => {
+    loadRegistry();
+    const { bridge, calls } = recordingBridge((frame) => ({
+      invocationId: frame.invocationId,
+      outcome: "ok",
+      resultJson: { ok: true, data: { id: "evt" } },
+    }));
+    const gw = new ToolGateway(mkDeps({ clientBridge: bridge }));
+    const res = await gw.dispatch(
+      readFrame(
+        {
+          connectorId: "google-calendar",
+          operation: "create_event",
+          params: {
+            start: "2026-07-01T09:00:00Z",
+            end: "2026-07-01T09:30:00Z",
+          },
+        },
+        "connector.act",
+      ),
+      mkPack(),
+      TURN,
+    );
+
+    expect(res.outcome).toBe("gateway_rejected");
+    expect(res.reason).toBe("CONNECTOR_REQUIRED_PARAMS_MISSING");
+    expect(calls).toHaveLength(0);
+    expect(gw.__connectorTurnStateForTest(TURN).mutations).toBe(0);
   });
 
   // 5 ────────────────────────────────────────────────────────────────────
@@ -440,7 +646,7 @@ describe("connector.* dispatch (Task 11)", () => {
     const gw = new ToolGateway(mkDeps());
     const actFrame = () =>
       readFrame(
-        { connectorId: "google-calendar", operation: "create_event", params: {} },
+        { connectorId: "google-calendar", operation: "create_event", params: createParams },
         "connector.act",
       );
     // Exhaust the 5-mutation baseline.
@@ -468,7 +674,7 @@ describe("connector.* dispatch (Task 11)", () => {
     const gw = new ToolGateway(mkDeps({ clientBridge: bridge }));
     const res = await gw.dispatch(
       readFrame(
-        { connectorId: "google-calendar", operation: "create_event", params: {} },
+        { connectorId: "google-calendar", operation: "create_event", params: createParams },
         "connector.act",
       ),
       mkPack(),
@@ -489,7 +695,7 @@ describe("connector.* dispatch (Task 11)", () => {
     );
     const res = await gw.dispatch(
       readFrame(
-        { connectorId: "google-calendar", operation: "create_event", params: {} },
+        { connectorId: "google-calendar", operation: "create_event", params: createParams },
         "connector.act",
       ),
       mkPack(),
@@ -500,8 +706,8 @@ describe("connector.* dispatch (Task 11)", () => {
     // Override TRUSTED: many mutations past the measured baseline succeed.
     for (let i = 0; i < 10; i += 1) {
       const ok = await gw.dispatch(
-        readFrame(
-          { connectorId: "google-calendar", operation: "create_event", params: {} },
+          readFrame(
+          { connectorId: "google-calendar", operation: "create_event", params: createParams },
           "connector.act",
         ),
         mkPack(),
@@ -755,7 +961,7 @@ describe("connector.* dispatch (Task 11)", () => {
     const gw = new ToolGateway(mkDeps());
     const res = await gw.dispatch(
       readFrame(
-        { connectorId: "google-calendar", operation: "create_event", params: {} },
+        { connectorId: "google-calendar", operation: "create_event", params: createParams },
         "connector.act",
       ),
       mkPack(),

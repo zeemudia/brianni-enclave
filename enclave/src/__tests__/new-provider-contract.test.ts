@@ -8,6 +8,7 @@ import { selectModelForSubtask } from '../orchestrator/router';
 import {
   buildProviderDisplayNameMap,
   resolveProviderDisplayName,
+  type ProviderDisplayNameConfig,
 } from '../providers/display-name';
 import {
   classifyProviderHttpError,
@@ -24,14 +25,35 @@ const providersWithXaiPath = resolve(
 describe('new provider failover contract', () => {
   it('uses registry display names when present and stable human fallbacks otherwise', () => {
     const displayNames = buildProviderDisplayNameMap([
-      provider('mistral_ai', 'Mistral AI'),
+      provider('mistral_ai', '  Mistral AI  '),
       provider('xai'),
+      provider('openai_realtime'),
+      provider('aws-bedrock'),
+      provider('gcp_vertex_api'),
+      provider('blank-name', '   '),
+      provider('null-name', null),
     ]);
 
     expect(resolveProviderDisplayName('mistral_ai', displayNames)).toBe(
       'Mistral AI',
     );
     expect(resolveProviderDisplayName('xai', displayNames)).toBe('xAI');
+    expect(resolveProviderDisplayName('openai_realtime', displayNames)).toBe(
+      'OpenAI Realtime',
+    );
+    expect(resolveProviderDisplayName('aws-bedrock', displayNames)).toBe(
+      'AWS Bedrock',
+    );
+    expect(resolveProviderDisplayName('gcp_vertex_api', displayNames)).toBe(
+      'GCP Vertex API',
+    );
+    expect(resolveProviderDisplayName('blank-name', displayNames)).toBe(
+      'Blank Name',
+    );
+    expect(resolveProviderDisplayName('null-name', displayNames)).toBe(
+      'Null Name',
+    );
+    expect(resolveProviderDisplayName('---')).toBe('---');
     expect(resolveProviderDisplayName('future-provider')).toBe(
       'Future Provider',
     );
@@ -111,13 +133,12 @@ function loadXaiFixture(): ProviderConfig[] {
   return registry.providers as ProviderConfig[];
 }
 
-function provider(id: string, displayName?: string): ProviderConfig {
+function provider(
+  id: string,
+  displayName?: string | null,
+): ProviderDisplayNameConfig {
   return {
     id,
     displayName,
-    adapter: 'openai_v1',
-    baseUrl: 'https://example.invalid/v1',
-    apiKeyEnvVar: `${id.toUpperCase()}_API_KEY`,
-    models: [],
   };
 }

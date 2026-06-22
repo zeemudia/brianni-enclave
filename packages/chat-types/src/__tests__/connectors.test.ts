@@ -218,6 +218,267 @@ describe("connector operation schema", () => {
       }),
     ).toMatchObject({ id: "get_event" });
   });
+
+  it("accepts a catalog-only OAuth2 + HTTP connector descriptor", () => {
+    const parsed = ConnectorCatalogSchema.parse({
+      version: MIN_CONNECTOR_CATALOG_VERSION,
+      connectors: [
+        {
+          id: "example-tasks",
+          displayName: "Example Tasks",
+          provider: "example",
+          platforms: ["web", "ios", "android"],
+            oauthScopes: ["tasks.read"],
+            auth: {
+              type: "oauth2",
+              tokenExchange: "server",
+              clientSecretEnv: "EXAMPLE_TASKS_CLIENT_SECRET",
+              authorizationEndpoint: "https://auth.example.test/oauth/authorize",
+              tokenEndpoint: "https://auth.example.test/oauth/token",
+            revocationEndpoint: "https://auth.example.test/oauth/revoke",
+            tokenInfoEndpoint: "https://auth.example.test/oauth/tokeninfo",
+            defaultScopes: ["tasks.read"],
+            web: {
+              flow: "authorization_code_pkce",
+              clientId: "web-public-client",
+            },
+            ios: {
+              flow: "authorization_code_pkce",
+              clientId: "ios-public-client",
+            },
+            android: {
+              flow: "authorization_code_pkce",
+              clientId: "android-public-client",
+            },
+          },
+          scopeSubsumes: [{ grant: "tasks.write", covers: ["tasks.read"] }],
+          operations: [
+            {
+              id: "list_tasks",
+              mutating: false,
+              requiredScope: "tasks.read",
+              paramsSchema: {},
+              http: {
+                method: "GET",
+                url: "https://api.example.test/v1/tasks",
+                response: { dataPath: "items", dataKey: "tasks" },
+              },
+            },
+          ],
+          mcp: null,
+        },
+      ],
+      signature: "AAAA",
+    });
+
+    expect(parsed.connectors[0]?.auth?.type).toBe("oauth2");
+    expect(parsed.connectors[0]?.operations[0]?.http?.response.dataKey).toBe(
+      "tasks",
+    );
+  });
+
+  it("rejects OAuth2 connectors without explicit defaultScopes", () => {
+    expect(() =>
+      ConnectorCatalogSchema.parse({
+        version: MIN_CONNECTOR_CATALOG_VERSION,
+        connectors: [
+          {
+            id: "example-wide",
+            displayName: "Example Wide",
+            provider: "example",
+            platforms: ["web"],
+            oauthScopes: ["items.read", "items.write"],
+            auth: {
+              type: "oauth2",
+              authorizationEndpoint: "https://auth.example.test/oauth/authorize",
+              tokenEndpoint: "https://auth.example.test/oauth/token",
+              web: {
+                flow: "authorization_code_pkce",
+                clientId: "web-public-client",
+              },
+            },
+            operations: [
+              {
+                id: "list_items",
+                mutating: false,
+                requiredScope: "items.read",
+                paramsSchema: {},
+              },
+            ],
+            mcp: null,
+          },
+        ],
+        signature: "AAAA",
+      }),
+    ).toThrow(/defaultScopes/);
+  });
+
+  it("rejects direct web PKCE connectors because the web token store has no refresh-token path", () => {
+    expect(() =>
+      ConnectorCatalogSchema.parse({
+        version: MIN_CONNECTOR_CATALOG_VERSION,
+        connectors: [
+          {
+            id: "example-direct-web",
+            displayName: "Example Direct Web",
+            provider: "example",
+            platforms: ["web"],
+            oauthScopes: ["items.read"],
+            auth: {
+              type: "oauth2",
+              tokenExchange: "client",
+              authorizationEndpoint: "https://auth.example.test/oauth/authorize",
+              tokenEndpoint: "https://auth.example.test/oauth/token",
+              defaultScopes: ["items.read"],
+              web: {
+                flow: "authorization_code_pkce",
+                clientId: "web-public-client",
+              },
+            },
+            operations: [
+              {
+                id: "list_items",
+                mutating: false,
+                requiredScope: "items.read",
+                paramsSchema: {},
+              },
+            ],
+            mcp: null,
+          },
+        ],
+        signature: "AAAA",
+      }),
+    ).toThrow(/web authorization_code_pkce requires server tokenExchange/);
+  });
+
+  it("rejects google_gis web flow on non-Google providers", () => {
+    expect(() =>
+      ConnectorCatalogSchema.parse({
+        version: MIN_CONNECTOR_CATALOG_VERSION,
+        connectors: [
+          {
+            id: "example-gis",
+            displayName: "Example GIS",
+            provider: "example",
+            platforms: ["web"],
+            oauthScopes: ["items.read"],
+            auth: {
+              type: "oauth2",
+              tokenExchange: "client",
+              defaultScopes: ["items.read"],
+              web: {
+                flow: "google_gis",
+                clientId: "not-a-google-client",
+              },
+            },
+            operations: [
+              {
+                id: "list_items",
+                mutating: false,
+                requiredScope: "items.read",
+                paramsSchema: {},
+              },
+            ],
+            mcp: null,
+          },
+        ],
+        signature: "AAAA",
+      }),
+    ).toThrow(/google_gis web flow requires provider google/);
+  });
+
+  it("accepts a confidential-client connector whose OAuth token exchange is brokered by the server", () => {
+    const parsed = ConnectorCatalogSchema.parse({
+      version: MIN_CONNECTOR_CATALOG_VERSION,
+      connectors: [
+        {
+          id: "example-mail",
+          displayName: "Example Mail",
+          provider: "example",
+          platforms: ["web", "ios", "android"],
+          oauthScopes: ["mail.read"],
+          auth: {
+            type: "oauth2",
+            tokenExchange: "server",
+            clientSecretEnv: "EXAMPLE_MAIL_CLIENT_SECRET",
+            authorizationEndpoint: "https://auth.example.test/oauth/authorize",
+            tokenEndpoint: "https://auth.example.test/oauth/token",
+            revocationEndpoint: "https://auth.example.test/oauth/revoke",
+            defaultScopes: ["mail.read"],
+            web: {
+              flow: "authorization_code_pkce",
+              clientId: "web-public-client",
+            },
+            ios: {
+              flow: "authorization_code_pkce",
+              clientId: "ios-public-client",
+            },
+            android: {
+              flow: "authorization_code_pkce",
+              clientId: "android-public-client",
+            },
+          },
+          operations: [
+            {
+              id: "list_mail",
+              mutating: false,
+              requiredScope: "mail.read",
+              paramsSchema: {},
+              http: {
+                method: "GET",
+                url: "https://api.example.test/v1/messages",
+              },
+            },
+          ],
+          mcp: null,
+        },
+      ],
+      signature: "AAAA",
+    });
+
+    expect(parsed.connectors[0]?.auth).toMatchObject({
+      tokenExchange: "server",
+      clientSecretEnv: "EXAMPLE_MAIL_CLIENT_SECRET",
+    });
+  });
+
+  it("rejects server-brokered OAuth without a catalog-declared secret env name", () => {
+    expect(() =>
+      ConnectorCatalogSchema.parse({
+        version: MIN_CONNECTOR_CATALOG_VERSION,
+        connectors: [
+          {
+            id: "bad-mail",
+            displayName: "Bad Mail",
+            provider: "example",
+            platforms: ["web"],
+            oauthScopes: ["mail.read"],
+            auth: {
+              type: "oauth2",
+              tokenExchange: "server",
+              authorizationEndpoint: "https://auth.example.test/oauth/authorize",
+              tokenEndpoint: "https://auth.example.test/oauth/token",
+              defaultScopes: ["mail.read"],
+              web: {
+                flow: "authorization_code_pkce",
+                clientId: "web-public-client",
+              },
+            },
+            operations: [
+              {
+                id: "list_mail",
+                mutating: false,
+                requiredScope: "mail.read",
+                paramsSchema: {},
+              },
+            ],
+            mcp: null,
+          },
+        ],
+        signature: "AAAA",
+      }),
+    ).toThrow(/clientSecretEnv/);
+  });
 });
 
 describe("connector catalog schema", () => {

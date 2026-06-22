@@ -9,6 +9,13 @@ const CONJUNCTIONS: readonly string[] = ['and', 'but', 'so', 'because', 'which']
  * Sentence boundaries: runs of `.!?` optionally followed by whitespace.
  * Keeps the terminator with the preceding sentence via a capture group.
  */
+// Stryker disable next-line Regex: equivalent — dropping the `+` (`[.!?]+` ->
+// `[.!?]`) only changes how a RUN of consecutive terminators is partitioned:
+// the run still attaches its first char to the preceding sentence, and the
+// extra chars become terminator-only segments of <=1 word that countWords never
+// flags (<= MAX_WORDS). The content, word count and boundaries of every segment
+// that can produce a suggestion are byte-identical, so detectSentenceLength's
+// output is unchanged (verified by a 200k-input fuzz: zero output differences).
 const SENTENCE_SPLIT = /([.!?]+)/g;
 
 interface Sentence {
@@ -25,13 +32,31 @@ function splitSentences(text: string): Sentence[] {
   while ((m = SENTENCE_SPLIT.exec(text)) !== null) {
     const end = m.index + m[0].length;
     const segment = text.slice(cursor, end);
+    // Stryker disable next-line ConditionalExpression,EqualityOperator,MethodExpression: equivalent —
+    // inside this loop `segment` is text.slice(cursor, end) where `end` ends with
+    // the captured terminator run `[.!?]+`, so segment always ends in a '.', '!'
+    // or '?'. A terminator is not whitespace, so segment.trim() is non-empty and
+    // its length is always >= 1: the guard is invariably true here. `> 0` ->
+    // `>= 0` and dropping the `.trim()` cannot change that (segment.length >= 1
+    // too), so all three mutants are inert (proven over a 300k-input fuzz).
     if (segment.trim().length > 0) {
       out.push({ start: cursor, end, text: segment });
     }
     cursor = end;
   }
+  // Stryker disable next-line ConditionalExpression,EqualityOperator: equivalent —
+  // `cursor` never exceeds text.length, so the only mutated case is cursor ===
+  // text.length, where forcing the guard true (or `<` -> `<=`) makes
+  // text.slice(cursor) === '': the inner length guard below then rejects it, so
+  // nothing extra is pushed and the output is unchanged.
   if (cursor < text.length) {
     const segment = text.slice(cursor);
+    // Stryker disable next-line ConditionalExpression,EqualityOperator,MethodExpression: equivalent —
+    // a trailing segment that is empty or whitespace-only has countWords === 0
+    // (<= MAX_WORDS), so detectSentenceLength never emits a suggestion for it.
+    // Forcing this guard true, relaxing `> 0` -> `>= 0`, or dropping the
+    // `.trim()` only ever pushes such a 0-word segment, which produces no
+    // output change (verified by the full-detect fuzz).
     if (segment.trim().length > 0) {
       out.push({ start: cursor, end: text.length, text: segment });
     }
@@ -41,6 +66,15 @@ function splitSentences(text: string): Sentence[] {
 
 function countWords(segment: string): number {
   const trimmed = segment.trim();
+  // Stryker disable next-line ConditionalExpression: equivalent — forcing this
+  // guard false makes countWords('') return ''.split(/\s+/).length === 1 instead
+  // of 0. The only caller that can pass an empty/whitespace string is
+  // findSplitPoint's `leftText` for a conjunction at the very START of a segment,
+  // whose true distance from the midpoint is already the LARGEST of any
+  // conjunction; nudging that distance from `mid` to `mid - 1` can never make it
+  // win over a more central conjunction (|a-b| < a+b for positive clause sizes),
+  // so the chosen split point — and thus every emitted suggestion — is unchanged
+  // (proven algebraically and by a 400k-input full-detect fuzz).
   if (trimmed.length === 0) return 0;
   return trimmed.split(/\s+/).length;
 }

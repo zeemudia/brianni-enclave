@@ -92,6 +92,7 @@ interface ConnectorOperationShape {
   maxResults?: number;
   windowParams?: { start: string; end: string };
   maxResultsParam?: string;
+  eventTimeRange?: { start: string; end: string };
   paramsSchema?: Record<string, unknown>;
 }
 
@@ -159,8 +160,9 @@ export type ConnectorAdmissionResult =
  *     → CONNECTOR_NOT_IN_SCOPE
  *  5. Connector not in connectedConnectors with status === "connected"
  *     → CONNECTOR_NOT_CONNECTED
- *  6. §12 read ceilings (connector.read only, fail-closed)
- *  7. §5.2 #5 scope check — coarse flat-match; non-matching ≡ inconclusive
+ *  6. Signed-catalog required params → CONNECTOR_REQUIRED_PARAMS_MISSING
+ *  7. §12 read ceilings (connector.read only, fail-closed)
+ *  8. §5.2 #5 scope check — coarse flat-match; non-matching ≡ inconclusive
  *     (NEVER a hard reject)
  */
 export function admitConnectorInvocation(
@@ -227,6 +229,12 @@ export function admitConnectorInvocation(
     return { ok: false, reason: "CONNECTOR_NOT_CONNECTED" };
   }
 
+  const params = ctx.params ?? {};
+  const requiredResult = enforceRequiredParams(op, params);
+  if (!requiredResult.ok) {
+    return requiredResult;
+  }
+
   // §12 read ceilings — fail-closed at THIS function, connector.read only.
   // Fail-closed is enforced HERE, not pushed onto every caller: an absent
   // `params` is treated as the empty object `{}`, so a ceiling-declaring op
@@ -237,9 +245,22 @@ export function admitConnectorInvocation(
   // dispatch tier that forgets to pre-parse) that omits params entirely. An op
   // that declares NO ceiling still admits — enforceReadCeilings is a no-op then.
   if (tool === "connector.read") {
-    const ceilResult = enforceReadCeilings(op, ctx.params ?? {});
+    const ceilResult = enforceReadCeilings(op, params);
     if (!ceilResult.ok) {
       return ceilResult;
+    }
+  }
+
+  // §12 write-time validation — for a mutating op, an unexecutable event-time
+  // (e.g. "tomorrow morning" or an impossible date) is rejected HERE, before the
+  // caller (dispatch) touches the per-turn mutation budget or the destructive-
+  // sequence lock — so a malformed planner write neither consumes a turn attempt
+  // nor poisons a later valid write. Connector.act only; reads use the window
+  // ceiling above.
+  if (tool === "connector.act") {
+    const timeResult = enforceEventTimeRange(op, params);
+    if (!timeResult.ok) {
+      return timeResult;
     }
   }
 
@@ -265,17 +286,41 @@ function isConnected(
   return entry?.status === "connected";
 }
 
-/**
- * The subset of ISO-8601 that ECMA-262 MANDATES `Date.parse` to accept
- * deterministically (the "Date Time String Format"): a date, optionally followed
- * by a time and an optional `Z` / `±HH:MM` offset. Window bounds are matched
- * against this BEFORE `Date.parse` so enforcement is stable across V8 versions —
- * non-ISO inputs (e.g. "June 1, 2026", RFC-2822) are implementation-defined for
- * `Date.parse` and could be silently clamped today and rejected tomorrow. Generic
- * (operates on the catalog-NAMED window keys); names no connector/param (C1).
- */
-const ISO_8601_DATE_OR_DATETIME =
-  /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})?)?$/;
+// Read WINDOW bounds (timeMin/timeMax) and write event-times are validated with
+// the STRICT date-time checker (isStrictIsoDateTime, below): the `T` time
+// component is REQUIRED (a bare YYYY-MM-DD window is unbindable / provider-
+// invalid) and the calendar components must be REAL — so an impossible value
+// ("2026-02-31T10:00:00Z") fails closed at the gate rather than being silently
+// rolled over by Date.parse and forwarded to the provider. Generic over the
+// catalog-NAMED keys; names no connector/param (C1).
+
+function enforceRequiredParams(
+  op: ConnectorOperationShape,
+  params: Record<string, unknown>,
+): ConnectorAdmissionResult {
+  const schema = op.paramsSchema ?? {};
+  for (const [key, descriptor] of Object.entries(schema)) {
+    if (!isRequiredParamDescriptor(descriptor)) continue;
+    const value = params[key];
+    if (
+      value === undefined ||
+      value === null ||
+      (typeof value === "string" && value.trim() === "")
+    ) {
+      return { ok: false, reason: "CONNECTOR_REQUIRED_PARAMS_MISSING" };
+    }
+  }
+  return { ok: true };
+}
+
+function isRequiredParamDescriptor(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { required?: unknown }).required === true
+  );
+}
 
 /**
  * §12 read-ceiling enforcement. Fail-closed, with a REQUIRED-vs-INVALID split so
@@ -317,14 +362,15 @@ function enforceReadCeilings(
     if (typeof startRaw !== "string" || typeof endRaw !== "string") {
       return { ok: false, reason: "CONNECTOR_READ_WINDOW_INVALID" };
     }
-    // Present but NON-ISO → INVALID, deterministically. Reject anything outside the
-    // ECMA-mandated ISO grammar before Date.parse, so a non-ISO-but-V8-parseable
-    // string ("June 1, 2026") can't be leniently clamped on one Node version and
-    // NaN-rejected on another.
-    if (
-      !ISO_8601_DATE_OR_DATETIME.test(startRaw) ||
-      !ISO_8601_DATE_OR_DATETIME.test(endRaw)
-    ) {
+    // Present but NOT a STRICT date-time → INVALID, deterministically. Requires
+    // the `T` time component (rejects a bare YYYY-MM-DD, which is unbindable /
+    // provider-invalid) AND real calendar components — so an impossible date like
+    // "2026-02-31T10:00:00Z" is rejected here rather than silently rolled over by
+    // Date.parse (Node clamps it to Mar 3) and forwarded to the provider. Also
+    // rejects anything outside the ISO grammar before Date.parse, so a non-ISO-
+    // but-V8-parseable string ("June 1, 2026") can't be leniently clamped on one
+    // Node version and NaN-rejected on another.
+    if (!isStrictIsoDateTime(startRaw) || !isStrictIsoDateTime(endRaw)) {
       return { ok: false, reason: "CONNECTOR_READ_WINDOW_INVALID" };
     }
     const startMs = Date.parse(startRaw);
@@ -373,6 +419,126 @@ function enforceReadCeilings(
     }
   }
 
+  return { ok: true };
+}
+
+// ── Event-time (write) param validation ───────────────────────────────────────
+// STRICT (real calendar components, not just shape) so an unexecutable write
+// value — "tomorrow morning", an impossible date like 2026-02-31 — is rejected at
+// admission BEFORE the mutation budget / destructive-sequence accounting, rather
+// than consuming a turn attempt and only failing in the client adapter / at the
+// provider after the user already confirmed. Generic over the catalog-NAMED
+// `eventTimeParams` keys; names no connector/operation (C1).
+
+function isRealCalendarYmd(year: number, month: number, day: number): boolean {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  return (
+    dt.getUTCFullYear() === year &&
+    dt.getUTCMonth() === month - 1 &&
+    dt.getUTCDate() === day
+  );
+}
+
+function isStrictIsoDate(value: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  return m !== null && isRealCalendarYmd(Number(m[1]), Number(m[2]), Number(m[3]));
+}
+
+function isStrictIsoDateTime(value: string): boolean {
+  const m =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|([+-])(\d{2}):(\d{2}))?$/.exec(
+      value,
+    );
+  if (m === null) return false;
+  const [, y, mo, d, h, mi, se, , , offH, offM] = m;
+  if (!isRealCalendarYmd(Number(y), Number(mo), Number(d))) return false;
+  if (Number(h) > 23 || Number(mi) > 59) return false;
+  if (se !== undefined && Number(se) > 59) return false;
+  if (offH !== undefined && (Number(offH) > 23 || Number(offM) > 59)) return false;
+  return true;
+}
+
+/** A calendar event-time value: a timed datetime or an all-day date, as a string
+ * or a `{ dateTime }` / `{ date }` object. STRICT components. */
+function isValidEventTimeValue(value: unknown): boolean {
+  if (typeof value === "string") {
+    return isStrictIsoDate(value) || isStrictIsoDateTime(value);
+  }
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    const o = value as Record<string, unknown>;
+    if (typeof o.dateTime === "string") return isStrictIsoDateTime(o.dateTime);
+    if (typeof o.date === "string") return isStrictIsoDate(o.date);
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Map an event-time value to a comparable epoch-ms for ORDER checks. Offset-less
+ * local values are compared as if UTC — both bounds of one event share the user's
+ * zone, so the SAME offset cancels and the relative order is preserved. Returns
+ * NaN for an unparseable value (its validity is gated separately).
+ */
+function eventTimeComparableMs(value: unknown): number {
+  let s: string | undefined;
+  if (typeof value === "string") s = value;
+  else if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    const o = value as Record<string, unknown>;
+    if (typeof o.dateTime === "string") s = o.dateTime;
+    else if (typeof o.date === "string") s = o.date;
+  }
+  if (s === undefined) return NaN;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return Date.parse(`${s}T00:00:00Z`);
+  // Offset-less local → compare as UTC (same-zone offset cancels in the order).
+  if (!/(Z|[+-]\d{2}:\d{2})$/.test(s)) return Date.parse(`${s}Z`);
+  return Date.parse(s);
+}
+
+/**
+ * Reject a mutating op whose catalog-declared `eventTimeRange` carries a present-
+ * but-unexecutable bound, OR an inverted/zero-length range, BEFORE budget/
+ * destructive accounting. Absent bounds are left to the required-param gate; the
+ * order check fires only when BOTH bounds are present (a partial update may set
+ * just one).
+ */
+function enforceEventTimeRange(
+  op: ConnectorOperationShape,
+  params: Record<string, unknown>,
+): ConnectorAdmissionResult {
+  const range = op.eventTimeRange;
+  if (!range) return { ok: true };
+  // PRESENCE is own-property presence, NOT non-null: a key explicitly PRESENT with
+  // a null (or otherwise garbage) value is present-but-INVALID, not "absent". A
+  // bare `{ start: null, end: null }` must therefore be REJECTED here — not slip
+  // through as "neither bound" and consume mutation budget / arm the destructive
+  // lock before the client adapter rejects it.
+  const startPresent = Object.prototype.hasOwnProperty.call(params, range.start);
+  const endPresent = Object.prototype.hasOwnProperty.call(params, range.end);
+  const startVal = params[range.start];
+  const endVal = params[range.end];
+  if (startPresent && !isValidEventTimeValue(startVal)) {
+    return { ok: false, reason: "CONNECTOR_PARAM_DATETIME_INVALID" };
+  }
+  if (endPresent && !isValidEventTimeValue(endVal)) {
+    return { ok: false, reason: "CONNECTOR_PARAM_DATETIME_INVALID" };
+  }
+  // BOTH-or-NEITHER: changing exactly one bound is rejected. A PATCH combines the
+  // supplied bound with the event's EXISTING other bound (which we cannot see at
+  // admission without a fetch), so a single-bound move could silently invert the
+  // effective range. Requiring the pair makes end>start verifiable up front —
+  // the planner read the event, so it has both bounds.
+  if (startPresent !== endPresent) {
+    return { ok: false, reason: "CONNECTOR_PARAM_DATETIME_INVALID" };
+  }
+  // Order: end MUST be strictly after start when both are present.
+  if (startPresent && endPresent) {
+    const startMs = eventTimeComparableMs(startVal);
+    const endMs = eventTimeComparableMs(endVal);
+    if (Number.isFinite(startMs) && Number.isFinite(endMs) && endMs <= startMs) {
+      return { ok: false, reason: "CONNECTOR_PARAM_DATETIME_INVALID" };
+    }
+  }
   return { ok: true };
 }
 

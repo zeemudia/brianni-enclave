@@ -55,6 +55,45 @@ describe("buildMaskPreview — interactive outbound preview model", () => {
     ).toBe(true);
   });
 
+  it("does not emit empty plain segments when an identifier starts the text", () => {
+    const { segments, maskedCount, keptCount } = buildMaskPreview(
+      "a@b.com is best",
+      new Set(),
+    );
+
+    expect(segments).toEqual([
+      { kind: "masked", token: "[EMAIL_1]", original: "a@b.com" },
+      { kind: "plain", text: " is best" },
+    ]);
+    expect(maskedCount).toBe(1);
+    expect(keptCount).toBe(0);
+  });
+
+  it("does not emit empty trailing plain segments when an identifier ends the text", () => {
+    const { segments, maskedCount, keptCount } = buildMaskPreview(
+      "send to a@b.com",
+      new Set(),
+    );
+
+    expect(segments).toEqual([
+      { kind: "plain", text: "send to " },
+      { kind: "masked", token: "[EMAIL_1]", original: "a@b.com" },
+    ]);
+    expect(maskedCount).toBe(1);
+    expect(keptCount).toBe(0);
+  });
+
+  it("uses kept segments at text boundaries without changing the counters", () => {
+    const { segments, maskedCount, keptCount } = buildMaskPreview(
+      "a@b.com",
+      new Set(["a@b.com"]),
+    );
+
+    expect(segments).toEqual([{ kind: "kept", original: "a@b.com" }]);
+    expect(maskedCount).toBe(0);
+    expect(keptCount).toBe(1);
+  });
+
   it("is reconstructible: joining display text round-trips to the masked output, joining originals round-trips to the source", () => {
     const text = "Email me at a@b.com please";
     const { segments } = buildMaskPreview(text, new Set());

@@ -17,7 +17,20 @@ const catalog = [
     oauthScopes: ["https://www.googleapis.com/auth/calendar.events"],
     operations: [
       { id: "list_events", mutating: false, destructive: false, binary: false, requiredScope: "calendar.readonly", maxWindowDays: 370, maxResults: 250, windowParams: { start: "timeMin", end: "timeMax" }, maxResultsParam: "maxResults", paramsSchema: {} },
-      { id: "create_event", mutating: true, destructive: false, binary: false, requiredScope: "calendar.events", paramsSchema: {} },
+      {
+        id: "create_event",
+        mutating: true,
+        destructive: false,
+        binary: false,
+        requiredScope: "calendar.events",
+        eventTimeRange: { start: "start", end: "end" },
+        paramsSchema: {
+          calendarId: { type: "string", required: true },
+          summary: { type: "string", required: true },
+          start: { type: "string", required: true },
+          end: { type: "string", required: true },
+        },
+      },
       { id: "download_attachment", mutating: false, destructive: false, binary: true, requiredScope: "calendar.readonly", paramsSchema: {} },
     ],
     mcp: null,
@@ -31,6 +44,12 @@ const baseCtx = {
     { connectorId: "google-calendar", displayName: "[C_1]", status: "connected", grantedScopes: ["calendar.readonly", "calendar.events"] },
   ],
   boundConnectorIds: ["google-calendar"],
+};
+const createParams = {
+  calendarId: "primary",
+  summary: "Lunch",
+  start: "2026-07-01T09:00:00Z",
+  end: "2026-07-01T09:30:00Z",
 };
 
 describe("connector admission (spec §5.2)", () => {
@@ -68,9 +87,79 @@ describe("connector admission (spec §5.2)", () => {
 
   it("treats a non-flat-matching grant as INCONCLUSIVE, never a hard reject (check 5, Finding-3)", () => {
     const dialect = { ...baseCtx, connectedConnectors: [{ ...baseCtx.connectedConnectors[0], grantedScopes: ["Calendars.ReadWrite"] }] };
-    const result = admitConnectorInvocation({ ...dialect, tool: "connector.act", connectorId: "google-calendar", operation: "create_event" });
+    const result = admitConnectorInvocation({
+      ...dialect,
+      tool: "connector.act",
+      connectorId: "google-calendar",
+      operation: "create_event",
+      params: createParams,
+    });
     expect(result.ok).toBe(true);
     expect(result.scopeCheck).toBe("inconclusive");
+  });
+
+  it("rejects a mutating invocation missing signed-catalog required params", () => {
+    const result = admitConnectorInvocation({
+      ...baseCtx,
+      tool: "connector.act",
+      connectorId: "google-calendar",
+      operation: "create_event",
+      params: {
+        start: "2026-07-01T09:00:00Z",
+        end: "2026-07-01T09:30:00Z",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("CONNECTOR_REQUIRED_PARAMS_MISSING");
+  });
+
+  it("rejects a mutating write whose eventTimeParams value is unexecutable, BEFORE budget (CONNECTOR_PARAM_DATETIME_INVALID)", () => {
+    for (const badStart of [
+      "tomorrow morning", // natural language
+      "2026-02-31T09:00:00Z", // impossible date
+      "2026-07-01T25:00:00Z", // impossible time
+    ]) {
+      const result = admitConnectorInvocation({
+        ...baseCtx,
+        tool: "connector.act",
+        connectorId: "google-calendar",
+        operation: "create_event",
+        params: { ...createParams, start: badStart },
+      });
+      expect(result.ok, `start=${badStart}`).toBe(false);
+      expect(result.reason).toBe("CONNECTOR_PARAM_DATETIME_INVALID");
+    }
+  });
+
+  it("admits a write whose eventTimeRange bounds are valid (offset-less local accepted; client binds the zone)", () => {
+    const result = admitConnectorInvocation({
+      ...baseCtx,
+      tool: "connector.act",
+      connectorId: "google-calendar",
+      operation: "create_event",
+      // Offset-less local datetime — valid at the gate; the client adapter binds
+      // the user's IANA zone before the provider call.
+      params: { ...createParams, start: "2026-07-01T09:00:00", end: "2026-07-01T10:00:00" },
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects an inverted / zero-length write range BEFORE budget (end ≤ start → CONNECTOR_PARAM_DATETIME_INVALID)", () => {
+    for (const [start, end] of [
+      ["2026-07-01T15:00:00Z", "2026-07-01T14:00:00Z"], // inverted
+      ["2026-07-01T09:00:00Z", "2026-07-01T09:00:00Z"], // zero-length
+      ["2026-07-01T15:00:00", "2026-07-01T14:00:00"], // inverted offset-less local
+    ]) {
+      const result = admitConnectorInvocation({
+        ...baseCtx,
+        tool: "connector.act",
+        connectorId: "google-calendar",
+        operation: "create_event",
+        params: { ...createParams, start, end },
+      });
+      expect(result.ok, `${start}..${end}`).toBe(false);
+      expect(result.reason).toBe("CONNECTOR_PARAM_DATETIME_INVALID");
+    }
   });
 
   it("admits connector.list — read-only discovery, no operation lookup (Finding-8)", () => {
@@ -192,6 +281,30 @@ describe("connector admission (spec §5.2)", () => {
     const result = admitConnectorInvocation({
       ...baseCtx, tool: "connector.read", connectorId: "google-calendar", operation: "list_events",
       params: { timeMin: "June 1, 2026", timeMax: "June 8, 2026", maxResults: 50 },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("CONNECTOR_READ_WINDOW_INVALID");
+  });
+
+  it("rejects an IMPOSSIBLE read-window date (strict components, not a Date.parse rollover) as INVALID", () => {
+    // "2026-02-31T..." is shape-valid but not a real date; Node's Date.parse
+    // silently rolls it over to Mar 3 — so without strict component validation it
+    // would reach Google as a provider-invalid window. Must fail closed here.
+    const result = admitConnectorInvocation({
+      ...baseCtx, tool: "connector.read", connectorId: "google-calendar", operation: "list_events",
+      params: { timeMin: "2026-02-31T10:00:00Z", timeMax: "2026-03-05T10:00:00Z", maxResults: 50 },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("CONNECTOR_READ_WINDOW_INVALID");
+  });
+
+  it("rejects a bare date-only (YYYY-MM-DD) window bound as INVALID (must be a date-time)", () => {
+    // A date-only bound is rejected by Google Calendar timeMin/timeMax/freeBusy
+    // AND cannot be bound to an unambiguous instant — it must fail closed at the
+    // gate, not reach the provider as an unbound/over-broad window.
+    const result = admitConnectorInvocation({
+      ...baseCtx, tool: "connector.read", connectorId: "google-calendar", operation: "list_events",
+      params: { timeMin: "2026-07-01", timeMax: "2026-07-02", maxResults: 50 },
     });
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("CONNECTOR_READ_WINDOW_INVALID");

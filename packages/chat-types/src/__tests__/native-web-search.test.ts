@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  annotateNativeWebSearchError,
+  getAnnotatedNativeWebSearchCapabilityRejectionReason,
+  getAnnotatedNativeWebSearchFallbackReason,
   getNativeWebSearchCapabilityRejectionReason,
   getNativeWebSearchPreOutputFallbackReason,
   ModelCapabilitySchema,
@@ -123,8 +126,124 @@ describe("native web search chat contracts", () => {
       getNativeWebSearchPreOutputFallbackReason({
         providerId: "anthropic",
         status: 403,
-        message: "forbidden",
+      message: "forbidden",
+    }),
+    ).toBeNull();
+  });
+
+  it("classifies provider-specific capability rejection wording", () => {
+    expect(
+      getNativeWebSearchCapabilityRejectionReason({
+        providerId: "openai",
+        status: 400,
+        message: "Unknown parameter: tools[0].search",
+      }),
+    ).toBe("web-search-tool-parameter-rejected");
+    expect(
+      getNativeWebSearchCapabilityRejectionReason({
+        providerId: "anthropic",
+        status: 400,
+        message: "Organization must enable web search before this tool can run",
+      }),
+    ).toBe("web-search-tool-rejected");
+    expect(
+      getNativeWebSearchCapabilityRejectionReason({
+        providerId: "google",
+        status: 400,
+        message: "GoogleSearch grounding tool is not supported",
+      }),
+    ).toBe("web-search-tool-rejected");
+    expect(
+      getNativeWebSearchCapabilityRejectionReason({
+        providerId: "unknown-provider",
+        status: 400,
+        message: "web_search tool rejected",
+      }),
+    ).toBe("web-search-tool-rejected");
+  });
+
+  it("does not classify empty, unrelated, auth, or quota errors as web-search capability failures", () => {
+    expect(
+      getNativeWebSearchCapabilityRejectionReason({
+        providerId: "openai",
+        status: 400,
+        message: "",
       }),
     ).toBeNull();
+    expect(
+      getNativeWebSearchCapabilityRejectionReason({
+        providerId: "google",
+        status: 400,
+        message: "safety settings rejected the prompt",
+      }),
+    ).toBeNull();
+    expect(
+      getNativeWebSearchCapabilityRejectionReason({
+        providerId: "openai",
+        status: 401,
+        message: "web_search tool unauthorized",
+      }),
+    ).toBeNull();
+    expect(
+      getNativeWebSearchCapabilityRejectionReason({
+        providerId: "anthropic",
+        message: "429 web_search quota exceeded",
+      }),
+    ).toBeNull();
+  });
+
+  it("derives fallback reasons from status codes embedded in Error messages and network wording", () => {
+    expect(
+      getNativeWebSearchPreOutputFallbackReason({
+        providerId: "google",
+        error: new Error("upstream returned 425 before output"),
+      }),
+    ).toBe("native-search-preoutput-failure");
+    expect(
+      getNativeWebSearchPreOutputFallbackReason({
+        providerId: "openai",
+        error: new Error("502 fetch failed: socket hang up"),
+      }),
+    ).toBe("native-search-preoutput-failure");
+    expect(
+      getNativeWebSearchPreOutputFallbackReason({
+        providerId: "anthropic",
+        error: "network timeout",
+      }),
+    ).toBe("native-search-preoutput-failure");
+    expect(
+      getNativeWebSearchPreOutputFallbackReason({
+        providerId: "openai",
+        status: 302,
+        message: "temporary redirect",
+      }),
+    ).toBeNull();
+  });
+
+  it("annotates errors with non-enumerable capability and fallback metadata", () => {
+    const error = annotateNativeWebSearchError(new Error("web_search tool not supported"), {
+      providerId: "openai",
+      status: 400,
+      message: "web_search tool not supported",
+    });
+
+    expect(getAnnotatedNativeWebSearchCapabilityRejectionReason("openai", error)).toBe(
+      "web-search-tool-rejected",
+    );
+    expect(getAnnotatedNativeWebSearchFallbackReason("openai", error)).toBe(
+      "web-search-tool-rejected",
+    );
+    expect(Object.keys(error)).not.toContain("nativeWebSearchFallbackReason");
+    expect(Object.keys(error)).not.toContain("nativeWebSearchCapabilityRejectionReason");
+    expect(Object.keys(error)).not.toContain("status");
+  });
+
+  it("falls back to classifying unannotated errors through their message and status", () => {
+    const error = Object.assign(new Error("503 service unavailable"), { status: 503 });
+
+    expect(getAnnotatedNativeWebSearchFallbackReason("openai", error)).toBe(
+      "native-search-preoutput-failure",
+    );
+    expect(getAnnotatedNativeWebSearchCapabilityRejectionReason("openai", error)).toBeNull();
   });
 });

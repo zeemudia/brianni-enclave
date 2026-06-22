@@ -1850,11 +1850,12 @@ export class EnclaveRouter {
           // orchestrator are the paid upgrades. Narrowing the pack here is the
           // single authoritative gate — the model's advertised tools and the
           // gateway's per-dispatch enforcement both read pack.toolScopes.
+          const resolvedPack: SkillPack = getEffectiveSkillPack(
+            outerPackId,
+            this.skillPromptResolver ?? undefined,
+          );
           const pack: SkillPack = scopePackToPlan(
-            getEffectiveSkillPack(
-              outerPackId,
-              this.skillPromptResolver ?? undefined,
-            ),
+            resolvedPack,
             subscriptionPlanId,
           );
 
@@ -1885,6 +1886,7 @@ export class EnclaveRouter {
             connectedConnectors?: unknown;
             connectorModeEchoes?: unknown;
             connectorTurnBudgetOverride?: unknown;
+            localTime?: unknown;
             // Inner skillPack is retained on the wire for back-compat
             // with older clients but the enclave IGNORES its prompt
             // content + scopes. If present, its `id` must match the
@@ -1978,6 +1980,7 @@ export class EnclaveRouter {
             connectedConnectors: body.connectedConnectors,
             connectorModeEchoes: body.connectorModeEchoes,
             connectorTurnBudgetOverride: body.connectorTurnBudgetOverride,
+            localTime: body.localTime,
           });
           const runMode =
             body.runMode === "orchestrator" ? "orchestrator" : "single";
@@ -2749,6 +2752,8 @@ export class EnclaveRouter {
                         ? FREE_AGENT_MAX_TOOL_CALLS
                         : undefined,
                     requestContext: maskedRequestContext.requestContext,
+                    subscriptionPlanId,
+                    fullSkillToolScopes: resolvedPack.toolScopes,
                     awaitBinaryWriteAck: (payload) => {
                       const key = invocationKey(
                         sessionId!,

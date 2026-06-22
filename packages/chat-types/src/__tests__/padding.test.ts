@@ -17,6 +17,8 @@ import { describe, it, expect } from 'vitest';
 import {
   PADDING_BUCKETS,
   MAX_PADDED_PAYLOAD,
+  PADDING_HEADER,
+  PADDING_HEADER_V1,
   PaddedFrameEncoder,
   PaddedFrameDecoder,
 } from '../padding';
@@ -276,6 +278,23 @@ describe('PaddedFrameDecoder — request framing (bucket mode)', () => {
   });
 });
 
+describe('PaddedFrameDecoder — zero-arg constructor default', () => {
+  it('defaults to response mode (1 KB alignment) when constructed with no options', () => {
+    // Covers the constructor default parameter `{ mode: 'response' }`
+    // (padding.ts), which every other test bypasses by passing explicit
+    // options — leaving the default an UNTESTED path. A response frame is
+    // 1 KB-aligned; a request-mode decoder would compute a 4 KB-bucket padding
+    // length for this 21-byte payload and never emit (it would still be
+    // draining padding). So a clean single-push emit through a no-arg decoder
+    // pins that the documented client-side default is 'response'.
+    const d = new PaddedFrameDecoder();
+    const out = d.push(buildResponseFrame(A));
+    expect(out).toEqual([A]);
+    expect(d.carrySize()).toBe(0);
+    d.endOfStream();
+  });
+});
+
 describe('PaddedFrameDecoder — carrySize diagnostic', () => {
   it('reports non-zero while waiting for a partial prefix', () => {
     const d = new PaddedFrameDecoder({ mode: 'response' });
@@ -287,5 +306,58 @@ describe('PaddedFrameDecoder — carrySize diagnostic', () => {
     const d = new PaddedFrameDecoder({ mode: 'response' });
     d.push(buildResponseFrame(A));
     expect(d.carrySize()).toBe(0);
+  });
+});
+
+describe('PaddedFrameDecoder — mutation hardening (boundaries)', () => {
+  it('decoder ACCEPTS a frame whose declared length equals MAX_PADDED_PAYLOAD', () => {
+    // Kills the prefix guard `payloadLen > MAX` -> `>=`: the exact maximum is
+    // a VALID frame and must emit, not throw.
+    const payload = new Uint8Array(MAX_PADDED_PAYLOAD);
+    payload[0] = 0x7a;
+    const d = new PaddedFrameDecoder({ mode: 'request' });
+    const out = d.push(buildRequestFrame(payload));
+    d.endOfStream();
+    expect(out).toHaveLength(1);
+    expect(out[0]).toHaveLength(MAX_PADDED_PAYLOAD);
+    expect(out[0]![0]).toBe(0x7a);
+  });
+
+  it('endOfStream throws when only a partial prefix has been buffered', () => {
+    // Kills endOfStream's `kind !== 'prefix' || carry.length > 0` -> `&&`: in
+    // prefix state with leftover carry, the OR must still fail closed.
+    const d = new PaddedFrameDecoder({ mode: 'response' });
+    d.push(new Uint8Array([0, 0])); // 2 of 4 prefix bytes
+    expect(() => d.endOfStream()).toThrow(/truncated|incomplete/i);
+  });
+
+  it('encodeResponseChunk ACCEPTS a chunk whose canonical frame is exactly the 256 KB ceiling', () => {
+    // target === 262144 (the largest bucket) is valid; kills the response
+    // ceiling check `target > BUCKETS[last]` -> `>=`. len 261116 -> target
+    // (floor(261120/1024)+1)*1024 == 262144.
+    const chunk = new Uint8Array(261116);
+    const frame = PaddedFrameEncoder.encodeResponseChunk(chunk);
+    expect(frame).toHaveLength(262144);
+  });
+
+  it('pins the padded-SSE protocol header + version (transport contract)', () => {
+    expect(PADDING_HEADER).toBe('X-Calypso-Padding');
+    expect(PADDING_HEADER_V1).toBe('v1');
+  });
+
+  it('endOfStream throws when only a length-prefix arrived and the payload never did', () => {
+    // Kills endOfStream's `this.state.kind !== 'prefix' || carry.length > 0`
+    // -> dropping the `kind !== 'prefix'` operand. Here the prefix is fully
+    // consumed (carry.length === 0) but the decoder is mid-frame in 'payload'
+    // state awaiting a declared 21-byte payload that the stream never sent.
+    // With only the `carry.length > 0` half left, the guard would WRONGLY
+    // accept this truncation as a clean end of stream. The full fail-closed
+    // guard must still throw.
+    const prefixOnly = new Uint8Array(4);
+    new DataView(prefixOnly.buffer).setUint32(0, 21, false); // declares 21-byte payload
+    const d = new PaddedFrameDecoder({ mode: 'response' });
+    expect(d.push(prefixOnly)).toEqual([]); // prefix consumed, now mid-payload, carry empty
+    expect(d.carrySize()).toBe(0);
+    expect(() => d.endOfStream()).toThrow(/truncated|incomplete/i);
   });
 });

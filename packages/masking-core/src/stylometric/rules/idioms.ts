@@ -11,6 +11,10 @@ interface IdiomEntry {
 const ENTRIES: readonly IdiomEntry[] = IDIOMS_JSON as readonly IdiomEntry[];
 
 function escapeRegex(raw: string): string {
+  // Stryker disable next-line StringLiteral: equivalent — no idiom dictionary
+  // entry contains a regex metacharacter, so the replacement string is never
+  // exercised (the character class never matches) and '\\$&' -> '' is
+  // behaviourally inert.
   return raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 

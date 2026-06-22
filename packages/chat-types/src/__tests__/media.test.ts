@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  MediaHandleKindSchema,
+  MediaJobStatusSchema,
   MediaArtifactKindSchema,
+  MediaOriginSchema,
   MediaProvenanceRecordSchema,
   ProviderVisibleInputConsentSchema,
   VideoCompositionSpecSchema,
+  canonicaliseProviderVisibleConsentUnsigned,
+  canonicaliseStableJson,
 } from "../media";
 
 describe("media contracts", () => {
@@ -23,6 +28,28 @@ describe("media contracts", () => {
     });
 
     expect(parsed.origin).toBe("generated_from_private");
+  });
+
+  it("pins media enum values used across app, enclave, and renderer boundaries", () => {
+    expect(MediaHandleKindSchema.options).toEqual([
+      "text",
+      "caption",
+      "image",
+      "audio",
+      "video",
+      "font",
+      "composition",
+    ]);
+    expect(MediaOriginSchema.options).toEqual([
+      "user_private",
+      "public",
+      "generated",
+      "generated_from_private",
+      "system_template",
+    ]);
+    expect(MediaJobStatusSchema.options).toContain("waiting_for_renderer");
+    expect(MediaJobStatusSchema.options).toContain("done");
+    expect(MediaJobStatusSchema.options).toContain("error");
   });
 
   it("accepts first-pass artifact kinds", () => {
@@ -151,5 +178,123 @@ describe("media contracts", () => {
     });
 
     expect(parsed.providerId).toBe("google");
+  });
+
+  it("accepts WebAuthn provider-visible consent signatures and canonicalises unsigned payloads", () => {
+    const unsigned = {
+      consentId: "consent_01JVIDEO0000000000002",
+      planId: "plan_1",
+      subtaskId: "clip_1",
+      providerId: "google",
+      modelId: "veo-3.1-generate-preview",
+      inputHandleSetHash: "b".repeat(64),
+      enclaveNonce: "nonce_1234567890123456",
+      expiresAt: "2026-05-19T08:35:00.000Z",
+      signerKeyId: "passkey_1",
+    };
+    const parsed = ProviderVisibleInputConsentSchema.parse({
+      ...unsigned,
+      signature: {
+        type: "webauthn",
+        credentialId: "cred_1",
+        authenticatorData: "auth_data",
+        clientDataJSON: "client_json",
+        signature: "sig_b64",
+      },
+    });
+
+    expect(parsed.signature.type).toBe("webauthn");
+    expect(canonicaliseProviderVisibleConsentUnsigned(unsigned)).toBe(
+      canonicaliseStableJson({
+        consentId: "consent_01JVIDEO0000000000002",
+        enclaveNonce: "nonce_1234567890123456",
+        expiresAt: "2026-05-19T08:35:00.000Z",
+        inputHandleSetHash: "b".repeat(64),
+        modelId: "veo-3.1-generate-preview",
+        planId: "plan_1",
+        providerId: "google",
+        signerKeyId: "passkey_1",
+        subtaskId: "clip_1",
+      }),
+    );
+  });
+
+  it("sorts nested stable JSON keys without reordering arrays", () => {
+    expect(
+      canonicaliseStableJson({
+        z: 1,
+        a: [{ b: 2, a: 1 }],
+        m: { y: true, x: null },
+      }),
+    ).toBe('{"a":[{"a":1,"b":2}],"m":{"x":null,"y":true},"z":1}');
+  });
+
+  it("rejects over-broad media provenance and consent tokens", () => {
+    expect(() =>
+      MediaProvenanceRecordSchema.parse({
+        handleId: "mh_01JVIDEO000000000000000001",
+        kind: "video",
+        origin: "generated_from_private",
+        providerVisible: false,
+        sourceHandleIds: Array.from({ length: 65 }, (_, i) => `mh_source_${i}`),
+        createdBy: "core.video.remotion",
+        createdAt: "2026-05-19T08:30:00.000Z",
+        ttlSeconds: 86_401,
+        byteSize: 0,
+        sha256: "a".repeat(64),
+        signature: "sig_b64",
+      }),
+    ).toThrow();
+    expect(() =>
+      ProviderVisibleInputConsentSchema.parse({
+        consentId: "consent_1",
+        planId: "plan_1",
+        subtaskId: "clip_1",
+        providerId: "google",
+        modelId: "veo-3.1-generate-preview",
+        inputHandleSetHash: "not-hex",
+        enclaveNonce: "short",
+        expiresAt: "not-a-date",
+        signerKeyId: "device_key_1",
+        signature: { type: "device_key", signature: "" },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects composition specs with scenes beyond duration or unknown asset references", () => {
+    const validSpec = {
+      version: 1,
+      title: "Launch teaser",
+      templateId: "promo_cut",
+      format: { width: 1920, height: 1080, fps: 24, durationFrames: 240 },
+      assets: [{ id: "hero", handleId: "mh_hero", kind: "image" }],
+      scenes: [
+        {
+          id: "scene_1",
+          startFrame: 0,
+          durationFrames: 240,
+          layout: "full_bleed",
+          layers: [{ type: "asset", assetId: "hero", fit: "cover" }],
+        },
+      ],
+    };
+
+    expect(() =>
+      VideoCompositionSpecSchema.parse({
+        ...validSpec,
+        scenes: [{ ...validSpec.scenes[0], startFrame: 200, durationFrames: 80 }],
+      }),
+    ).toThrow(/scene exceeds composition duration/);
+    expect(() =>
+      VideoCompositionSpecSchema.parse({
+        ...validSpec,
+        scenes: [
+          {
+            ...validSpec.scenes[0],
+            layers: [{ type: "asset", assetId: "missing", fit: "cover" }],
+          },
+        ],
+      }),
+    ).toThrow(/unknown asset id/);
   });
 });

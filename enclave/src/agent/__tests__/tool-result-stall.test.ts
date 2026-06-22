@@ -32,7 +32,7 @@
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -52,6 +52,13 @@ import type {
 } from "@calypso/chat-types";
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+function enclaveIndexSourcePath(): string {
+  const marker = `${sep}.stryker-tmp${sep}`;
+  const sandboxIdx = here.indexOf(marker);
+  if (sandboxIdx >= 0) return join(here.slice(0, sandboxIdx), "enclave/src/index.ts");
+  return join(here, "..", "..", "index.ts");
+}
 
 function mkPack(scopes: SkillPack["toolScopes"]): SkillPack {
   return {
@@ -323,10 +330,7 @@ describe("tool-result stall watchdog (B2)", () => {
     // the builder is a closure inside handleMessage and cannot be imported,
     // so pin the production source to the contract the behavioural test
     // above replicates.
-    const indexSource = readFileSync(
-      join(here, "..", "..", "index.ts"),
-      "utf8",
-    );
+    const indexSource = readFileSync(enclaveIndexSourcePath(), "utf8");
     expect(indexSource).toContain("buildMemoryWriteAckPromise");
     expect(indexSource).toContain('reason: "MEMORY_WRITE_ACK_TIMEOUT"');
     // The timer is armed with the shared production constant ...

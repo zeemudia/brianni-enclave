@@ -492,6 +492,39 @@ describe('B4 V1 — FREE cannot enter orchestrator mode', () => {
 // ─── V2 — paid tools are OUT_OF_SCOPE for FREE ───────────────────────────────
 
 describe('B4 V2 — FREE cannot dispatch web.fetch / research.ask / media tools', () => {
+  it('FREE model prompt explains that external service connectors require PRO or MAX', async () => {
+    const { processor, transcripts } = makeScriptedProcessor([
+      ['I can draft a plan manually.'],
+    ]);
+    const router = new EnclaveRouter({
+      agentLoopProcessorFactory: () => processor,
+    });
+    const { sessionId, sessionKey, agentTurnId } = await establishSession(router);
+
+    const turn = await runAgentTurn({
+      router,
+      sessionId,
+      sessionKey,
+      agentTurnId,
+      subscriptionPlanId: 'FREE',
+      body: {
+        messages: [{ role: 'user', content: "Read tomorrow's calendar" }],
+        model: 'test-model',
+      },
+    });
+
+    expect(turn.doneCount).toBe(1);
+    expect(transcripts).toHaveLength(1);
+    const systemPrompt = transcripts[0][0];
+    expect(systemPrompt.role).toBe('system');
+    expect(systemPrompt.content).toContain(
+      'External service connectors require PRO or MAX',
+    );
+    expect(systemPrompt.content).toContain('Settings');
+    expect(systemPrompt.content).toContain('upgrade');
+    expect(systemPrompt.content).not.toContain('connector.');
+  });
+
   it('web.fetch, research.ask, and image.ocr are each rejected OUT_OF_SCOPE before ANY TOOL_INVOCATION reaches the wire', async () => {
     const { processor, transcripts } = makeScriptedProcessor([
       [toolFence('web.fetch', { url: 'https://example.com/?q=exfil' })],

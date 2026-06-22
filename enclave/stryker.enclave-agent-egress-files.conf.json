@@ -1,0 +1,21 @@
+{
+  "$schema": "../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Target-local mutation run over two pure, hermetic, high-risk agent-path boundaries NOT covered by enclave-agent-tools: tools/egress-taint.ts (content-level exfiltration guard for the agent web.fetch tool — harvests private-read plaintext, then blocks any web.fetch URL/query that reproduces it literally OR after reversing percent/base64/base64url/hex encodings; a flipped guard or off-by-one threshold lets prompt-injected private content leak through the egress URL) and tools/file-allowlist.ts (Tier-A file CONTENT-TYPE + size allowlist — extension capability gating, per-capability max-bytes cap, magic-byte / OOXML-container / iWork / google-stub / UTF-8 content checks that must FAIL CLOSED; a flipped guard admits a disallowed or spoofed-content file into the agent's read path). Both are pure (no vsock / network / DB / DOM), so they run hermetically. Report-only / not wired into the shared adjusted-gate while parallel mutation sessions are open. See docs/quality/mutation-triage/enclave-agent-egress-files.md.",
+  "testRunner": "vitest",
+  "concurrency": 4,
+  "vitest": {
+    "configFile": "vitest.mutation.enclave-agent-egress-files.config.ts",
+    "related": false
+  },
+  "mutate": [
+    "src/tools/egress-taint.ts",
+    "src/tools/file-allowlist.ts"
+  ],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/enclave-agent-egress-files.html" },
+  "jsonReporter": { "fileName": "reports/mutation/enclave-agent-egress-files.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

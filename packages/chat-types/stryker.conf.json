@@ -1,0 +1,15 @@
+{
+  "$schema": "../../node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Pattern 5 mutation run over chat-types' IMPERATIVE vsock trust-boundary logic — the padded-SSE binary-frame codec (padding.ts), the surface of the live R4 SSE-frame incident. chat-types is the single source of truth for enclave<->client message shapes. Scoped to padding.ts only; the orchestrator/schema modules are overwhelmingly declarative Zod (z.string().min/max field bodies) whose mutants are mostly equivalent noise, so they are intentionally excluded from this curated target (a future wave can add focused tests for the imperative orchestrator decode/recovery helpers). Pure package, hermetic tests. Non-blocking (thresholds.break=null). See docs/quality/mutation-testing.md.",
+  "testRunner": "vitest",
+  "concurrency": 4,
+  "vitest": { "configFile": "vitest.mutation.config.ts" },
+  "mutate": ["src/padding.ts"],
+  "coverageAnalysis": "perTest",
+  "reporters": ["html", "json", "clear-text", "progress"],
+  "htmlReporter": { "fileName": "reports/mutation/chat-types.html" },
+  "jsonReporter": { "fileName": "reports/mutation/chat-types.json" },
+  "thresholds": { "high": 85, "low": 70, "break": null },
+  "timeoutMS": 30000,
+  "tempDirName": ".stryker-tmp"
+}

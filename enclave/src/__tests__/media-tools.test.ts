@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { MediaToolRequestSchema, MediaToolsClient } from "../tools/media-tools";
+import {
+  MediaToolRequestSchema,
+  MediaToolResultSchema,
+  MediaToolsClient,
+} from "../tools/media-tools";
 
 // These tests spawn the Python media sidecar, whose start() waits for the
 // process to import its deps (Pillow/vosk) and print MEDIA_TOOLS_READY — a
@@ -118,6 +122,191 @@ with zipfile.ZipFile(io.BytesIO(data), "r") as z:
     { input: docxB64 },
   ).toString("utf8");
 }
+
+describe("MediaToolRequestSchema", () => {
+  it("pins every supported media operation and rejects unknown operations", () => {
+    for (const operation of [
+      "image.inspect",
+      "image.ocr",
+      "image.transform",
+      "audio.inspect",
+      "audio.transcribe",
+      "audio.transform",
+      "video.inspect",
+      "video.transcribe",
+      "video.transform",
+      "document.docx_transform",
+      "document.pdf_transform",
+    ]) {
+      expect(
+        MediaToolRequestSchema.parse({
+          operation,
+          filename: "fixture.bin",
+          inputB64: "AA==",
+        }).operation,
+      ).toBe(operation);
+    }
+
+    expect(() =>
+      MediaToolRequestSchema.parse({
+        operation: "image.delete",
+        filename: "fixture.png",
+        inputB64: "AA==",
+      }),
+    ).toThrow();
+  });
+
+  it("requires bounded image resize dimensions and defaults missing sides", () => {
+    expect(
+      MediaToolRequestSchema.parse({
+        operation: "image.transform",
+        filename: "image.png",
+        inputB64: "AA==",
+        transform: { kind: "resize", maxHeight: 512 },
+      }).transform,
+    ).toEqual({
+      kind: "resize",
+      maxWidth: 8192,
+      maxHeight: 512,
+      format: "png",
+    });
+
+    for (const transform of [
+      { kind: "resize" },
+      { kind: "resize", maxWidth: 0 },
+      { kind: "resize", maxHeight: 8193 },
+      { kind: "resize", maxWidth: 1.5 },
+      { kind: "resize", maxWidth: 512, format: "gif" },
+    ]) {
+      expect(() =>
+        MediaToolRequestSchema.parse({
+          operation: "image.transform",
+          filename: "image.png",
+          inputB64: "AA==",
+          transform,
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("bounds audio and video transform parameters", () => {
+    expect(
+      MediaToolRequestSchema.parse({
+        operation: "audio.transform",
+        filename: "audio.wav",
+        inputB64: "AA==",
+        transform: { kind: "extract_clip", startSeconds: 0, durationSeconds: 0.1 },
+      }).transform,
+    ).toEqual({
+      kind: "extract_clip",
+      startSeconds: 0,
+      durationSeconds: 0.1,
+      format: "wav",
+    });
+    expect(
+      MediaToolRequestSchema.parse({
+        operation: "video.transform",
+        filename: "video.mov",
+        inputB64: "AA==",
+        transform: { kind: "extract_audio" },
+      }).transform,
+    ).toEqual({ kind: "extract_audio", format: "wav" });
+
+    for (const transform of [
+      { kind: "extract_clip", startSeconds: -1, durationSeconds: 1 },
+      { kind: "extract_clip", startSeconds: 0, durationSeconds: 0.09 },
+      { kind: "extract_clip", startSeconds: 0, durationSeconds: 3600.1 },
+      { kind: "convert", format: "aac" },
+      { kind: "resize", maxWidth: 720, maxHeight: 8193 },
+      { kind: "resize", maxWidth: 720.5, maxHeight: 720 },
+      { kind: "extract_audio", format: "flac" },
+    ]) {
+      expect(() =>
+        MediaToolRequestSchema.parse({
+          operation: "video.transform",
+          filename: "media.bin",
+          inputB64: "AA==",
+          transform,
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("bounds document transform payloads and keeps PDF pages zero-indexed", () => {
+    expect(
+      MediaToolRequestSchema.parse({
+        operation: "document.docx_transform",
+        filename: "doc.docx",
+        inputB64: "AA==",
+        transform: {
+          kind: "replace_text",
+          search: "alpha",
+          replacement: "",
+          maxReplacements: 1,
+        },
+      }).transform,
+    ).toMatchObject({ kind: "replace_text", maxReplacements: 1 });
+    expect(
+      MediaToolRequestSchema.parse({
+        operation: "document.pdf_transform",
+        filename: "doc.pdf",
+        inputB64: "AA==",
+        transform: { kind: "extract_pages", pages: [0, 2] },
+      }).transform,
+    ).toEqual({ kind: "extract_pages", pages: [0, 2] });
+
+    for (const transform of [
+      { kind: "replace_text", search: "", replacement: "x", maxReplacements: 1 },
+      { kind: "replace_text", search: "x", replacement: "y", maxReplacements: 0 },
+      { kind: "append_section", heading: "", body: "body" },
+      { kind: "append_section", heading: "heading", body: "" },
+      { kind: "annotate", page: -1, text: "x", x: 0, y: 0 },
+      { kind: "annotate", page: 0.5, text: "x", x: 0, y: 0 },
+      { kind: "annotate", page: 0, text: "", x: 0, y: 0 },
+      { kind: "redact_text", search: "", maxReplacements: 1 },
+      { kind: "extract_pages", pages: [] },
+      { kind: "extract_pages", pages: [-1] },
+    ]) {
+      expect(() =>
+        MediaToolRequestSchema.parse({
+          operation: "document.pdf_transform",
+          filename: "doc.pdf",
+          inputB64: "AA==",
+          transform,
+        }),
+      ).toThrow();
+    }
+  });
+});
+
+describe("MediaToolResultSchema", () => {
+  it("defaults metadata and extraction status while validating output hashes", () => {
+    expect(
+      MediaToolResultSchema.parse({
+        contentKind: "image",
+      }),
+    ).toEqual({
+      contentKind: "image",
+      extractionStatus: "ok",
+      metadata: {},
+    });
+    expect(
+      MediaToolResultSchema.parse({
+        contentKind: "video",
+        outputSha256Hex: "a".repeat(64),
+      }).outputSha256Hex,
+    ).toBe("a".repeat(64));
+
+    for (const outputSha256Hex of ["A".repeat(64), "a".repeat(63), "z".repeat(64)]) {
+      expect(() =>
+        MediaToolResultSchema.parse({
+          contentKind: "image",
+          outputSha256Hex,
+        }),
+      ).toThrow();
+    }
+  });
+});
 
 describe("MediaToolsClient", () => {
   it("accepts image resize requests that only constrain width", () => {

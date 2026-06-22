@@ -227,6 +227,13 @@ describe("closed enclave-inbound connector channels are structurally token-free"
           mutationsPerTurn: 50,
           readsPerTurn: 200,
         }),
+        localTime: saltTokens({
+          nowIso: "2026-06-21T16:48:00.000Z",
+          localDate: "2026-06-21",
+          localTime: "17:48:00",
+          timeZone: "Europe/London",
+          utcOffsetMinutes: 60,
+        }),
       }),
     );
 
@@ -236,6 +243,13 @@ describe("closed enclave-inbound connector channels are structurally token-free"
     expect(parsed.connectorTurnBudgetOverride).toEqual({
       mutationsPerTurn: 50,
       readsPerTurn: 200,
+    });
+    expect(parsed.localTime).toEqual({
+      nowIso: "2026-06-21T16:48:00.000Z",
+      localDate: "2026-06-21",
+      localTime: "17:48:00",
+      timeZone: "Europe/London",
+      utcOffsetMinutes: 60,
     });
     // …and the WHOLE parsed tree (recursing nested arrays/objects) is token-free.
     expect(surviving(parsed)).toEqual([]);

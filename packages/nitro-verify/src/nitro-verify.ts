@@ -26,6 +26,8 @@ const AWS_NITRO_ROOT_CA_DER = (() => {
   // Subject: CN=aws.nitro-enclaves, O=Amazon, OU=AWS, C=US
   // Valid: 2019-10-28 → 2049-10-28 (30 years)
   // Algorithm: ECDSA P-384 with SHA-384
+  // Stryker disable all: Mutating pinned certificate bytes only corrupts the
+  // trust-anchor fixture during the baseline run; verifier logic remains mutable.
   const b64 =
     'MIICETCCAZagAwIBAgIRAPkxdWgbkK/hHUbMtOTn+FYwCgYIKoZIzj0EAwMwSTEL' +
     'MAkGA1UEBhMCVVMxDzANBgNVBAoMBkFtYXpvbjEMMAoGA1UECwwDQVdTMRswGQYD' +
@@ -39,6 +41,7 @@ const AWS_NITRO_ROOT_CA_DER = (() => {
     'MQCjfy+Rocm9Xue4YnwWmNJVA44fA0P5W2OpYow9OYCVRaEevL8uO1XYru5xtMPW' +
     'rfMCMQCi85sWBbJwKKXdS6BptQFuZbT73o/gBh1qUxl/nNr12UO8Yfwr6wPLb+6N' +
     'IwLz3/Y=';
+  // Stryker restore all
   return fromBase64(b64);
 })();
 
@@ -78,6 +81,38 @@ export interface NitroVerifyOptions {
  */
 export async function verifyNitroAttestation(
   attestationDocBase64: string,
+  options: NitroVerifyOptions = {},
+): Promise<NitroVerifyResult> {
+  // The production trust anchor is ALWAYS the pinned AWS Nitro Root G1. This is
+  // the only entry the package barrel (src/index.ts) exports, and it gives the
+  // caller no way to override the root — so attestation verification cannot be
+  // weakened through the public API. The trust-anchor-injectable core below is
+  // for the hermetic test suite only.
+  return verifyNitroAttestationWithTrustAnchor(
+    attestationDocBase64,
+    AWS_NITRO_ROOT_CA_DER,
+    options,
+  );
+}
+
+/**
+ * Trust-anchor-injectable verification core.
+ *
+ * ⚠️ Exported for the hermetic test suite ONLY and deliberately NOT re-exported
+ * from the package barrel (`src/index.ts`). Production consumers import
+ * `verifyNitroAttestation`, which hard-codes the pinned AWS Nitro root, so the
+ * trust anchor can never be overridden through the package's public API. This
+ * seam exists so tests can drive a synthetic-but-cryptographically-valid chain
+ * (rooted at a throwaway test CA) all the way through COSE-signature
+ * verification, PCR extraction, and result assembly — paths a real AWS-rooted
+ * document exercises but which are otherwise unreachable without live Nitro
+ * hardware (the leaf must chain to AWS's root, whose private key we do not
+ * hold). Mirrors the tests-only `verificationTimeMs` option and the enclave's
+ * own injectable-root verifier. See docs/quality/mutation-triage/nitro-verify.md.
+ */
+export async function verifyNitroAttestationWithTrustAnchor(
+  attestationDocBase64: string,
+  trustAnchorDER: Uint8Array,
   options: NitroVerifyOptions = {},
 ): Promise<NitroVerifyResult> {
   const verificationTimeMs = options.verificationTimeMs ?? Date.now();
@@ -165,7 +200,7 @@ export async function verifyNitroAttestation(
     }),
     certificate,
   ];
-  await verifyCertificateChain(certChain, verificationTimeMs);
+  await verifyCertificateChain(certChain, verificationTimeMs, trustAnchorDER);
 
   // Step 4: Verify the COSE_Sign1 signature using the leaf certificate
   await verifyCOSESignature(protectedHeader, payloadBytes, signature, certificate);
@@ -201,16 +236,17 @@ export async function verifyNitroAttestation(
  *
  * Uses SubtleCrypto for ECDSA-P384 + SHA-384 signature verification.
  */
-async function verifyCertificateChain(
+export async function verifyCertificateChain(
   certChain: Uint8Array[],
   verificationTimeMs: number,
+  trustAnchorDER: Uint8Array = AWS_NITRO_ROOT_CA_DER,
 ): Promise<void> {
   if (certChain.length === 0) {
     throw new Error('Empty certificate chain');
   }
 
-  // Start with the pinned root CA as the trust anchor
-  let issuerSPKI = extractSPKI(AWS_NITRO_ROOT_CA_DER);
+  // Start with the (pinned, by default) root CA as the trust anchor
+  let issuerSPKI = extractSPKI(trustAnchorDER);
 
   for (let i = 0; i < certChain.length; i++) {
     const certDER = certChain[i];
@@ -264,7 +300,7 @@ async function verifyCertificateChain(
  * Sig_structure = CBOR(["Signature1", protected, b"", payload])
  * Verify with ECDSA P-384 + SHA-384 using the leaf cert's public key.
  */
-async function verifyCOSESignature(
+export async function verifyCOSESignature(
   protectedHeader: Uint8Array,
   payloadBytes: Uint8Array,
   signature: Uint8Array,
@@ -311,7 +347,7 @@ async function verifyCOSESignature(
 /**
  * Parse a DER tag+length and return the content offset and length.
  */
-function parseDERTL(
+export function parseDERTL(
   data: Uint8Array,
   offset: number,
 ): { contentOffset: number; contentLength: number; totalLength: number } {
@@ -357,7 +393,7 @@ function parseDERTL(
  *     ...
  *   }
  */
-function extractSPKI(certDER: Uint8Array): Uint8Array {
+export function extractSPKI(certDER: Uint8Array): Uint8Array {
   // Outer SEQUENCE (Certificate)
   const cert = parseDERTL(certDER, 0);
   // TBSCertificate SEQUENCE
@@ -402,7 +438,7 @@ function extractSPKI(certDER: Uint8Array): Uint8Array {
  *
  *   Validity ::= SEQUENCE { notBefore Time, notAfter Time }
  */
-function parseCertValidity(certDER: Uint8Array): {
+export function parseCertValidity(certDER: Uint8Array): {
   notBefore: number;
   notAfter: number;
 } {
@@ -438,7 +474,7 @@ function parseCertValidity(certDER: Uint8Array): {
  * year pivot 1950/2049) or GeneralizedTime (tag 0x18, YYYYMMDDHHMMSSZ).
  * RFC 5280 mandates seconds and the Z suffix for both forms.
  */
-function parseDERTime(
+export function parseDERTime(
   data: Uint8Array,
   offset: number,
 ): { timeMs: number; totalLength: number } {
@@ -480,7 +516,7 @@ function parseDERTime(
  * The TBS (To Be Signed) portion is what the issuer's signature covers.
  * The signature is a BIT STRING containing the ECDSA signature.
  */
-function parseCertificateSignature(certDER: Uint8Array): {
+export function parseCertificateSignature(certDER: Uint8Array): {
   tbs: Uint8Array;
   signatureBytes: Uint8Array;
 } {
@@ -517,7 +553,7 @@ function parseCertificateSignature(certDER: Uint8Array): {
  * DER: SEQUENCE { INTEGER r, INTEGER s }
  * Raw: r (padded to componentSize) || s (padded to componentSize)
  */
-function derSignatureToRaw(derSig: Uint8Array, componentSize: number): Uint8Array {
+export function derSignatureToRaw(derSig: Uint8Array, componentSize: number): Uint8Array {
   // Parse outer SEQUENCE
   const seq = parseDERTL(derSig, 0);
   let pos = seq.contentOffset;
@@ -546,7 +582,7 @@ function derSignatureToRaw(derSig: Uint8Array, componentSize: number): Uint8Arra
 // PCR extraction
 // ---------------------------------------------------------------------------
 
-function extractPCRs(pcrsMap: Map<CBORValue, CBORValue>): {
+export function extractPCRs(pcrsMap: Map<CBORValue, CBORValue>): {
   PCR0: string;
   PCR1: string;
   PCR2: string;

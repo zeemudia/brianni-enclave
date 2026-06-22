@@ -50,6 +50,43 @@ describe('USAGE_REPORT', () => {
     expect(decodeUsageReport(encoded)).toEqual(payload);
   });
 
+  it('omits null providerId from the wire map and restores the schema default on decode', () => {
+    const payload: UsageReportPayload = {
+      requestId: 'req_null_provider',
+      routeKind: 'agent_summary',
+      providerId: null,
+      model: 'summary-local',
+      inputTokens: 24,
+      cacheCreationInputTokens: 255,
+      cachedInputTokens: 256,
+      inputTokensIncludeCachedTokens: true,
+      outputTokens: 65_536,
+      providerUsagePresent: false,
+    };
+
+    const encoded = encodeUsageReport(payload);
+
+    expect(new TextDecoder().decode(encoded)).not.toContain('providerId');
+    expect(decodeUsageReport(encoded)).toEqual(payload);
+  });
+
+  it('round-trips CBOR integer width boundaries', () => {
+    const payload: UsageReportPayload = {
+      requestId: 'req_boundaries',
+      routeKind: 'dream_extract',
+      providerId: 'google',
+      model: 'gemini-2.5-pro',
+      inputTokens: 23,
+      cacheCreationInputTokens: 24,
+      cachedInputTokens: 65_535,
+      inputTokensIncludeCachedTokens: false,
+      outputTokens: 65_536,
+      providerUsagePresent: true,
+    };
+
+    expect(decodeUsageReport(encodeUsageReport(payload))).toEqual(payload);
+  });
+
   it('decodes legacy five-field reports with safe metadata defaults', () => {
     const legacy = encodeLegacyUsageReport({
       requestId: 'req_legacy',
@@ -190,6 +227,48 @@ describe('USAGE_REPORT', () => {
     const huge = Buffer.alloc(MAX_USAGE_REPORT_BYTES + 1);
 
     expect(() => decodeUsageReport(huge)).toThrow(/USAGE_REPORT.*too large/);
+  });
+
+  it('rejects malformed CBOR payloads instead of accepting partial reports', () => {
+    const valid = encodeUsageReport({
+      requestId: 'req_trailing',
+      routeKind: 'chat',
+      providerId: 'openai',
+      model: 'gpt-5.5',
+      inputTokens: 1,
+      cacheCreationInputTokens: 0,
+      cachedInputTokens: 0,
+      inputTokensIncludeCachedTokens: true,
+      outputTokens: 1,
+      providerUsagePresent: true,
+    });
+
+    expect(() => decodeUsageReport(Buffer.concat([valid, Buffer.from([0])]))).toThrow(
+      /trailing bytes/,
+    );
+    expect(() => decodeUsageReport(Buffer.from([0xa1, 0x01, 0x61, 0x78]))).toThrow(
+      /map key must be a string/,
+    );
+    expect(() => decodeUsageReport(Buffer.from([0x61]))).toThrow(/text length exceeds payload/);
+    expect(() => decodeUsageReport(Buffer.from([0x1b]))).toThrow(/unsupported CBOR additional/);
+    expect(() => decodeUsageReport(Buffer.from([0xff]))).toThrow(/unsupported CBOR major=7/);
+  });
+
+  it('rejects integers that exceed the deliberately supported CBOR width', () => {
+    expect(() =>
+      encodeUsageReport({
+        requestId: 'req_too_large',
+        routeKind: 'chat',
+        providerId: 'openai',
+        model: 'gpt-5.5',
+        inputTokens: 0x1_0000_0000,
+        cacheCreationInputTokens: 0,
+        cachedInputTokens: 0,
+        inputTokensIncludeCachedTokens: true,
+        outputTokens: 1,
+        providerUsagePresent: true,
+      }),
+    ).toThrow(/integer too large/);
   });
 });
 

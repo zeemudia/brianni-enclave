@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { detectContractions } from '../rules/contractions';
+import { makeId } from '../id';
 
 describe('contractions rule', () => {
   it('expands "can\'t" to "cannot" with confidence 1.0', () => {
@@ -81,6 +82,23 @@ describe('contractions rule', () => {
       const out = detectContractions(input);
       const hit = out.find((s) => s.original === "I'd");
       expect(hit?.replacement).toBe('I had');
+    });
+  });
+
+  describe('mutation hardening', () => {
+    it('does not rewrite a contraction whose span is excluded', () => {
+      // Kills `if (spanIsExcluded(...)) continue` -> false. "can't" is at [2,7).
+      expect(detectContractions("I can't sleep", [[2, 7]])).toEqual([]);
+      // Sanity: without the exclusion it IS flagged.
+      expect(detectContractions("I can't sleep")).toHaveLength(1);
+    });
+
+    it("derives the suggestion id from the 'contraction' category", () => {
+      // Kills `makeId('contraction', ...)` -> `makeId('', ...)`.
+      const out = detectContractions("I can't sleep");
+      expect(out).toHaveLength(1);
+      const s = out[0];
+      expect(s.id).toBe(makeId('contraction', s.startIndex, s.endIndex, s.original));
     });
   });
 });

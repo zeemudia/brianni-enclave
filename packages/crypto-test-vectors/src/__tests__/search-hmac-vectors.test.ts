@@ -29,6 +29,13 @@ async function hmac(key: Uint8Array, term: string): Promise<string> {
 }
 
 describe('search HMAC vectors', () => {
+  it('ships a non-empty set of pinned term/tag vectors', () => {
+    // Without this guard, emptying SEARCH_HMAC_VECTORS would make the per-vector
+    // loop below produce zero `it()` cases — the conformance check would vanish
+    // rather than fail. Pin a floor so the key->tag mapping is always exercised.
+    expect(SEARCH_HMAC_VECTORS.length).toBeGreaterThanOrEqual(3);
+  });
+
   for (const v of SEARCH_HMAC_VECTORS) {
     it(`HMAC-SHA256(key, "${v.term}") matches the pinned tag`, async () => {
       const actual = await hmac(SEARCH_VECTOR_KEY, v.term);

@@ -55,4 +55,10 @@ describe('input validation (M1)', () => {
       /output length/,
     );
   });
+
+  it('accepts the exact HKDF-SHA256 maximum output length (255 × 32)', async () => {
+    const ikm = new Uint8Array(32).fill(2);
+    const key = await deriveKey(ikm, salt, 'info', 255 * 32);
+    expect(key.byteLength).toBe(255 * 32);
+  });
 });

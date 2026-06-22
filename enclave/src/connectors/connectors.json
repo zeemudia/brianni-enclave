@@ -14,6 +14,30 @@
         "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/calendar.readonly"
       ],
+      "scopeSubsumes": [
+        {
+          "grant": "calendar",
+          "covers": [
+            "calendar.events",
+            "calendar.readonly",
+            "calendar.events.readonly",
+            "calendar.freebusy"
+          ]
+        },
+        {
+          "grant": "calendar.events",
+          "covers": [
+            "calendar.events.readonly"
+          ]
+        },
+        {
+          "grant": "calendar.readonly",
+          "covers": [
+            "calendar.events.readonly",
+            "calendar.freebusy"
+          ]
+        }
+      ],
       "operations": [
         {
           "id": "list_events",
@@ -75,7 +99,18 @@
             },
             "timeMax": {
               "type": "string"
+            },
+            "calendarIds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             }
+          },
+          "maxWindowDays": 370,
+          "windowParams": {
+            "start": "timeMin",
+            "end": "timeMax"
           }
         },
         {
@@ -91,20 +126,30 @@
           ],
           "paramsSchema": {
             "summary": {
-              "type": "string"
+              "type": "string",
+              "required": true
             },
             "start": {
-              "type": "string"
+              "type": "string",
+              "required": true,
+              "format": "date-time"
             },
             "end": {
-              "type": "string"
+              "type": "string",
+              "required": true,
+              "format": "date-time"
             },
             "attendees": {
               "type": "array"
             },
             "calendarId": {
-              "type": "string"
+              "type": "string",
+              "required": true
             }
+          },
+          "eventTimeRange": {
+            "start": "start",
+            "end": "end"
           }
         },
         {
@@ -120,20 +165,32 @@
           ],
           "paramsSchema": {
             "eventId": {
-              "type": "string"
+              "type": "string",
+              "required": true
             },
             "summary": {
               "type": "string"
             },
             "start": {
-              "type": "string"
+              "type": "string",
+              "format": "date-time"
             },
             "end": {
-              "type": "string"
+              "type": "string",
+              "format": "date-time"
+            },
+            "calendarId": {
+              "type": "string",
+              "required": true
             },
             "etag": {
-              "type": "string"
+              "type": "string",
+              "required": true
             }
+          },
+          "eventTimeRange": {
+            "start": "start",
+            "end": "end"
           }
         },
         {
@@ -143,10 +200,22 @@
           "requiredScope": "calendar.events",
           "paramsSchema": {
             "eventId": {
-              "type": "string"
+              "type": "string",
+              "required": true
+            },
+            "calendarId": {
+              "type": "string",
+              "required": true
             },
             "response": {
-              "type": "string"
+              "type": "string",
+              "enum": [
+                "accepted",
+                "declined",
+                "tentative",
+                "needsAction"
+              ],
+              "required": true
             }
           }
         },
@@ -158,10 +227,16 @@
           "requiredScope": "calendar.events",
           "paramsSchema": {
             "eventId": {
-              "type": "string"
+              "type": "string",
+              "required": true
+            },
+            "calendarId": {
+              "type": "string",
+              "required": true
             },
             "etag": {
-              "type": "string"
+              "type": "string",
+              "required": true
             }
           }
         }
@@ -169,5 +244,5 @@
       "mcp": null
     }
   ],
-  "signature": "0LnlqQipYsexRD3JhYH2+EbVxJl+DOJVY4EKrJ+iI2PjYBXOy0629bZctCQm+HwdCnePX9w6b/LBB529cCalCw=="
+  "signature": "LFpg7IyN/YO7z0tmUuLWMUf+vCi36rOYWPPQyVwus8jO3JIKR4KDmOrcWcmgggYdeydjC9i3Mm1gKgMyNPHfCA=="
 }

@@ -35,6 +35,32 @@ export type AgentLinkedFolderContext = z.infer<
   typeof AgentLinkedFolderContextSchema
 >;
 
+const LOCAL_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const LOCAL_TIME_RE = /^\d{2}:\d{2}:\d{2}$/;
+const IANA_TIME_ZONE_RE = /^[A-Za-z0-9._+\-/]+$/;
+
+export const AgentLocalTimeContextSchema = z.object({
+  // UTC instant from the client device. Encrypted into the TEE request and used
+  // only to resolve relative user phrasing such as "tomorrow morning".
+  nowIso: z
+    .string()
+    .min(20)
+    .max(64)
+    .refine((value) => Number.isFinite(Date.parse(value)), {
+      message: "nowIso must be a parseable ISO date/time",
+    }),
+  // Pre-formatted client-local date/time so the enclave does not need to trust
+  // host locale data to derive the user's calendar day.
+  localDate: z.string().regex(LOCAL_DATE_RE),
+  localTime: z.string().regex(LOCAL_TIME_RE),
+  timeZone: z.string().min(1).max(128).regex(IANA_TIME_ZONE_RE),
+  utcOffsetMinutes: z.number().int().min(-14 * 60).max(14 * 60).optional(),
+});
+
+export type AgentLocalTimeContext = z.infer<
+  typeof AgentLocalTimeContextSchema
+>;
+
 /**
  * Hard upper bound on connectors attached to ONE agent request (spec §7.3, N5).
  * SINGLE source of truth: imported by both the wire-schema `.max()` (the enclave
@@ -201,6 +227,10 @@ export const AgentRequestContextSchema = z.object({
   // typed/passkey-fresh settings action; the enclave consumes it in Phase 1
   // (Task 10). Carries NO mode (S5) and no connector id.
   connectorTurnBudgetOverride: ConnectorTurnBudgetOverrideSchema.optional(),
+  // Encrypted client-local date/time metadata. It contains no connector tokens
+  // and lets the enclave resolve relative scheduling language before connector
+  // operations reach the on-device adapter.
+  localTime: AgentLocalTimeContextSchema.optional(),
 });
 
 export type AgentRequestContext = z.infer<typeof AgentRequestContextSchema>;

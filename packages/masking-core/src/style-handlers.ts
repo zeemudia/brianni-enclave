@@ -113,6 +113,13 @@ export function applyAllStyleSuggestions(deps: StyleHandlerDeps): void {
   const stalePending = pending.filter(
     (s) => current.slice(s.startIndex, s.endIndex) !== s.original,
   );
+  // Stryker disable next-line ConditionalExpression,EqualityOperator: equivalent
+  // — this guard (`> 0`) only skips the block when validPending is empty.
+  // Forcing it true / to `>= 0` then runs the block with an empty validPending:
+  // `applyAccepted(current, [])` returns `current` unchanged (applyAccepted has
+  // its own `accepted.length === 0` early return), so `next !== current` is false
+  // and setText is never called, and `for (const s of validPending)` iterates
+  // zero times so accept is never called. No observable output change.
   if (validPending.length > 0) {
     const next = applyAccepted(current, validPending);
     if (next !== current) deps.setText(next);

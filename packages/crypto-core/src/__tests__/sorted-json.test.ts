@@ -19,6 +19,16 @@ describe('sortedJsonStringify', () => {
     expect(out).toBe('{"alg":"AES-256-GCM","mimeType":"image/png","v":1}');
   });
 
+  it('preserves empty strings except for the special mimeType parity rule', () => {
+    const out = sortedJsonStringify({
+      description: '',
+      filename: '',
+      mimeType: '',
+      v: 1,
+    });
+    expect(out).toBe('{"description":"","filename":"","v":1}');
+  });
+
   it('drops null values (sister parity with Android buildSortedJsonString)', () => {
     const out = sortedJsonStringify({ a: 1, b: null, c: 2 });
     expect(out).toBe('{"a":1,"c":2}');
@@ -32,6 +42,11 @@ describe('sortedJsonStringify', () => {
   it('drops s3Parts unconditionally (sister parity — not part of AAD)', () => {
     const out = sortedJsonStringify({ a: 1, s3Parts: ['p1', 'p2'], v: 1 });
     expect(out).toBe('{"a":1,"v":1}');
+  });
+
+  it('preserves falsy non-null metadata values', () => {
+    const out = sortedJsonStringify({ archived: false, retryCount: 0, v: 1 });
+    expect(out).toBe('{"archived":false,"retryCount":0,"v":1}');
   });
 
   it('handles all skip-cases together', () => {
