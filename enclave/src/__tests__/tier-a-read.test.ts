@@ -42,6 +42,16 @@ import {
   MAX_TOOL_RESULT_PLAINTEXT_BYTES,
 } from "../tools/file-allowlist";
 
+// Several file.read tests drive REAL pdfjs text extraction (searchable PDFs
+// and iWork QuickLook previews). The first such test in a worker pays a
+// one-time cost to dynamically import the ~1 MB pdfjs-dist legacy build, and
+// the extractor itself allows up to PDF_EXTRACTION_TIMEOUT_MS (10s) internally.
+// That import cost varies wildly (≈200ms warm to ≈1s cold locally, and well
+// past 5s on a cold, contended CI runner), so vitest's default 5s test budget
+// — which is smaller than the extractor's own 10s deadline — flakes under
+// load. Give the whole file a generous timeout, matching media-tools.test.ts.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+
 const pack: SkillPack = {
   id: "personal-agent.default",
   version: 1,

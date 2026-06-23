@@ -576,6 +576,456 @@ describe("ToolCallStreamParser", () => {
     });
   });
 
+  it("generic connector.read maps discovery read verbs to a unique catalog list operation", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_events", mutating: false }],
+      },
+    ]);
+
+    for (const operation of [
+      "searchEvents",
+      "find_events",
+      "lookup-events",
+      "query.events",
+    ]) {
+      const events = aliasEventsWithArgs("connector.read", {
+        connectorId: "cal",
+        operation,
+        params: { q: "dentist" },
+      });
+      expect(events).toContainEqual({
+        kind: "tool",
+        payload: {
+          invocationId: "",
+          toolName: "connector.read",
+          args: {
+            connectorId: "acme-cal",
+            operation: "list_events",
+            params: { q: "dentist" },
+          },
+        },
+      });
+    }
+
+    __resetConnectorRegistryForTest();
+  });
+
+  it("generic connector.read maps discovery aliases to a unique catalog get operation", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "get_events", mutating: false }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    expect(events).toContainEqual({
+      kind: "tool",
+      payload: {
+        invocationId: "",
+        toolName: "connector.read",
+        args: {
+          connectorId: "acme-cal",
+          operation: "get_events",
+          params: { q: "dentist" },
+        },
+      },
+    });
+  });
+
+  it("does not guess a search/find read alias when the catalog match is ambiguous", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [
+          { id: "list_events", mutating: false },
+          { id: "read_events", mutating: false },
+        ],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect((tool.payload.args as { operation: string }).operation).toBe(
+        "searchEvents",
+      );
+    }
+  });
+
+  it("does not map non-discovery or object-less operation names by read-object alias", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [
+          { id: "list", mutating: false },
+          { id: "list_events", mutating: false },
+        ],
+      },
+    ]);
+
+    for (const operation of ["search", "events", "deleteEvents"]) {
+      const events = aliasEventsWithArgs("connector.read", {
+        connectorId: "cal",
+        operation,
+        params: { q: "dentist" },
+      });
+      const tool = events.find((e) => e.kind === "tool");
+      expect(tool, operation).toBeDefined();
+      if (tool?.kind === "tool") {
+        expect(tool.payload.args).toEqual({
+          connectorId: "cal",
+          operation,
+          params: { q: "dentist" },
+        });
+      }
+    }
+
+    __resetConnectorRegistryForTest();
+  });
+
+  it("does not map discovery read aliases to mutating catalog operations", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_events", mutating: true }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect(tool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "searchEvents",
+        params: { q: "dentist" },
+      });
+    }
+  });
+
+  it("does not map discovery read aliases to non-read catalog verbs", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "fetch_events", mutating: false }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect(tool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "searchEvents",
+        params: { q: "dentist" },
+      });
+    }
+  });
+
+  it("requires discovery alias object tokens to match by length and value", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_events", mutating: false }],
+      },
+    ]);
+
+    const lengthMismatch = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchEventsToday",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const lengthTool = lengthMismatch.find((e) => e.kind === "tool");
+    expect(lengthTool).toBeDefined();
+    if (lengthTool?.kind === "tool") {
+      expect(lengthTool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "searchEventsToday",
+        params: { q: "dentist" },
+      });
+    }
+
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_tasks", mutating: false }],
+      },
+    ]);
+
+    const valueMismatch = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const valueTool = valueMismatch.find((e) => e.kind === "tool");
+    expect(valueTool).toBeDefined();
+    if (valueTool?.kind === "tool") {
+      expect(valueTool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "searchEvents",
+        params: { q: "dentist" },
+      });
+    }
+  });
+
+  it("requires every discovery alias object token to match", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_big_tasks", mutating: false }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchBigEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect(tool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "searchBigEvents",
+        params: { q: "dentist" },
+      });
+    }
+  });
+
+  it("maps a discovery alias when the catalog object tokens match", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_tasks", mutating: false }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchTasks",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    expect(events).toContainEqual({
+      kind: "tool",
+      payload: {
+        invocationId: "",
+        toolName: "connector.read",
+        args: {
+          connectorId: "acme-cal",
+          operation: "list_tasks",
+          params: { q: "dentist" },
+        },
+      },
+    });
+  });
+
+  it("leaves an empty operation string unchanged", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list", mutating: false }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect(tool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "",
+        params: { q: "dentist" },
+      });
+    }
+  });
+
+  it("does not resolve an exact operation alias when multiple catalog operations loosen to the same id", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [
+          { id: "list_events", mutating: false },
+          { id: "listEvents", mutating: false },
+        ],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "list_events",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect(tool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "list_events",
+        params: { q: "dentist" },
+      });
+    }
+  });
+
+  it("does not use discovery aliasing to resolve exact-operation ambiguity", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [
+          { id: "list_events", mutating: false },
+          { id: "listEvents", mutating: false },
+        ],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect(tool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "searchEvents",
+        params: { q: "dentist" },
+      });
+    }
+  });
+
+  it("preserves connector params when discovery aliases use whitespace separators", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_events", mutating: false }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: " search   events ",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    expect(events).toContainEqual({
+      kind: "tool",
+      payload: {
+        invocationId: "",
+        toolName: "connector.read",
+        args: {
+          connectorId: "acme-cal",
+          operation: "list_events",
+          params: { q: "dentist" },
+        },
+      },
+    });
+  });
+
+  it("does not let empty separator tokens participate in discovery alias matching", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_events", mutating: false }],
+      },
+    ]);
+
+    for (const operation of ["search___", "search..."]) {
+      const events = aliasEventsWithArgs("connector.read", {
+        connectorId: "cal",
+        operation,
+        params: { q: "dentist" },
+      });
+      const tool = events.find((e) => e.kind === "tool");
+      expect(tool, operation).toBeDefined();
+      if (tool?.kind === "tool") {
+        expect(tool.payload.args).toEqual({
+          connectorId: "cal",
+          operation,
+          params: { q: "dentist" },
+        });
+      }
+    }
+
+    __resetConnectorRegistryForTest();
+  });
+
+  it("tokenizes camelCase and separator-heavy discovery aliases when matching catalog objects", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_big_events", mutating: false }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "queryBigEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    expect(events).toContainEqual({
+      kind: "tool",
+      payload: {
+        invocationId: "",
+        toolName: "connector.read",
+        args: {
+          connectorId: "acme-cal",
+          operation: "list_big_events",
+          params: { q: "dentist" },
+        },
+      },
+    });
+  });
+
   it("generic connector.read merges a nested params object with sibling keys", () => {
     initRegistryWithOps(ALIAS_CATALOG);
     const events = aliasEventsWithArgs("connector.read", {

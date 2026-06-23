@@ -1,9 +1,18 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { extractDocxPlainText, validateDocxContainer } from "../tools/ooxml-validator";
 import { MediaToolsClient } from "../tools/media-tools";
+
+// These tests spawn the Python media sidecar (MediaToolsClient.start()), whose
+// readiness wait imports heavy deps (Pillow / PyMuPDF) — the same cold-start
+// that media-tools.test.ts documents as exceeding vitest's default 5s test
+// timeout on a loaded CI runner (the client's timeoutMs only bounds run(), not
+// start()). The PyMuPDF cases are skipped locally but run in CI where fitz is
+// installed. Give the whole file a generous timeout so the cold spawn cannot
+// flake. Matches media-tools.test.ts / tier-a-read.test.ts.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 const servicePath = resolve(
   import.meta.dirname ?? __dirname,

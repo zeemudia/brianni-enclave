@@ -221,6 +221,72 @@ describe("assembleSystemPrompt", () => {
     expect(out).toContain("do not guess default ids");
   });
 
+  it("includes runtime connector operation schemas up front when supplied", () => {
+    const out = assembleSystemPrompt(
+      {
+        ...defaultPack,
+        toolScopes: ["connector.list", "connector.read", "connector.act"],
+      },
+      {
+        connectorRuntimeView: [
+          {
+            connectorId: "fixture-cal",
+            displayName: "[C_1]",
+            operations: [
+              {
+                id: "list_items",
+                mutating: false,
+                paramsSchema: { q: { type: "string" } },
+                maxWindowDays: 7,
+                maxResults: 50,
+                windowParams: { start: "timeMin", end: "timeMax" },
+                maxResultsParam: "maxResults",
+              },
+            ],
+          },
+        ],
+      },
+    );
+
+    expect(out).toContain("Connected external service operations available now");
+    expect(out).toContain('"connectorId":"fixture-cal"');
+    expect(out).toContain('"id":"list_items"');
+    expect(out).toContain('"timeMin":{"required":true,"maxWindowDays":7}');
+    expect(out).toContain('"maxResults":{"required":true,"maximum":50}');
+  });
+
+  it("filters upfront runtime connector operations to the scoped connector tool family", () => {
+    const out = assembleSystemPrompt(
+      {
+        ...defaultPack,
+        toolScopes: ["connector.read"],
+      },
+      {
+        connectorRuntimeView: [
+          {
+            connectorId: "fixture-cal",
+            displayName: "[C_1]",
+            operations: [
+              {
+                id: "list_items",
+                mutating: false,
+                paramsSchema: {},
+              },
+              {
+                id: "create_item",
+                mutating: true,
+                paramsSchema: {},
+              },
+            ],
+          },
+        ],
+      },
+    );
+
+    expect(out).toContain('"id":"list_items"');
+    expect(out).not.toContain('"id":"create_item"');
+  });
+
   it("advertises every non-specialist scoped tool", () => {
     const liveToolScopes = TOOL_NAMES.filter(
       (tool) => !SPECIALIST_MEDIA_TOOLS.has(tool),

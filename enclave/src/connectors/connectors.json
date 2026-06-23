@@ -64,6 +64,9 @@
             },
             "calendarId": {
               "type": "string"
+            },
+            "q": {
+              "type": "string"
             }
           }
         },
@@ -244,5 +247,5 @@
       "mcp": null
     }
   ],
-  "signature": "LFpg7IyN/YO7z0tmUuLWMUf+vCi36rOYWPPQyVwus8jO3JIKR4KDmOrcWcmgggYdeydjC9i3Mm1gKgMyNPHfCA=="
+  "signature": "NnweqfSVBnXjPwuB2GsrctWmJwewZ6fIrUUn8LjlmnjPl0v85wf91QDpoUYabY8zaV3DZvuBI31QAbXr0QVHCw=="
 }

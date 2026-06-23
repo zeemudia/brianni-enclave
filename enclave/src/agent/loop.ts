@@ -19,6 +19,7 @@ import type { ProviderResponseLike } from '../usage-report';
 import { assembleSystemPrompt } from './prompt';
 import { ToolCallStreamParser } from './parse-tool-call';
 import { sanitizeToolOutputForModel } from './tool-output-sanitizer';
+import { buildRuntimeConnectorView } from './connector-runtime-view';
 import { REINJECT_CHAIN } from './harness/chain';
 import { runReinjectChain } from './harness/reinject-chain';
 import type { LifecycleHooks, TurnContext } from './harness/types';
@@ -193,6 +194,9 @@ export async function* runAgentLoop(
     ...deps.requestContext,
     subscriptionPlanId: deps.subscriptionPlanId,
     fullSkillToolScopes: deps.fullSkillToolScopes,
+    connectorRuntimeView: buildRuntimeConnectorView({
+      connectedConnectors: deps.requestContext?.connectedConnectors ?? [],
+    }),
   });
 
   const messages: ChatMessage[] = [

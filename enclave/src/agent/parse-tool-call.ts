@@ -318,7 +318,52 @@ function matchCatalogOperationId(
 ): string | null {
   const want = loosenIdentifier(input);
   const exact = connector.operations.filter((op) => loosenIdentifier(op.id) === want);
-  return exact.length === 1 ? exact[0].id : null;
+  if (exact.length === 1) return exact[0].id;
+  if (exact.length > 1) return null;
+  return matchUniqueReadOperationByObject(connector, input);
+}
+
+const DISCOVERY_READ_VERBS = new Set(['find', 'lookup', 'query', 'search']);
+const CATALOG_READ_VERBS = new Set(['get', 'list', 'read']);
+
+function matchUniqueReadOperationByObject(
+  connector: ConnectorDescriptor,
+  input: string,
+): string | null {
+  const inputTokens = identifierTokens(input);
+  const [inputVerb, ...inputObject] = inputTokens;
+  if (
+    !inputVerb ||
+    inputObject.length === 0 ||
+    !DISCOVERY_READ_VERBS.has(inputVerb)
+  ) {
+    return null;
+  }
+
+  const candidates = connector.operations.filter((operation) => {
+    if (operation.mutating) return false;
+    const [catalogVerb, ...catalogObject] = identifierTokens(operation.id);
+    return (
+      catalogVerb !== undefined &&
+      CATALOG_READ_VERBS.has(catalogVerb) &&
+      sameTokens(catalogObject, inputObject)
+    );
+  });
+  return candidates.length === 1 ? candidates[0].id : null;
+}
+
+function identifierTokens(value: string): string[] {
+  return value
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[-_.\s]+/g, ' ')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((token) => token.length > 0);
+}
+
+function sameTokens(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((token, idx) => token === right[idx]);
 }
 
 /**

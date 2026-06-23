@@ -6,9 +6,7 @@ import {
   type AgentLinkedFolderContext,
   type BinaryWorkItemWriteRequestFrame,
   type ConnectedConnectorContext,
-  type ConnectorDescriptor,
   type ConnectorModeEcho,
-  type ConnectorOperation,
   type MediaProvenanceRecord,
   type MemoryMutationEnvelope,
   type MemoryNamespace,
@@ -24,6 +22,10 @@ import { randomUUID } from 'node:crypto';
 import { isToolBanned, isToolInScope } from './scope-check';
 import { EgressTaintLedger } from './egress-taint';
 import { sanitizeToolOutputForModel } from '../agent/tool-output-sanitizer';
+import {
+  buildRuntimeConnectorView,
+  connectorOperationScopeSatisfied,
+} from '../agent/connector-runtime-view';
 import { buildConnectorListView } from '../agent/prompt';
 import {
   getAllConnectors,
@@ -1281,50 +1283,13 @@ export class ToolGateway {
   ): DispatchResult {
     // Intersect the registry catalog with the connected set (optionally narrowed
     // to one connector). The display name is the client-masked token from the
-    // connected context (the enclave never holds the real label).
-    const view = connected
-      .filter(
-        (c) =>
-          (scopeToConnectorId === undefined ||
-            c.connectorId === scopeToConnectorId) &&
-          // Only advertise a CONNECTED connector. A needs_reauth connector still
-          // rides in the request context (buildConnectedConnectorContext keeps
-          // everything except revoked), but connector.read/act on it would be
-          // rejected NOT_CONNECTED — so listing its operations would mislead the
-          // planner into forming a doomed call. Mirror admission's isConnected
-          // status gate here so the discovery view matches what is invocable.
-          c.status === 'connected',
-      )
-      .map((c) => {
-        const descriptor = getConnector(c.connectorId);
-        if (!descriptor) return null;
-        return {
-          connectorId: c.connectorId,
-          displayName: c.displayName,
-          operations: descriptor.operations
-            // v1 forbids binary ops; do not advertise an op the gateway would
-            // hard-reject at admission.
-            .filter((op) => op.binary !== true)
-            .filter((op) =>
-              connectorOperationScopeSatisfied(
-                descriptor,
-                op,
-                c.grantedScopes,
-              ),
-            )
-            .map((op) => ({
-              id: op.id,
-              mutating: op.mutating,
-              paramsSchema: op.paramsSchema,
-              contentFields: op.contentFields,
-              maxWindowDays: op.maxWindowDays,
-              maxResults: op.maxResults,
-              windowParams: op.windowParams,
-              maxResultsParam: op.maxResultsParam,
-            })),
-        };
-      })
-      .filter((v): v is NonNullable<typeof v> => v !== null);
+    // connected context (the enclave never holds the real label). The shared
+    // builder also mirrors admission's connected-status gate and grant-scope
+    // filter, so planner discovery and first-turn prompt hints stay aligned.
+    const view = buildRuntimeConnectorView({
+      connectedConnectors: connected,
+      scopeToConnectorId,
+    });
 
     const data = buildConnectorListView(view);
     return {
@@ -1740,44 +1705,4 @@ export class ToolGateway {
       }
     }
   }
-}
-
-function connectorOperationScopeSatisfied(
-  descriptor: ConnectorDescriptor,
-  operation: ConnectorOperation,
-  grantedScopes: readonly string[],
-): boolean {
-  const requiredScopes = Array.isArray(operation.requiredScope)
-    ? operation.requiredScope
-    : [operation.requiredScope];
-  return requiredScopes.some((requiredScope) =>
-    grantedScopes.some((grantedScope) =>
-      grantCoversRequiredScope(descriptor, grantedScope, requiredScope),
-    ),
-  );
-}
-
-function grantCoversRequiredScope(
-  descriptor: ConnectorDescriptor,
-  grantedScope: string,
-  requiredScope: string,
-): boolean {
-  if (scopeTokenMatches(grantedScope, requiredScope)) return true;
-  return (
-    descriptor.scopeSubsumes?.some(
-      (rule) =>
-        scopeTokenMatches(grantedScope, rule.grant) &&
-        rule.covers.some((coveredScope) =>
-          scopeTokenMatches(coveredScope, requiredScope),
-        ),
-    ) ?? false
-  );
-}
-
-function scopeTokenMatches(left: string, right: string): boolean {
-  return (
-    left === right ||
-    left.endsWith(`/${right}`) ||
-    right.endsWith(`/${left}`)
-  );
 }

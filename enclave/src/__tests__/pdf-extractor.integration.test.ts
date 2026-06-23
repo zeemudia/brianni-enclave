@@ -1,6 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { extractPdfPlainText } from "../tools/pdf-extractor";
+
+// This test exercises the REAL pdfjs path: it dynamically imports the ~1 MB
+// pdfjs-dist legacy build and parses a PDF. The cold import cost is highly
+// variable (≈200ms warm to ≈1s+ cold locally, well past 5s on a contended CI
+// runner) and the extractor's own internal deadline is 10s — both larger than
+// vitest's default 5s budget. Give the file a generous timeout so a slow cold
+// import under CI load cannot flake. Matches tier-a-read / media-tools.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 function utf8(value: string): Uint8Array {
   return new TextEncoder().encode(value);
