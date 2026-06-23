@@ -82,7 +82,7 @@ export type ConnectorTurnBudgetResult =
 // them so this file stays a lightweight, test-friendly pure module.
 // ---------------------------------------------------------------------------
 
-interface ConnectorOperationShape {
+export interface ConnectorOperationShape {
   id: string;
   mutating: boolean;
   destructive?: boolean;
@@ -420,6 +420,47 @@ function enforceReadCeilings(
   }
 
   return { ok: true };
+}
+
+/**
+ * BUG-B — default an ABSENT results-count to the catalog ceiling for a
+ * connector.read op, returning a NEW params object (the input is never mutated).
+ *
+ * The model intermittently omits the technical `maxResults` cap on a read whose
+ * catalog op declares a results ceiling. `enforceReadCeilings`
+ * then hard-rejects with `CONNECTOR_READ_RESULTS_REQUIRED` — the confirmed
+ * intermittent "calendar wasn't available" / "rejected by the gateway" read
+ * failure. An absent cap means "no explicit limit", for which the CEILING is the
+ * correct BOUNDED default (the read stays capped — it can never exceed
+ * `op.maxResults`), so defaulting it turns a brittle reject into a reliable read
+ * without weakening the §12 bound.
+ *
+ * The WINDOW is deliberately NOT defaulted: a time range is semantically
+ * load-bearing (a 370-day default would silently return the wrong events), so an
+ * absent window stays REQUIRED — the planner must supply the range it means.
+ *
+ * A present cap (even one over the ceiling) is left untouched, so
+ * `enforceReadCeilings` still rejects an over-ceiling value as EXCEEDED — this
+ * helper only fills a genuinely-absent cap, never lowers a supplied one.
+ *
+ * Applied at dispatch BEFORE admission so the defaulted cap reaches BOTH the gate
+ * and the client/provider call. `admitConnectorInvocation` / `enforceReadCeilings`
+ * are left unchanged (still REQUIRED on a truly-absent cap) as defense-in-depth
+ * for any direct caller that bypasses this helper.
+ */
+export function applyConnectorReadDefaults(
+  op: ConnectorOperationShape,
+  params: Record<string, unknown>,
+): Record<string, unknown> {
+  if (op.maxResults === undefined || op.maxResultsParam === undefined) {
+    return params;
+  }
+  const key = op.maxResultsParam;
+  const current = params[key];
+  if (current === undefined || current === null) {
+    return { ...params, [key]: op.maxResults };
+  }
+  return params;
 }
 
 // ── Event-time (write) param validation ───────────────────────────────────────

@@ -33,6 +33,7 @@ import {
 } from '../connectors/registry';
 import {
   admitConnectorInvocation,
+  applyConnectorReadDefaults,
   buildConnectorLedgerEntry,
   checkConnectorTurnBudget,
   MAX_CONNECTOR_MUTATIONS_PER_TURN,
@@ -447,6 +448,17 @@ export class ToolGateway {
       return rejection('TAINTED_EGRESS_BLOCKED');
     }
 
+    // BUG-B — connector.read preflight MUST run BEFORE the wire frame is emitted.
+    // The live agent loop yields prepared.wireFrame to the client (the client makes
+    // the provider call) before dispatch() parks on the resolver. So read-side
+    // safety checks that prevent an external provider read — catalog loaded,
+    // admission, window/ceiling bounds, scope, and per-turn budget — belong here
+    // too. This preflight never increments budgets; dispatch() remains the single
+    // admission-consumption point and repeats the same checks for direct callers.
+    if (frame.toolName === 'connector.read') {
+      return this.prepareConnectorReadInvocation(frame, pack, turnId);
+    }
+
     if (frame.toolName !== 'memory.write') {
       return { ok: true, wireFrame: frame };
     }
@@ -513,6 +525,105 @@ export class ToolGateway {
       wireFrame: result.prepared.sanitisedFrame,
       preparedKey: frame.invocationId,
     };
+  }
+
+  private prepareConnectorReadInvocation(
+    frame: ToolInvocationFrame,
+    pack: SkillPack,
+    turnId: string,
+  ): PrepareInvocationResult {
+    const echoes = this.deps.connectorModeEchoes ?? [];
+    const reject = (
+      reason: string,
+      connectorId?: string,
+      operation?: string,
+    ): PrepareInvocationResult => {
+      const gatewayResult = this.connectorReject(
+        frame,
+        pack,
+        turnId,
+        reason,
+        echoes,
+        connectorId,
+        operation,
+      );
+      return {
+        ok: false,
+        reason,
+        ledgerEntry: gatewayResult.ledgerEntry,
+        gatewayResult,
+      };
+    };
+
+    if (!isConnectorRegistryLoaded()) {
+      return reject('CONNECTOR_CATALOG_NOT_LOADED');
+    }
+
+    const parsed = ConnectorInvocationArgsSchema.safeParse(frame.args);
+    if (!parsed.success) {
+      return reject('CONNECTOR_INVOCATION_ARGS_INVALID');
+    }
+    const { connectorId, operation, params } = parsed.data;
+
+    let effectiveParams = params;
+    let wireFrame = frame;
+    const readOp = getConnector(connectorId)?.operations.find(
+      (o) => o.id === operation,
+    );
+    if (readOp) {
+      const defaulted = applyConnectorReadDefaults(readOp, params);
+      if (defaulted !== params) {
+        effectiveParams = defaulted;
+        wireFrame = {
+          ...frame,
+          args: { connectorId, operation, params: defaulted },
+        };
+      }
+    }
+
+    const connected = this.deps.connectedConnectors ?? [];
+    const connectedForAdmission = connected.map((c) => ({
+      connectorId: c.connectorId,
+      displayName: c.displayName,
+      status: c.status,
+      grantedScopes: c.grantedScopes,
+    }));
+    const admission = admitConnectorInvocation({
+      catalog: getAllConnectors() ?? [],
+      pack: { toolScopes: pack.toolScopes },
+      connectedConnectors: connectedForAdmission,
+      boundConnectorIds: this.boundConnectorIdsFromContext(connected),
+      tool: 'connector.read',
+      connectorId,
+      operation,
+      params: effectiveParams,
+    });
+    if (!admission.ok) {
+      return reject(admission.reason, connectorId, operation);
+    }
+
+    const scopeDescriptor = getConnector(connectorId);
+    const scopeOp = scopeDescriptor?.operations.find((o) => o.id === operation);
+    const grantedScopes =
+      connected.find((c) => c.connectorId === connectorId)?.grantedScopes ?? [];
+    if (
+      scopeDescriptor &&
+      scopeOp &&
+      !connectorOperationScopeSatisfied(scopeDescriptor, scopeOp, grantedScopes)
+    ) {
+      return reject('CONNECTOR_SCOPE_NOT_GRANTED', connectorId, operation);
+    }
+
+    const budget = checkConnectorTurnBudget(
+      this.connectorTurnState(turnId),
+      'connector.read',
+      this.deps.connectorTurnBudgetOverride,
+    );
+    if (!budget.ok) {
+      return reject(budget.reason, connectorId, operation);
+    }
+
+    return { ok: true, wireFrame };
   }
 
   /** Test seam: read prepared state without consuming it. */
@@ -852,6 +963,33 @@ export class ToolGateway {
     }
     const { connectorId, operation, params } = parsed.data;
 
+    // BUG-B — for a connector.read whose catalog op declares a results ceiling,
+    // default an ABSENT results-count to that ceiling BEFORE admission, so a model
+    // that omits the technical maxResults cap gets a reliable BOUNDED read instead
+    // of an intermittent CONNECTOR_READ_RESULTS_REQUIRED reject ("calendar wasn't
+    // available" / "rejected by the gateway"). The WINDOW is NOT defaulted (a time
+    // range is semantically required). The defaulted params flow to BOTH admission
+    // (so the gate sees a bounded value) AND the client frame (so the bound reaches
+    // the provider call). A truly-absent cap still REJECTS at the gate for any
+    // direct caller that bypasses this dispatch path (defense-in-depth).
+    let effectiveParams = params;
+    let effectiveFrame = frame;
+    if (tool === 'connector.read') {
+      const readOp = getConnector(connectorId)?.operations.find(
+        (o) => o.id === operation,
+      );
+      if (readOp) {
+        const defaulted = applyConnectorReadDefaults(readOp, params);
+        if (defaulted !== params) {
+          effectiveParams = defaulted;
+          effectiveFrame = {
+            ...frame,
+            args: { connectorId, operation, params: defaulted },
+          };
+        }
+      }
+    }
+
     // The connected-connector ids ARE the bound set — a client-asserted
     // consistency check by C1 necessity, not enclave-side defense-in-depth. See
     // boundConnectorIdsFromContext for the full rationale.
@@ -877,7 +1015,9 @@ export class ToolGateway {
       operation,
       // PARSED/defaulted params — NOT raw frame.args — so a ceiling-declaring op
       // with no params field still fails closed (§12 read-side, defense-in-depth).
-      params,
+      // `effectiveParams` carries the BUG-B read-cap default (absent maxResults →
+      // ceiling); the window is never defaulted, so an absent window still REQUIRES.
+      params: effectiveParams,
     });
     if (!admission.ok) {
       return this.connectorReject(
@@ -1027,7 +1167,10 @@ export class ToolGateway {
 
     // 4d — hand the admitted op to the client fulfiller (like folder.write):
     // the client calls the external service and returns the structured result.
-    const result = await this.deps.clientBridge.invokeClient(frame);
+    // `effectiveFrame` carries the BUG-B read-cap default in args.params so the
+    // bound reaches the provider call (identical to `frame` for non-read / when no
+    // default was applied).
+    const result = await this.deps.clientBridge.invokeClient(effectiveFrame);
 
     // 4d-bis — FREE-tier model-visible read budget for connector.read. The generic
     // post-dispatch byte cap (readAggregateByteCap) lives BELOW the early return

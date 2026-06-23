@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ToolCallLedgerEntrySchema } from "@calypso/chat-types";
 import {
   admitConnectorInvocation,
+  applyConnectorReadDefaults,
   MAX_CONNECTOR_MUTATIONS_PER_TURN,
   MAX_CONNECTOR_READS_PER_TURN,
   checkConnectorTurnBudget,
@@ -336,6 +337,78 @@ describe("connector admission (spec §5.2)", () => {
   it("admission input is MODE-FREE by construction — the echo is a separate channel (S5 structural, R4-3)", () => {
     expect(baseCtx.connectedConnectors[0]).not.toHaveProperty("writePermissionMode");
     expect("connectorModeEchoes" in baseCtx).toBe(false);
+  });
+});
+
+describe("applyConnectorReadDefaults (BUG-B — default an absent results cap to the ceiling)", () => {
+  type OpShape = Parameters<typeof applyConnectorReadDefaults>[0];
+  const listEventsOp = catalog[0].operations[0] as unknown as OpShape; // maxResults 250
+  const createEventOp = catalog[0].operations[1] as unknown as OpShape; // no results ceiling
+  const window = {
+    timeMin: "2026-06-01T00:00:00Z",
+    timeMax: "2026-06-08T00:00:00Z",
+  };
+
+  it("defaults an absent results count to the catalog ceiling", () => {
+    const out = applyConnectorReadDefaults(listEventsOp, { ...window });
+    expect(out.maxResults).toBe(250);
+  });
+
+  it("leaves a present results count untouched (incl. one already at/over the ceiling)", () => {
+    expect(
+      applyConnectorReadDefaults(listEventsOp, { ...window, maxResults: 10 })
+        .maxResults,
+    ).toBe(10);
+    // A present-but-over value is left for enforceReadCeilings to reject as
+    // EXCEEDED — defaulting must never silently lower a supplied value.
+    expect(
+      applyConnectorReadDefaults(listEventsOp, { ...window, maxResults: 5000 })
+        .maxResults,
+    ).toBe(5000);
+  });
+
+  it("does NOT default the window — a time range is semantically required", () => {
+    const out = applyConnectorReadDefaults(listEventsOp, {});
+    expect(out.timeMin).toBeUndefined();
+    expect(out.timeMax).toBeUndefined();
+    // Only the results cap is filled.
+    expect(out.maxResults).toBe(250);
+  });
+
+  it("is a no-op for an op that declares no results ceiling", () => {
+    const params = { calendarId: "primary", summary: "Lunch" };
+    expect(applyConnectorReadDefaults(createEventOp, params)).toEqual(params);
+  });
+
+  it("does not mutate the input params object", () => {
+    const input = { ...window };
+    applyConnectorReadDefaults(listEventsOp, input);
+    expect("maxResults" in input).toBe(false);
+  });
+
+  it("turns a would-be CONNECTOR_READ_RESULTS_REQUIRED reject into an admit (the BUG-B fix)", () => {
+    // A window-only read (model omitted the technical cap) is REQUIRED by the gate…
+    const raw = { ...window };
+    expect(
+      admitConnectorInvocation({
+        ...baseCtx,
+        tool: "connector.read",
+        connectorId: "google-calendar",
+        operation: "list_events",
+        params: raw,
+      }).reason,
+    ).toBe("CONNECTOR_READ_RESULTS_REQUIRED");
+    // …but ADMITS once the dispatch default is applied.
+    const defaulted = applyConnectorReadDefaults(listEventsOp, raw);
+    expect(
+      admitConnectorInvocation({
+        ...baseCtx,
+        tool: "connector.read",
+        connectorId: "google-calendar",
+        operation: "list_events",
+        params: defaulted,
+      }).ok,
+    ).toBe(true);
   });
 });
 

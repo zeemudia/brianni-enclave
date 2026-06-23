@@ -126,6 +126,50 @@ describe('PIITokeniser', () => {
     expect(tokeniser.getSubstitutions()).toEqual([]);
   });
 
+  // Display safety net — after rehydrate(), any residual masking token of a type
+  // this tokeniser ISSUED but cannot rehydrate (lost mapping / model-hallucinated
+  // index) must never reach the user-visible final answer (launch gate: zero raw
+  // masking tokens in answers). Scoped to issued types so legit non-PII bracket
+  // markup the model emits is untouched.
+  describe('neutraliseResidualTokens (display safety net)', () => {
+    it('replaces a residual token of an issued type that has no mapping', () => {
+      const tokeniser = new PIITokeniser();
+      tokeniser.mask('Google Calendar', detectPII('Google Calendar')); // issues NAME_1
+      const out = tokeniser.neutraliseResidualTokens('Contact [NAME_9] now.');
+      expect(out).not.toMatch(/\[NAME_\d+\]/);
+      expect(out).toBe('Contact [redacted] now.');
+    });
+
+    it('leaves a known token for rehydrate() (does not pre-empt it)', () => {
+      const tokeniser = new PIITokeniser();
+      const { masked } = tokeniser.mask('Google Calendar', detectPII('Google Calendar'));
+      expect(masked).toBe('[NAME_1]'); // it IS in the map
+      expect(tokeniser.neutraliseResidualTokens(masked)).toBe('[NAME_1]');
+    });
+
+    it('does NOT neutralise non-PII bracket markup of un-issued types', () => {
+      const tokeniser = new PIITokeniser();
+      tokeniser.mask('a@b.com', detectPII('a@b.com')); // issues EMAIL only
+      const out = tokeniser.neutraliseResidualTokens('Pick [OPTION_1] or [STEP_2].');
+      expect(out).toBe('Pick [OPTION_1] or [STEP_2].');
+    });
+
+    it('neutralises a MULTI-DIGIT token index (not just single-digit)', () => {
+      const tokeniser = new PIITokeniser();
+      tokeniser.mask('Google Calendar', detectPII('Google Calendar')); // issues NAME
+      const out = tokeniser.neutraliseResidualTokens('see [NAME_42] now');
+      expect(out).not.toMatch(/\[NAME_\d+\]/);
+      expect(out).toBe('see [redacted] now');
+    });
+
+    it('is a no-op when nothing was masked this turn', () => {
+      const tokeniser = new PIITokeniser();
+      expect(tokeniser.neutraliseResidualTokens('plain [NAME_1] text')).toBe(
+        'plain [NAME_1] text',
+      );
+    });
+  });
+
   // L7 error-handling-audit — mask() must FAIL CLOSED on invalid entity
   // sets. Overlapping or out-of-range entities silently corrupted the
   // masked output (partially-overwritten tokens, resurfaced PII fragments);

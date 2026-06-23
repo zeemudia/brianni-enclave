@@ -496,6 +496,131 @@ describe("connector.* dispatch (Task 11)", () => {
     expect(res.ledgerEntry.scope).toContain("auto");
   });
 
+  // BUG-B ──────────────────────────────────────────────────────────────────
+  it("BUG-B: admits a connector.read missing maxResults and defaults the cap to the ceiling for the client", async () => {
+    loadRegistry();
+    const { bridge, calls } = recordingBridge((frame) => ({
+      invocationId: frame.invocationId,
+      outcome: "ok",
+      resultJson: { ok: true, data: { events: [] } },
+    }));
+    const gw = new ToolGateway(mkDeps({ clientBridge: bridge }));
+    const res = await gw.dispatch(
+      readFrame({
+        connectorId: "google-calendar",
+        operation: "list_events",
+        // Window supplied, maxResults OMITTED — the confirmed intermittent
+        // CONNECTOR_READ_RESULTS_REQUIRED case. Must now admit.
+        params: {
+          timeMin: "2026-06-01T00:00:00Z",
+          timeMax: "2026-06-08T00:00:00Z",
+        },
+      }),
+      mkPack(),
+      TURN,
+    );
+    expect(res.outcome).toBe("ok");
+    expect(calls).toHaveLength(1);
+    // The client (and thus the provider call) receives the catalog ceiling as
+    // the bounded default cap — never an unbounded pull.
+    const args = calls[0].args as { params?: Record<string, unknown> };
+    expect(args.params?.maxResults).toBe(250);
+    // Still metered as a read.
+    expect(gw.__connectorTurnStateForTest(TURN).reads).toBe(1);
+  });
+
+  it("BUG-B: prepareInvocation defaults the read cap on the WIRE FRAME emitted to the client", async () => {
+    // The live agent loop emits prepared.wireFrame to the client BEFORE dispatch()
+    // runs, and invokeClient only awaits the resolver for that already-emitted
+    // frame — so the default MUST live on the wire frame, not just in dispatch's
+    // admission view, or the client's provider call runs uncapped (Codex P1).
+    loadRegistry();
+    const gw = new ToolGateway(mkDeps());
+    const prepared = gw.prepareInvocation(
+      readFrame({
+        connectorId: "google-calendar",
+        operation: "list_events",
+        params: {
+          timeMin: "2026-06-01T00:00:00Z",
+          timeMax: "2026-06-08T00:00:00Z",
+        },
+      }),
+      mkPack(),
+      TURN,
+    );
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    const args = prepared.wireFrame.args as { params?: Record<string, unknown> };
+    expect(args.params?.maxResults).toBe(250);
+  });
+
+  it("BUG-B: prepareInvocation rejects a connector.read missing the window before any client wire frame", async () => {
+    // The live agent loop yields prepared.wireFrame to the client before
+    // dispatch() parks on the resolver. A doomed read must therefore be rejected
+    // here, not only later in dispatch(), or the client/provider can observe it.
+    loadRegistry();
+    const gw = new ToolGateway(mkDeps());
+    const prepared = gw.prepareInvocation(
+      readFrame({
+        connectorId: "google-calendar",
+        operation: "list_events",
+        params: { maxResults: 50 },
+      }),
+      mkPack(),
+      TURN,
+    );
+    expect(prepared.ok).toBe(false);
+    if (prepared.ok) return;
+    expect(prepared.reason).toBe("CONNECTOR_READ_WINDOW_REQUIRED");
+    expect(prepared.gatewayResult.outcome).toBe("gateway_rejected");
+    expect(prepared.ledgerEntry.reason).toBe("CONNECTOR_READ_WINDOW_REQUIRED");
+    expect(gw.__connectorTurnStateForTest(TURN).reads).toBe(0);
+  });
+
+  it("BUG-B: prepareInvocation leaves a present cap untouched on the wire frame", async () => {
+    loadRegistry();
+    const gw = new ToolGateway(mkDeps());
+    const prepared = gw.prepareInvocation(
+      readFrame({
+        connectorId: "google-calendar",
+        operation: "list_events",
+        params: {
+          timeMin: "2026-06-01T00:00:00Z",
+          timeMax: "2026-06-08T00:00:00Z",
+          maxResults: 10,
+        },
+      }),
+      mkPack(),
+      TURN,
+    );
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    const args = prepared.wireFrame.args as { params?: Record<string, unknown> };
+    expect(args.params?.maxResults).toBe(10);
+  });
+
+  it("BUG-B: still REJECTS a connector.read missing the WINDOW (a time range is not defaulted)", async () => {
+    loadRegistry();
+    const { bridge, calls } = recordingBridge((frame) => ({
+      invocationId: frame.invocationId,
+      outcome: "ok",
+      resultJson: { ok: true, data: { events: [] } },
+    }));
+    const gw = new ToolGateway(mkDeps({ clientBridge: bridge }));
+    const res = await gw.dispatch(
+      readFrame({
+        connectorId: "google-calendar",
+        operation: "list_events",
+        params: { maxResults: 50 }, // window omitted — must stay REQUIRED
+      }),
+      mkPack(),
+      TURN,
+    );
+    expect(res.outcome).toBe("gateway_rejected");
+    expect(res.reason).toBe("CONNECTOR_READ_WINDOW_REQUIRED");
+    expect(calls).toHaveLength(0); // never reached the client
+  });
+
   it("admits a connector.act, hands it to the fulfiller, and increments the mutation counter", async () => {
     loadRegistry();
     const { bridge, calls } = recordingBridge((frame) => ({

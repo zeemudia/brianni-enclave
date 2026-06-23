@@ -93,6 +93,34 @@ export class PIITokeniser {
     }
   }
 
+  /**
+   * Display safety net. Replace any residual masking token of a type this
+   * tokeniser ISSUED this turn that it cannot rehydrate — a lost token→value
+   * mapping, or a model-hallucinated index — with `replacement`, so a raw
+   * `[TYPE_N]` token never reaches the user-visible final answer. This enforces
+   * the launch gate "zero final answers containing raw masking tokens" as
+   * defense-in-depth: `rehydrate()` already restores every KNOWN token and the
+   * masking round-trip is the primary control; this catches the residual.
+   *
+   * Scoped to the TYPES this tokeniser actually issued (the `counters` keys), so
+   * legitimate non-PII bracket markup the model emits — `[OPTION_1]`,
+   * `[STEP_2]`, `[TASK_3]` — is left untouched (and when nothing was masked this
+   * turn no `counters` key matches, so every token is left as-is). A token still
+   * present in `tokenMap` is left for `rehydrate()` (call `rehydrate()` FIRST,
+   * then this). No PII is exposed by a residual token (the token is opaque); this
+   * only removes the stray token MARKUP from the rendered answer.
+   */
+  neutraliseResidualTokens(text: string, replacement = "[redacted]"): string {
+    return text.replace(
+      /\[([A-Z]{1,30})_\d{1,9}\]/g,
+      (match: string, type: string) => {
+        if (!this.counters.has(type)) return match; // not a type we masked
+        if (this.tokenMap.has(match)) return match; // known → rehydrate handles it
+        return replacement;
+      },
+    );
+  }
+
   /** Get the total number of tokens issued across all types (for TEE counter sync). */
   getTokenCount(): number {
     let total = 0;

@@ -1,10 +1,10 @@
 {
-  "pcr0": "db6dcedf3edf433f88c3ef14404fc419d038f8c99ab45218ad50c9d9f4f144718b720f09b1f22f19298f52dcb2e39981",
+  "pcr0": "802d82b907b1b68ff44d73819df0fc50e4497c6f295d742bcb30afa0eaa221ff7fb7302cf7ab1880ce60bb7c8bc325da",
   "pcr1": "4b4d5b3661b3efc12920900c80e126e4ce783c522de6c02a2a5bf7af3a2b9327b86776f188e4be1c1c404a129dbda493",
-  "pcr2": "f5916a7d6bcd460ee7a55db68d03dd669d2cea19285ca0856c30f7b33fefcbe5f0a6d7e1bbf3eb5a1c580502fc3b03ae",
+  "pcr2": "7c949da8fbfa05929c8fdd0484f830d72f3f369917338fdc3c08bd9b3413d39bf98ebb442289d098c4258041a40e1659",
   "version": "2.0.0",
-  "commitHash": "50771778",
-  "verifiedAt": "2026-06-22",
+  "commitHash": "ce5e55da",
+  "verifiedAt": "2026-06-23",
   "source": "nitro-cli-offline",
-  "vendorManifestSha256": "52bd8259c465363c1e41ff275544fbdb5bcbe613dd2bbcc778a0ea079de8627d"
+  "vendorManifestSha256": "299c466688ceef7237ec9183a4e9cf9b35e8b6f4e171836763f983365165ead2"
 }
