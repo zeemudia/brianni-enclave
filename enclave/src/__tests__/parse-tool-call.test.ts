@@ -940,6 +940,36 @@ describe("ToolCallStreamParser", () => {
     }
   });
 
+  it("does not use discovery aliasing after an ambiguous exact operation match", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [
+          { id: "list_events", mutating: false },
+          { id: "search_events", mutating: false },
+          { id: "searchEvents", mutating: false },
+        ],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "searchEvents",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect(tool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "searchEvents",
+        params: { q: "dentist" },
+      });
+    }
+  });
+
   it("preserves connector params when discovery aliases use whitespace separators", () => {
     initRegistryWithOps([
       {
@@ -995,6 +1025,32 @@ describe("ToolCallStreamParser", () => {
     }
 
     __resetConnectorRegistryForTest();
+  });
+
+  it("does not treat separator-only catalog object tokens as a discovery alias match", () => {
+    initRegistryWithOps([
+      {
+        id: "acme-cal",
+        operations: [{ id: "list_", mutating: false }],
+      },
+    ]);
+
+    const events = aliasEventsWithArgs("connector.read", {
+      connectorId: "cal",
+      operation: "search___",
+      params: { q: "dentist" },
+    });
+    __resetConnectorRegistryForTest();
+
+    const tool = events.find((e) => e.kind === "tool");
+    expect(tool).toBeDefined();
+    if (tool?.kind === "tool") {
+      expect(tool.payload.args).toEqual({
+        connectorId: "cal",
+        operation: "search___",
+        params: { q: "dentist" },
+      });
+    }
   });
 
   it("tokenizes camelCase and separator-heavy discovery aliases when matching catalog objects", () => {

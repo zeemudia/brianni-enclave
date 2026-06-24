@@ -35,6 +35,8 @@ if (args.includes('--help') || args.includes('-h')) {
       '  ENCLAVE_CID=16        Enclave CID when USE_VSOCK=true (default 16).',
       '  ENCLAVE_PORT=5000     vsock/TCP port (default 5000).',
       '  HEALTH_TIMEOUT_MS=5000',
+      '  REQUIRE_CONNECTOR_REGISTRY=true',
+      '                       Fail unless HEALTH_PONG reports connectorRegistryLoaded=true.',
       '',
       'Exit codes:',
       '  0 — enclave answered HEALTH_PING within the timeout.',
@@ -49,6 +51,9 @@ const CID = Number(process.env.ENCLAVE_CID ?? 16);
 const PORT = Number(process.env.ENCLAVE_PORT ?? 5000);
 const TIMEOUT_MS = Number(process.env.HEALTH_TIMEOUT_MS ?? 5000);
 const USE_VSOCK = process.env.USE_VSOCK === 'true';
+const REQUIRE_CONNECTOR_REGISTRY =
+  process.env.REQUIRE_CONNECTOR_REGISTRY === 'true' ||
+  process.env.REQUIRE_CONNECTOR_REGISTRY === '1';
 
 async function connect() {
   if (USE_VSOCK) {
@@ -136,10 +141,10 @@ async function probe() {
         //    OBJECTIVE, Phase-2-independent rotation-verify probe: they let a
         //    rotation verifier confirm the signed connector catalog loaded
         //    inside the enclave (true + the version) WITHOUT driving a
-        //    connector.* agent turn. They are NOT part of the readiness gate
-        //    below — an older enclave (or one booted before the
-        //    connectors-broker exists) reports false + null, and connectors are
-        //    an additive capability, not a boot dependency.
+        //    connector.* agent turn. They are part of the readiness gate only
+        //    when REQUIRE_CONNECTOR_REGISTRY=true: connector-bearing launch
+        //    rotations must not pass with connectorRegistryLoaded=false, while
+        //    older non-connector probes can still check core status only.
         //    The enclave no longer runs a Presidio masking sidecar
         //    (de-identification is on-device only), so the old `presidio_ready`
         //    readiness field was removed from HEALTH_PONG; requiring any extra
@@ -149,6 +154,17 @@ async function probe() {
         //    3-consecutive rule rides out brief startup flaps.
         if (body?.status !== 'ok') {
           reject(new Error(`unhealthy payload: ${JSON.stringify(body)}`));
+          return;
+        }
+        if (REQUIRE_CONNECTOR_REGISTRY && body.connectorRegistryLoaded !== true) {
+          reject(
+            new Error(
+              `connector registry not loaded: ${JSON.stringify({
+                connectorRegistryLoaded: body.connectorRegistryLoaded,
+                connectorCatalogVersion: body.connectorCatalogVersion ?? null,
+              })}`,
+            ),
+          );
           return;
         }
         resolve({ type, body });

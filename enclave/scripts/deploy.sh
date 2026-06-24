@@ -81,6 +81,7 @@ LOCK_STALE_SECONDS="${CALYPSO_ENCLAVE_DEPLOY_LOCK_STALE:-1800}"
 : "${ENCLAVE_CID:=16}"
 : "${ENCLAVE_PORT:=5000}"
 : "${ENCLAVE_CPU_COUNT:=2}"
+: "${REQUIRE_CONNECTOR_REGISTRY:=true}"
 # Enclave RAM. The current release-class EIFs are ~2.43 GB and Nitro requires
 # at least 4x the EIF size, so release hosts launch them with 10240 MiB. Earlier
 # incidents attributed post-launch exits to 10240 MiB, but the reproduced
@@ -219,6 +220,9 @@ Environment:
   ENCLAVE_PORT         (default 5000)  vsock health-check port.
   ENCLAVE_CPU_COUNT    (default 2)
   ENCLAVE_MEMORY_MB    (default 10240)
+  REQUIRE_CONNECTOR_REGISTRY
+                       (default true)  Require HEALTH_PONG connectorRegistryLoaded=true
+                                       before promoting an EIF.
   ENCLAVE_INITIAL_HEALTH_DELAY_SECONDS
                        (default 120)   Quiet warmup after run-enclave before
                                        the first vsock health probe.
@@ -1003,6 +1007,7 @@ sleep_until_first_health_probe() {
 # Used with a tighter value by rollback() — ROLLBACK_HEALTH_TIMEOUT_SECONDS.
 wait_for_health() {
   local budget_seconds="${1:-30}"
+  local require_connector_registry="${2:-$REQUIRE_CONNECTOR_REGISTRY}"
   local ok=0 attempt=0
   local max_attempts=$(( budget_seconds / 2 ))
   if [ "$max_attempts" -lt 3 ]; then
@@ -1012,6 +1017,8 @@ wait_for_health() {
   # Health probe runs on the Nitro host, so it must speak vsock.
   export USE_VSOCK=true
   export ENCLAVE_CID ENCLAVE_PORT
+  REQUIRE_CONNECTOR_REGISTRY="$require_connector_registry"
+  export REQUIRE_CONNECTOR_REGISTRY
 
   if ! sleep_until_first_health_probe; then
     return 1
@@ -1080,7 +1087,7 @@ rollback() {
         --enclave-cid "$ENCLAVE_CID"; then
       die "ROLLBACK ALSO FAILED — backup EIF does not launch. Manual intervention required. See enclave/README.md and VERIFICATIONS.md."
     fi
-    if ! wait_for_health "$ROLLBACK_HEALTH_TIMEOUT_SECONDS"; then
+    if ! wait_for_health "$ROLLBACK_HEALTH_TIMEOUT_SECONDS" false; then
       die "ROLLBACK ALSO FAILED — backup EIF does not respond to vsock health. Manual intervention required. See enclave/README.md and VERIFICATIONS.md."
     fi
     die "rolled back to PCR0=$OLD_PCR0 and confirmed healthy. Investigate the new EIF before retrying. See enclave/README.md and VERIFICATIONS.md."

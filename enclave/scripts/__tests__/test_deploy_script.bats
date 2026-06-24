@@ -88,7 +88,8 @@ SH
         --eif-path="$TESTDIR/release.eif"
 
     [ "$status" -ne 0 ]
-    [[ "$output" == *"new enclave launch failed — initiating rollback"* ]]
+    [[ "$output" == *"new enclave launch failed on attempt 1/1"* ]]
+    [[ "$output" == *"new EIF did not become healthy after 1 launch attempt(s) — initiating rollback"* ]]
     [[ "$output" == *"rolled back to PCR0=$TEST_PCR0 and confirmed healthy"* ]]
     [ "$(cat "$RUN_COUNT_FILE")" -eq 2 ]
     grep -q "run-enclave" "$MOCK_LOG"
@@ -157,6 +158,46 @@ NODE
     [ "$(cat "$RUN_COUNT_FILE")" -eq 3 ]
 }
 
+@test "rollback health probes do not inherit candidate connector readiness" {
+    cat > "$ROOT/enclave/scripts/health-check.mjs" <<'NODE'
+import { readFileSync } from "node:fs";
+
+const runCount = Number(readFileSync(process.env.RUN_COUNT_FILE, "utf8"));
+if (runCount === 1) {
+  if (process.env.REQUIRE_CONNECTOR_REGISTRY !== "true") {
+    console.error(`candidate REQUIRE_CONNECTOR_REGISTRY=${process.env.REQUIRE_CONNECTOR_REGISTRY ?? "unset"}`);
+    process.exit(42);
+  }
+  console.error("candidate connector registry not loaded");
+  process.exit(1);
+}
+
+if (process.env.REQUIRE_CONNECTOR_REGISTRY !== "false") {
+  console.error(`rollback REQUIRE_CONNECTOR_REGISTRY=${process.env.REQUIRE_CONNECTOR_REGISTRY ?? "unset"}`);
+  process.exit(43);
+}
+process.exit(0);
+NODE
+
+    run env \
+      EXPECTED_PCR0="$TEST_PCR0" \
+      ENCLAVE_CID=16 \
+      ENCLAVE_PORT=5000 \
+      ENCLAVE_INITIAL_HEALTH_DELAY_SECONDS=0 \
+      DEPLOY_HEALTH_TIMEOUT_SECONDS=6 \
+      DEPLOY_HEALTH_RETRY_ATTEMPTS=0 \
+      ROLLBACK_HEALTH_TIMEOUT_SECONDS=6 \
+      "$ROOT/enclave/scripts/deploy.sh" \
+        --build-mode=release \
+        --eif-path="$TESTDIR/release.eif"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"candidate connector registry not loaded"* ]]
+    [[ "$output" == *"rolled back to PCR0=$TEST_PCR0 and confirmed healthy"* ]]
+    [[ "$output" != *"rollback REQUIRE_CONNECTOR_REGISTRY=true"* ]]
+    [ "$(cat "$RUN_COUNT_FILE")" -eq 2 ]
+}
+
 @test "no-rollback mode leaves failed candidate running for operator debugging" {
     cat > "$ROOT/enclave/scripts/health-check.mjs" <<'NODE'
 console.error("candidate not listening yet");
@@ -204,6 +245,30 @@ NODE
 
     [ "$status" -ne 0 ]
     [[ "$output" == *"health probe attempt 1: fail — vsock connect ECONNREFUSED"* ]]
+}
+
+@test "release health probes require connector registry readiness by default" {
+    cat > "$ROOT/enclave/scripts/health-check.mjs" <<'NODE'
+if (process.env.REQUIRE_CONNECTOR_REGISTRY !== "true") {
+  console.error(`REQUIRE_CONNECTOR_REGISTRY=${process.env.REQUIRE_CONNECTOR_REGISTRY ?? "unset"}`);
+  process.exit(42);
+}
+process.exit(0);
+NODE
+
+    run env \
+      EXPECTED_PCR0="$TEST_PCR0" \
+      ENCLAVE_CID=16 \
+      ENCLAVE_PORT=5000 \
+      ENCLAVE_INITIAL_HEALTH_DELAY_SECONDS=0 \
+      DEPLOY_HEALTH_TIMEOUT_SECONDS=6 \
+      "$ROOT/enclave/scripts/deploy.sh" \
+        --build-mode=release \
+        --eif-path="$TESTDIR/release.eif"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"health probe confirmed (3 consecutive)."* ]]
+    [[ "$output" != *"REQUIRE_CONNECTOR_REGISTRY=unset"* ]]
 }
 
 @test "health wait fails fast when candidate exits during warmup" {

@@ -477,6 +477,7 @@ export class EnclaveRouter {
   // Recurring orphan/billing reconciler tick (video). Started in init() once a
   // video adapter is wired; cleared in dispose().
   private videoReconcilerTimer: ReturnType<typeof setInterval> | null = null;
+  private connectorRegistryLoadPromise: Promise<boolean> | null = null;
   // True only when `this.media` was constructed by buildProductionMedia (the
   // real gateway), NOT when a test injected its own media. Gates the per-request
   // budgetClient override so injected test budget clients are never replaced.
@@ -957,7 +958,9 @@ export class EnclaveRouter {
     }
   }
 
-  private async loadConnectorRegistry(): Promise<void> {
+  private async loadConnectorRegistry(): Promise<boolean> {
+    if (isConnectorRegistryLoaded()) return true;
+
     // The connector catalog JSON is NOT baked into the EIF. Production fetches
     // it from the host-side connectors-broker sidecar over vsock at boot; the
     // enclave verifies the Ed25519 signature (signed offline, domain-separated
@@ -1030,22 +1033,40 @@ export class EnclaveRouter {
       console.warn(
         "[enclave] Connector catalog unavailable (no CONNECTORS_PATH, no connectors-broker, no bundled fallback) — connectors DISABLED; connector.* will reject CONNECTOR_CATALOG_NOT_LOADED.",
       );
-      return;
+      return false;
     }
 
     try {
       const catalogData = JSON.parse(catalogJson);
       const verifyKey = readFileSync(verifyKeyPath, "utf-8");
       initConnectorRegistry(catalogData, verifyKey);
+      return true;
     } catch (err) {
       if (process.env.NODE_ENV === "test") {
         console.warn("[enclave] Connector catalog loading skipped in test environment");
-        return;
+        return false;
       }
       throw new Error(
         `Failed to load connector catalog: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  private async ensureConnectorRegistryLoaded(): Promise<boolean> {
+    if (isConnectorRegistryLoaded()) return true;
+    if (!this.connectorRegistryLoadPromise) {
+      this.connectorRegistryLoadPromise = this.loadConnectorRegistry()
+        .catch((err) => {
+          console.warn(
+            `[enclave] Connector catalog retry failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return false;
+        })
+        .finally(() => {
+          this.connectorRegistryLoadPromise = null;
+        });
+    }
+    return this.connectorRegistryLoadPromise;
   }
 
   private async fetchKeysFromKMS(): Promise<AttestedKmsResult> {
@@ -1084,6 +1105,9 @@ export class EnclaveRouter {
 
     switch (type) {
       case MSG.HEALTH_PING:
+        if (!isConnectorRegistryLoaded()) {
+          await this.ensureConnectorRegistryLoaded();
+        }
         yield encodeFrame(
           MSG.HEALTH_PONG,
           Buffer.from(
@@ -1982,6 +2006,9 @@ export class EnclaveRouter {
             connectorTurnBudgetOverride: body.connectorTurnBudgetOverride,
             localTime: body.localTime,
           });
+          if (requestContext.connectedConnectors.length > 0) {
+            await this.ensureConnectorRegistryLoaded();
+          }
           const runMode =
             body.runMode === "orchestrator" ? "orchestrator" : "single";
           // Claims pack is orchestrator-only: it crosses namespace

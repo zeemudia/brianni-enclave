@@ -261,9 +261,9 @@ describe("EnclaveRouter — extended", () => {
     expect(loadedBody.connectorRegistryLoaded).toBe(true);
     expect(loadedBody.connectorCatalogVersion).toBe(2);
 
-    // Unloaded/reset: connectorRegistryLoaded=false + null version (so an
-    // older enclave — or one booted before the connectors-broker exists —
-    // reports a deterministic, generic "not loaded" rather than throwing).
+    // Unloaded/reset: HEALTH_PING now makes a best-effort reload. In tests that
+    // uses the bundled dev catalog, matching production's retry when the
+    // connectors-broker becomes available after enclave init.
     __resetConnectorRegistryForTest();
 
     const resetFrames: Buffer[] = [];
@@ -274,8 +274,8 @@ describe("EnclaveRouter — extended", () => {
     }
     const resetBody = JSON.parse(decodeFrame(resetFrames[0]).payload.toString());
     expect(resetBody.status).toBe("ok");
-    expect(resetBody.connectorRegistryLoaded).toBe(false);
-    expect(resetBody.connectorCatalogVersion).toBeNull();
+    expect(resetBody.connectorRegistryLoaded).toBe(true);
+    expect(resetBody.connectorCatalogVersion).toEqual(expect.any(Number));
   });
 
   it("error classifier maps DECRYPT error correctly", async () => {
